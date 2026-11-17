@@ -30,7 +30,9 @@ __all__ = [
     "Key",
     "Informational",
     "RationalizationError",
+    "PassSpec",
     "rationalize",
+    "rationalize_many",
     "RationalizedResult",
     "GroundedRecord",
     "ElementSource",
@@ -56,7 +58,7 @@ __all__ = [
 ]
 
 if TYPE_CHECKING:
-    from datagrunt.rationalization.api import rationalize
+    from datagrunt.rationalization.api import PassSpec, rationalize, rationalize_many
     from datagrunt.rationalization.batch import BatchItem, BatchPlan, ingest_batch, prepare_batch
     from datagrunt.rationalization.consensus import QuarantinedItem
     from datagrunt.rationalization.folding import ElementSource, GroundedRecord

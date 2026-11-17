@@ -211,10 +211,11 @@ from datagrunt.rationalization.providers.google_cloud import (
     dedicated_model_id,
     family_for_publisher,
     model_id_for,
+    rate_key_for,
     split_publisher_model,
 )
 from datagrunt.rationalization.providers.http import MAX_CONNECTIONS_LIMIT, HttpClient, HttpReply
-from datagrunt.rationalization.providers.responses import parse_json_object, response
+from datagrunt.rationalization.providers.responses import parsed_response, response
 from datagrunt.rationalization.wire import FinishReason, ModelRequest, ProviderResponse
 
 MaxTokensField: TypeAlias = Literal["max_tokens", "max_completion_tokens"]
@@ -276,7 +277,8 @@ OPENAI_LARGE_ENUM_VALUES = 250
 OPENAI_MAX_LARGE_ENUM_CHARS = 15_000
 """OpenAI's strict-mode limits (module notes, 4)."""
 
-DEFAULT_MAX_CONNECTIONS = 8
+DEFAULT_MAX_CONNECTIONS = 64
+MAX_CONCURRENCY_CAP = 256
 
 _ROOT = "#"
 _WIRE_FORMATS: Mapping[str, str] = MappingProxyType({"chat": WIRE_FORMAT, "mistral": MISTRAL_WIRE_FORMAT})
@@ -696,8 +698,8 @@ def reply_response(reply: HttpReply) -> ProviderResponse:
             output_tokens=output_tokens,
         )
     message, finish_reason = found
-    return response(
-        content=parse_json_object(message.get("content")),
+    return parsed_response(
+        json_text=message.get("content"),
         raw_text=_raw_text(message, reply.text),
         finish=_finish(message, finish_reason),
         input_tokens=input_tokens,
@@ -950,13 +952,14 @@ def _google_route(
     mapped = family_for_publisher(publisher)
     family = None if mapped == UNKNOWN_FAMILY else mapped
     model_id = model_id_for(target, publisher, name)
+    rate_key = rate_key_for(target, publisher=publisher, model=name)
     if publisher == MISTRAL_PUBLISHER:
         url = target.publisher_model_url(publisher, name, "rawPredict")
         bare = name.partition("@")[0]  # the URL keeps the @version; the body's model leaves it out
-        route = _Route(url, model_id, model_id, "google-cloud-mistral", bare, "mistral", False)
+        route = _Route(url, model_id, rate_key, "google-cloud-mistral", bare, "mistral", False)
         return _GoogleRoute(route, "rawPredict", False, family)
     url = f"{target.openai_base_url()}/chat/completions"
-    route = _Route(url, model_id, model_id, "google-cloud-openai", f"{publisher}/{name}", "chat", False)
+    route = _Route(url, model_id, rate_key, "google-cloud-openai", f"{publisher}/{name}", "chat", False)
     return _GoogleRoute(route, "chatCompletions", True, family)
 
 
@@ -1328,13 +1331,15 @@ class OpenAICompatibleProvider:
 
     @property
     def max_concurrency(self) -> int | None:
-        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        """Optional per-provider concurrency cap (1-256), or ``None``."""
         return self._max_concurrency
 
     def with_max_concurrency(self, max_concurrency: int | None) -> "OpenAICompatibleProvider":
-        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
-        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
-            raise RationalizationError("max_concurrency must be None or an int in 1-64")
+        """Configure a per-provider concurrency cap (1-256, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (
+            type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_CONCURRENCY_CAP
+        ):
+            raise RationalizationError(f"max_concurrency must be None or an int in 1-{MAX_CONCURRENCY_CAP}")
         self._max_concurrency = max_concurrency
         return self
 

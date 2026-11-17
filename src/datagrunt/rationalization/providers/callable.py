@@ -47,6 +47,8 @@ from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
 ProviderFunction = Callable[[ModelRequest], object]
 """What a callable provider calls: a request in, a ``ProviderResponse`` or a JSON object out (``generate`` checks)."""
 
+MAX_CONCURRENCY_CAP = 256
+
 
 class CallableProvider:
     """A function as a model provider (module notes).
@@ -104,13 +106,15 @@ class CallableProvider:
 
     @property
     def max_concurrency(self) -> int | None:
-        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        """Optional per-provider concurrency cap (1-256), or ``None``."""
         return self._max_concurrency
 
     def with_max_concurrency(self, max_concurrency: int | None) -> "CallableProvider":
-        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
-        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
-            raise RationalizationError("max_concurrency must be None or an int in 1-64")
+        """Configure a per-provider concurrency cap (1-256, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (
+            type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_CONCURRENCY_CAP
+        ):
+            raise RationalizationError(f"max_concurrency must be None or an int in 1-{MAX_CONCURRENCY_CAP}")
         self._max_concurrency = max_concurrency
         return self
 

@@ -31,6 +31,7 @@ RATIONALIZE_EXTRA_HINT = 'Install rationalization support with: uv pip install "
 # Each lazily loaded class, and the module that defines it.
 LAZY_CLASSES = MappingProxyType(
     {
+        "PassSpec": "datagrunt.rationalization.api",
         "RationalizedResult": "datagrunt.rationalization.result",
         "RationalizeTelemetry": "datagrunt.rationalization.result",
         "GroundedRecord": "datagrunt.rationalization.folding",
@@ -49,6 +50,7 @@ LAZY_CLASSES = MappingProxyType(
 LAZY_FUNCTIONS = MappingProxyType(
     {
         "rationalize": "datagrunt.rationalization.api",
+        "rationalize_many": "datagrunt.rationalization.api",
         "prepare_batch": "datagrunt.rationalization.batch",
         "ingest_batch": "datagrunt.rationalization.batch",
     }

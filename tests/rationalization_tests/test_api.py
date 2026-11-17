@@ -4,6 +4,7 @@ import copy
 import hashlib
 import inspect
 import sys
+import threading
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -29,7 +30,7 @@ from datagrunt.pdf.elements import (
     Section,
     Table,
 )
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
 from datagrunt.pdf.render import RenderedPage
 from datagrunt.rationalization import Key, RationalizationError, _extra
 from datagrunt.rationalization import api as api_module
@@ -39,13 +40,17 @@ from datagrunt.rationalization.envelope import CONTEXT_MAX_BYTES, PROMPT_MAX_BYT
 from datagrunt.rationalization.providers.base import ModelProvider, TransientProviderError
 from datagrunt.rationalization.providers.callable import CallableProvider
 from datagrunt.rationalization.result import RationalizedResult as real_result_cls
+from datagrunt.rationalization.runner import CONCURRENCY_LIMIT, snapshot_providers
+from datagrunt.rationalization.schema import prepare
 from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
 
 EXPECTED_RATIONALIZATION_ALL: tuple[str, ...] = (
     "Key",
     "Informational",
     "RationalizationError",
+    "PassSpec",
     "rationalize",
+    "rationalize_many",
     "RationalizedResult",
     "GroundedRecord",
     "ElementSource",
@@ -285,7 +290,7 @@ def _fake_render(source: Path, page_index: int, *, dpi: int, password: str | Non
 class TestPublicNamespaceAndLazyExports:
     def test_rationalization_all_has_exact_21_names(self) -> None:
         assert tuple(datagrunt.rationalization.__all__) == EXPECTED_RATIONALIZATION_ALL
-        assert len(datagrunt.rationalization.__all__) == 26
+        assert len(datagrunt.rationalization.__all__) == 28
 
     @pytest.mark.parametrize("name", EXPECTED_RATIONALIZATION_ALL)
     def test_every_exported_name_is_accessible_and_in_dir(self, name: str) -> None:
@@ -299,12 +304,18 @@ class TestPublicNamespaceAndLazyExports:
 
     def test_top_level_datagrunt_exports_rationalize_and_result(self) -> None:
         assert "Key" in datagrunt.__all__
+        assert "PassSpec" in datagrunt.__all__
         assert "rationalize" in datagrunt.__all__
+        assert "rationalize_many" in datagrunt.__all__
         assert "RationalizedResult" in datagrunt.__all__
+        assert "PassSpec" in dir(datagrunt)
         assert "rationalize" in dir(datagrunt)
+        assert "rationalize_many" in dir(datagrunt)
         assert "RationalizedResult" in dir(datagrunt)
         assert datagrunt.Key is datagrunt.rationalization.Key
+        assert datagrunt.PassSpec is datagrunt.rationalization.PassSpec
         assert datagrunt.rationalize is datagrunt.rationalization.rationalize
+        assert datagrunt.rationalize_many is datagrunt.rationalization.rationalize_many
         assert datagrunt.RationalizedResult is datagrunt.rationalization.RationalizedResult
 
     def test_importing_api_submodule_never_shadows_rationalize_function(self) -> None:
@@ -345,19 +356,17 @@ class TestRationalizationExtraGuard:
                 _extra._loaded.cache_clear()
 
                 fn_stand_in = _extra.load("rationalize")
+                many_stand_in = _extra.load("rationalize_many")
                 cls_stand_in = _extra.load("RationalizedResult")
+                spec_stand_in = _extra.load("PassSpec")
                 assert fn_stand_in is not real_rationalize
                 assert cls_stand_in is not real_result_cls
 
-                with pytest.raises(ImportError) as fn_exc:
-                    fn_stand_in()
-                assert EXPECTED_HINT in str(fn_exc.value)
-                assert expected_pkg in str(fn_exc.value)
-
-                with pytest.raises(ImportError) as cls_exc:
-                    cls_stand_in()
-                assert EXPECTED_HINT in str(cls_exc.value)
-                assert expected_pkg in str(cls_exc.value)
+                for stand_in in (fn_stand_in, many_stand_in, cls_stand_in, spec_stand_in):
+                    with pytest.raises(ImportError) as item_exc:
+                        stand_in()
+                    assert EXPECTED_HINT in str(item_exc.value)
+                    assert expected_pkg in str(item_exc.value)
 
             # Once the blocked sys.modules entry is restored, the next load() returns the real objects.
             assert _extra.load("rationalize") is real_rationalize
@@ -376,7 +385,7 @@ class TestZeroIoPreflightOrder:
         ("bad_kwargs", "expected_exc"),
         [
             ({"max_concurrency": 0}, (ValueError, RationalizationError)),
-            ({"max_concurrency": 65}, (ValueError, RationalizationError)),
+            ({"max_concurrency": CONCURRENCY_LIMIT + 1}, (ValueError, RationalizationError)),
             ({"max_concurrency": True}, (TypeError, RationalizationError)),
             ({"max_concurrency_per_provider": 0}, (ValueError, RationalizationError)),
             ({"rpm_limit": 0}, (ValueError, RationalizationError)),
@@ -395,6 +404,10 @@ class TestZeroIoPreflightOrder:
             ({"strict": "no"}, (TypeError, RationalizationError)),
             ({"coalesce_sections": "yes"}, (TypeError, RationalizationError)),
             ({"coalesce_sections": 1}, (TypeError, RationalizationError)),
+            ({"split_on_truncation": "yes"}, (TypeError, RationalizationError)),
+            ({"split_on_truncation": 1}, (TypeError, RationalizationError)),
+            ({"event_delivery": 123}, (TypeError, RationalizationError)),
+            ({"event_delivery": "bogus"}, (ValueError, RationalizationError)),
             ({"on_event": "not_callable"}, (TypeError, RationalizationError)),
         ],
     )
@@ -1478,3 +1491,330 @@ class TestEphemeralProviderCleanupAndSinglePassPreflight:
         assert counts2 == {"google": 0, "anthropic": 0}
         assert res_hit.telemetry.cache_hits == 6
         assert set(get_counts.values()) == {1}
+
+
+class TestSplitOnTruncation:
+    def test_multi_element_and_table_truncation_bisects_recovers_records_and_sums_telemetry(self) -> None:
+        doc_id = BOM_DOC.metadata.doc_id
+        coalesced_uid = f"{doc_id}:p0001_e001-p0002_e001"
+        table_uid = f"{doc_id}:p0002_e001-p0002_e001"
+        seen_uids: list[str] = []
+
+        def truncating_google(req: ModelRequest) -> ProviderResponse:
+            seen_uids.append(req.unit_id)
+            if req.unit_id in (coalesced_uid, table_uid):
+                return ProviderResponse(
+                    content=None,
+                    raw_text='{"records": [',
+                    finish="truncated",
+                    input_tokens=100,
+                    output_tokens=200,
+                )
+            if req.unit_id.endswith(":p0002_e001.1-p0002_e001.1"):
+                return ProviderResponse(
+                    content={
+                        "records": [
+                            {
+                                "record": {
+                                    "assembly_id": "A-100",
+                                    "components": [{"part_no": "PN-1", "qty": 2}],
+                                },
+                                "grounding_quotes": ["| A-100 |  | PN-1 | 2 |"],
+                                "source_element_ids": ["p0002_e001"],
+                            }
+                        ]
+                    },
+                    raw_text="{}",
+                    finish="complete",
+                    input_tokens=60,
+                    output_tokens=30,
+                )
+            if req.unit_id.endswith(":p0002_e001.2-p0002_e001.2"):
+                return ProviderResponse(
+                    content={
+                        "records": [
+                            {
+                                "record": {
+                                    "assembly_id": "A-100",
+                                    "components": [{"part_no": "PN-2", "qty": 4}],
+                                },
+                                "grounding_quotes": ["| A-100 |  | PN-2 | 4 |"],
+                                "source_element_ids": ["p0002_e001"],
+                            },
+                            {
+                                "record": {
+                                    "assembly_id": "A-200",
+                                    "drawing": "DWG-900",
+                                    "title": "Booster",
+                                    "components": [{"part_no": "PN-9", "qty": 1}],
+                                },
+                                "grounding_quotes": ["| A-200 | Booster | PN-9 | 1 |", "**Drawing:** DWG-900"],
+                                "source_element_ids": ["p0002_e001", "p0001_e001"],
+                            },
+                        ]
+                    },
+                    raw_text="{}",
+                    finish="complete",
+                    input_tokens=70,
+                    output_tokens=40,
+                )
+            if req.unit_id.endswith(":p0001_e001-p0001_e002"):
+                return ProviderResponse(
+                    content={"records": []},
+                    raw_text="{}",
+                    finish="complete",
+                    input_tokens=40,
+                    output_tokens=10,
+                )
+            if req.unit_id.endswith(":p0001_e003-p0001_e003"):
+                return ProviderResponse(
+                    content={
+                        "records": [
+                            {
+                                "record": {
+                                    "assembly_id": "A-100",
+                                    "drawing": "DWG-900",
+                                    "title": "Main Pump",
+                                    "notes": "see page 2",
+                                },
+                                "grounding_quotes": [
+                                    "Assembly A-100 Main Pump",
+                                    "Notes: see page 2",
+                                    "**Drawing:** DWG-900",
+                                ],
+                                "source_element_ids": ["p0001_e003", "p0001_e001"],
+                            }
+                        ]
+                    },
+                    raw_text="{}",
+                    finish="complete",
+                    input_tokens=50,
+                    output_tokens=20,
+                )
+            if req.unit_id.endswith(":p0001_e003-p0002_e001"):
+                return ProviderResponse(
+                    content=None,
+                    raw_text='{"records": [',
+                    finish="truncated",
+                    input_tokens=90,
+                    output_tokens=180,
+                )
+            return _bom_response_for(req)
+
+        p_g = CallableProvider("test:g-trunc", truncating_google, family="google")
+        p_a = CallableProvider("test:a-trunc", truncating_google, family="anthropic")
+
+        res = real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_g, p_a),
+            split_on_truncation=True,
+        )
+        assert [r.assembly_id for r in res.records] == ["A-100", "A-200"]
+        assert [c.part_no for c in res.records[0].components] == ["PN-1", "PN-2"]
+        assert res.quarantined == ()
+        # 4 final leaf units: (e001-e002), (e003), (e001.1), (e001.2), plus 3 truncated parent units spent!
+        assert res.telemetry.unit_count == 4
+        assert res.telemetry.cache_misses == 14
+        assert res.telemetry.usage_by_model["test:g-trunc"].requests == 7
+        assert res.telemetry.usage_by_model["test:g-trunc"].input_tokens == 100 + 40 + 90 + 50 + 100 + 60 + 70
+        assert dict(res.telemetry.hidden_excluded_by_reason) == {"invisible": 1}
+
+    def test_split_on_truncation_false_preserves_quarantined_truncated_response(self) -> None:
+        def always_truncated(req: ModelRequest) -> ProviderResponse:
+            return ProviderResponse(content=None, raw_text="{", finish="truncated", input_tokens=10, output_tokens=50)
+
+        p_g = CallableProvider("test:g-off", always_truncated, family="google")
+        p_a = CallableProvider("test:a-off", always_truncated, family="anthropic")
+        res = real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract BOM.",
+            models=(p_g, p_a),
+            split_on_truncation=False,
+        )
+        assert res.records == ()
+        assert len(res.quarantined) == 2
+        assert res.telemetry.unit_count == 1
+        assert res.telemetry.cache_misses == 2
+
+    def test_unsplittable_single_element_unit_terminates_cleanly_as_quarantined(self) -> None:
+        solo_doc = PDFDocument(
+            metadata=metadata(1, source_name="solo.pdf", sha=hashlib.sha256(b"solo").hexdigest()),
+            pages=(page(1, (Paragraph(**ids(1, 1, (), BOX), text="Assembly A-100 solo paragraph"),)),),
+        )
+        calls = 0
+
+        def always_truncated(req: ModelRequest) -> ProviderResponse:
+            nonlocal calls
+            calls += 1
+            return ProviderResponse(content=None, raw_text="{", finish="truncated", input_tokens=10, output_tokens=50)
+
+        res = real_rationalize(
+            solo_doc,
+            schema=Assembly,
+            prompt="Extract.",
+            models=(
+                CallableProvider("test:g-solo", always_truncated, family="google"),
+                CallableProvider("test:a-solo", always_truncated, family="anthropic"),
+            ),
+            split_on_truncation=True,
+        )
+        assert calls == 2
+        assert len(res.quarantined) == 2
+        assert res.telemetry.unit_count == 1
+
+    def test_bisection_enforces_cumulative_max_requests_budget(self) -> None:
+        calls = 0
+
+        def always_truncated(req: ModelRequest) -> ProviderResponse:
+            nonlocal calls
+            calls += 1
+            return ProviderResponse(content=None, raw_text="{", finish="truncated")
+
+        with pytest.raises(RationalizationError, match="max_requests"):
+            real_rationalize(
+                BOM_DOC,
+                schema=Assembly,
+                prompt="Extract.",
+                models=(
+                    CallableProvider("test:g-cap", always_truncated, family="google"),
+                    CallableProvider("test:a-cap", always_truncated, family="anthropic"),
+                ),
+                max_requests=4,
+                split_on_truncation=True,
+            )
+        # Round 0 spent 2 misses; Round 1 needed 4 more (total 6 > max_requests=4) -> halted before Round 1!
+        assert calls == 2
+
+    def test_bisection_at_exact_max_requests_blocks_child_miss_but_allows_file_cache_hit(self, tmp_path: Path) -> None:
+        calls = 0
+
+        def google_truncates_parent(req: ModelRequest) -> ProviderResponse:
+            nonlocal calls
+            calls += 1
+            if req.unit_id.endswith(":p0001_e001-p0002_e001"):
+                return ProviderResponse(
+                    content=None, raw_text="{", finish="truncated", input_tokens=20, output_tokens=50
+                )
+            return ProviderResponse(
+                content={"records": []}, raw_text="{}", finish="complete", input_tokens=10, output_tokens=5
+            )
+
+        def anthropic_complete(req: ModelRequest) -> ProviderResponse:
+            nonlocal calls
+            calls += 1
+            return ProviderResponse(
+                content={"records": []}, raw_text="{}", finish="complete", input_tokens=10, output_tokens=5
+            )
+
+        cache_dir = tmp_path / "bisect_exact_cache"
+        g_prov = CallableProvider("test:g-exact", google_truncates_parent, family="google")
+        a_prov = CallableProvider("test:a-exact", anthropic_complete, family="anthropic")
+        real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract.",
+            models=(g_prov, a_prov),
+            cache_dir=cache_dir,
+            max_requests=10,
+            split_on_truncation=True,
+        )
+        prep = prepare(Assembly)
+        snaps = snapshot_providers((g_prov, a_prov), prep)
+        tw = api_module._build_target_work(
+            (BOM_DOC,),
+            max_unit_chars=120_000,
+            coalesce_sections=True,
+            prompt_text="Extract.",
+            context=None,
+            prepared=prep,
+            snapshots=snaps,
+            schema_version="1.0",
+            file_cache=None,
+            limits=api_module.RunLimits(max_requests=10),
+        )
+        parent_keys = {req.key for req in tw.preflight.requests}
+        all_files = sorted(cache_dir.rglob("*.json"))
+        for p in all_files:
+            if p.stem in parent_keys:
+                p.unlink()
+
+        # 1) All 4 child slots hit FileCache (0 child misses): succeeds under max_requests=2 (spent_misses == 2)!
+        calls = 0
+        res_cached = real_rationalize(
+            BOM_DOC,
+            schema=Assembly,
+            prompt="Extract.",
+            models=(g_prov, a_prov),
+            cache_dir=cache_dir,
+            max_requests=2,
+            split_on_truncation=True,
+        )
+        assert calls == 2
+        assert res_cached.telemetry.cache_misses == 2
+        assert res_cached.telemetry.cache_hits == 4
+
+        # 2) Delete the 2 parent cache files AND 1 child cache file -> 2 parent misses + 1 child miss = 3 > 2!
+        child_files = [p for p in cache_dir.rglob("*.json") if p.stem not in parent_keys]
+        for p in cache_dir.rglob("*.json"):
+            if p.stem in parent_keys:
+                p.unlink()
+        child_files[0].unlink()
+
+        calls = 0
+        with pytest.raises(RationalizationError, match="max_requests"):
+            real_rationalize(
+                BOM_DOC,
+                schema=Assembly,
+                prompt="Extract.",
+                models=(g_prov, a_prov),
+                cache_dir=cache_dir,
+                max_requests=2,
+                split_on_truncation=True,
+            )
+        assert calls == 2
+
+
+class TestParallelPreflightPackingAndCacheWarm:
+    def test_multi_document_packing_runs_in_parallel_preserves_order_and_lowest_index_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        docs = tuple(build_bom_document(source_name=f"bom_{idx}.pdf") for idx in range(4))
+        barrier = threading.Barrier(4, timeout=3.0)
+        real_build_units = api_module.build_units
+
+        def concurrent_build_units(doc: PDFDocument, **kwargs: Any):
+            barrier.wait()
+            return real_build_units(doc, **kwargs)
+
+        monkeypatch.setattr(api_module, "build_units", concurrent_build_units)
+        p_g, p_a, _ = make_bom_providers()
+        res = real_rationalize(docs, schema=Assembly, prompt="Extract BOM.", models=(p_g, p_a))
+        assert [item.doc_id for item in res.items] == [
+            docs[0].metadata.doc_id,
+            docs[0].metadata.doc_id,
+            docs[1].metadata.doc_id,
+            docs[1].metadata.doc_id,
+            docs[2].metadata.doc_id,
+            docs[2].metadata.doc_id,
+            docs[3].metadata.doc_id,
+            docs[3].metadata.doc_id,
+        ]
+
+        # Deterministic lowest-index error: doc 3 fails immediately, releasing doc 1 which fails second -> doc 1 wins!
+        doc3_failed = threading.Event()
+
+        def ordered_fail_build_units(doc: PDFDocument, **kwargs: Any):
+            if doc.metadata.doc_id == docs[3].metadata.doc_id:
+                doc3_failed.set()
+                raise PDFEncryptedError("doc_3_encrypted")
+            if doc.metadata.doc_id == docs[1].metadata.doc_id:
+                doc3_failed.wait(timeout=3.0)
+                raise PDFCorruptError("doc_1_corrupt")
+            return real_build_units(doc, **kwargs)
+
+        monkeypatch.setattr(api_module, "build_units", ordered_fail_build_units)
+        with pytest.raises(PDFCorruptError, match="doc_1_corrupt"):
+            real_rationalize(docs, schema=Assembly, prompt="Extract BOM.", models=(p_g, p_a))

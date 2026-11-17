@@ -72,7 +72,7 @@ from datagrunt.rationalization.wire import ModelRequest, ProviderResponse
 from rationalization_tests.test_schema import REALISTIC
 
 KEY = "AIza-test-KEY-hunter2"
-TOKEN = "ya29.test-TOKEN-hunter2"
+TOKEN = "tok0.test-TOKEN-hunter2"
 SECRET_VALUES = (KEY, TOKEN, "hunter2")
 MODEL = "gemini-2.5-flash"
 CLOUD_MODEL = "gemini-2.5-pro"
@@ -642,7 +642,7 @@ class TestGoogleCloudRequest:
 
     def test_the_token_is_called_once_per_request_never_at_construction(self):
         handler = Recorder()
-        source = TokenSource("ya29.first-hunter2", "ya29.second-hunter2")
+        source = TokenSource("tok0.first-hunter2", "tok0.second-hunter2")
         provider = cloud(handler, token=source)
 
         assert source.calls == 0
@@ -651,8 +651,8 @@ class TestGoogleCloudRequest:
 
         assert source.calls == 2
         assert [sent.headers["authorization"] for sent in handler.seen] == [
-            "Bearer ya29.first-hunter2",
-            "Bearer ya29.second-hunter2",
+            "Bearer tok0.first-hunter2",
+            "Bearer tok0.second-hunter2",
         ]
 
     @pytest.mark.parametrize("make", [cloud, express])
@@ -740,7 +740,7 @@ class TestGoogleCloudAuth:
             "   ",
             f"{TOKEN}\n",
             f" {TOKEN}",
-            "ya29.tök-hunter2",
+            "tok0.tök-hunter2",
             "ya29\x00hunter2",
             "ya29 inner-hunter2",
             "ya29\tinner-hunter2",
@@ -1890,7 +1890,7 @@ class TestIdentity:
             f"google-cloud:projects/{PROJECT}/locations/{location}/publishers/google/models/{CLOUD_MODEL}"
         )
         assert provider.rate_key == provider.model_id
-        assert provider.max_connections == 8
+        assert provider.max_connections == 64
 
     def test_two_models_in_one_project_never_share_a_rate_key(self):
         auth = GoogleCloudAuth(token=TokenSource())
@@ -1975,7 +1975,7 @@ class TestIdentity:
         assert provider.model_family == "google"
 
     @pytest.mark.parametrize(
-        ("given", "held"), [({}, 8), ({"max_connections": 3}, 3), ({"max_connections": 1024}, 1024)]
+        ("given", "held"), [({}, 64), ({"max_connections": 3}, 3), ({"max_connections": 1024}, 1024)]
     )
     @pytest.mark.parametrize("make", [gemini, cloud])
     def test_max_connections_is_exposed_read_only(self, make, given, held):
@@ -2504,3 +2504,11 @@ class TestMultimodalImages:
         provider.generate(req)
         provider.generate(req)
         assert calls == [False, True]
+
+    def test_gemini_default_pool_and_concurrency_cap_support_256(self):
+        default_prov = GeminiProvider("gemini-2.5-flash", api_key=KEY)
+        assert default_prov.max_connections == 64
+        assert default_prov._client.keepalive_connections == 64
+        assert default_prov.with_max_concurrency(256).max_concurrency == 256
+        with pytest.raises(RationalizationError, match="max_concurrency"):
+            default_prov.with_max_concurrency(257)

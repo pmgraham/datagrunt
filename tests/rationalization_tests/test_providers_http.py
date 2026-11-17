@@ -1492,7 +1492,8 @@ def test_keepalive_connections_defaults_to_zero_and_validates_bounds(monkeypatch
     pooled.close()
     assert pooled.keepalive_connections == 4
     assert captured[-1]["limits"].max_keepalive_connections == 4
-    assert captured[-1]["limits"].keepalive_expiry == 15.0
+    assert http_module.KEEPALIVE_EXPIRY_S == 60.0
+    assert captured[-1]["limits"].keepalive_expiry == 60.0
 
     for bad in (-1, 1025):
         with pytest.raises(ValueError, match="keepalive_connections"):

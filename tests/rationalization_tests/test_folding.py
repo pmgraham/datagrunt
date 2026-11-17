@@ -1579,3 +1579,88 @@ class TestGroundedUnionTierHelpers:
         assert folded.records == (clean_rec,)
         assert folded.grounded_items == (it_consensus, it_grounded_partial)
         assert folded.grounded_records == (clean_rec, single_family_grounded_rec)
+
+
+class TestGroundedRecordSourceName:
+    def test_source_name_defaults_and_omitted_from_repr(self) -> None:
+        fields = dataclasses.fields(GroundedRecord)
+        assert fields[-1].name == "source_name"
+        assert fields[-1].repr is False
+
+        default_item = make_grounded_record()
+        assert default_item.source_name == ""
+
+        named_item = make_grounded_record(source_name="SECRET_CUSTOMER_BOM_2026.pdf")
+        assert named_item.source_name == "SECRET_CUSTOMER_BOM_2026.pdf"
+        assert "SECRET_CUSTOMER_BOM_2026.pdf" not in repr(named_item)
+
+        base_kwargs: dict[str, Any] = {
+            "doc_id": DOC_ID,
+            "unit_ids": (U1,),
+            "status": "consensus",
+            "key": ("A-100",),
+            "record": default_item.record,
+            "disputed_fields": (),
+            "notes": (),
+            "grounding_reasons": (),
+            "sources": default_item.sources,
+            "grounding_quotes": default_item.grounding_quotes,
+            "model_votes": default_item.model_votes,
+            "quotes_by_model": default_item.quotes_by_model,
+            "element_ids_by_model": default_item.element_ids_by_model,
+            "families": default_item.families,
+        }
+        trusted_default: GroundedRecord[Assembly] = GroundedRecord._trusted(**base_kwargs)
+        assert trusted_default.source_name == ""
+
+        trusted_named: GroundedRecord[Assembly] = GroundedRecord._trusted(
+            **base_kwargs, source_name="SECRET_TRUSTED.pdf"
+        )
+        assert trusted_named.source_name == "SECRET_TRUSTED.pdf"
+        assert "SECRET_TRUSTED.pdf" not in repr(trusted_named)
+
+    def test_source_name_rejects_non_str_types(self) -> None:
+        default_item = make_grounded_record()
+        base_kwargs: dict[str, Any] = {
+            "doc_id": DOC_ID,
+            "unit_ids": (U1,),
+            "status": "consensus",
+            "key": ("A-100",),
+            "record": default_item.record,
+            "disputed_fields": (),
+            "notes": (),
+            "grounding_reasons": (),
+            "sources": default_item.sources,
+            "grounding_quotes": default_item.grounding_quotes,
+            "model_votes": default_item.model_votes,
+            "quotes_by_model": default_item.quotes_by_model,
+            "element_ids_by_model": default_item.element_ids_by_model,
+            "families": default_item.families,
+        }
+        bad_sources: tuple[Any, ...] = (None, 123, True, ["report.pdf"])
+        for bad_source in bad_sources:
+            with pytest.raises(TypeError, match="source_name"):
+                make_grounded_record(source_name=bad_source)
+            with pytest.raises(TypeError, match="source_name"):
+                GroundedRecord._trusted(**base_kwargs, source_name=bad_source)
+
+    def test_fold_documents_populates_source_name_on_single_and_multi_unit_records(self) -> None:
+        doc_a = make_doc(page(1, (para(1, 0, "Assembly A-100 Main Pump."),)), source_name="alpha_drawing.pdf")
+        run_a = prepare_doc(doc_a)
+        (ua,) = run_a.unit_ids
+
+        ra = {"assembly_id": "A-100", "title": "Main Pump"}
+        r1 = {"assembly_id": "A-100", "title": "Main Pump"}
+        r2 = {"assembly_id": "A-100", "notes": "Spare"}
+        responses = {
+            (ua, G): response(entry(ra, ("Assembly A-100 Main Pump.",), ("p0001_e000",))),
+            (ua, A): response(entry(ra, ("Assembly A-100 Main Pump.",), ("p0001_e000",))),
+            (U1, G): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U1, A): response(entry(r1, ("Assembly A-100 Main Pump",), (E_P1,))),
+            (U2, G): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+            (U2, A): response(entry(r2, ("Assembly A-100 Spare",), (E_P2,))),
+        }
+        result = run_and_fold(responses, run_a, BOM_RUN)
+        assert [item.source_name for item in result.items] == ["alpha_drawing.pdf", "report.pdf"]
+        for item in result.items:
+            assert item.source_name not in repr(item)

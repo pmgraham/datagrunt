@@ -56,10 +56,12 @@ class TestPerProviderConcurrencyCap:
             returned = provider.with_max_concurrency(2)
             assert returned is provider
             assert provider.max_concurrency == 2
+            provider.with_max_concurrency(256)
+            assert provider.max_concurrency == 256
             provider.with_max_concurrency(None)
             assert provider.max_concurrency is None
 
-            for bad in (0, -1, 65, True, "2"):
+            for bad in (0, -1, 257, True, "2"):
                 with pytest.raises(RationalizationError, match="max_concurrency"):
                     getattr(provider, "with_max_concurrency")(bad)
 
@@ -223,7 +225,7 @@ class TestOfflineCloudBatchMode:
             "gemini-2.5-pro",
             project="demo-proj",
             location="global",
-            auth=GoogleCloudAuth(token=lambda: "ya29.unused"),
+            auth=GoogleCloudAuth(token=lambda: "tok0.unused"),
         )
         ant = AnthropicProvider("claude-opus-4-7", api_key="sk-ant-test-key")
 
@@ -403,6 +405,11 @@ class TestMultimodalBatch:
             encode_calls.append(img)
             return real_encode(img)
 
+        fresh_lru = base_module._ImageB64LRU(
+            base_module.IMAGE_B64_CACHE_MAX_ENTRIES,
+            base_module.IMAGE_B64_CACHE_MAX_BYTES,
+        )
+        monkeypatch.setattr(base_module, "_IMAGE_B64_LRU", fresh_lru)
         monkeypatch.setattr(base_module, "encode_png_b64", spy_encode)
         assert plan.to_vertex_jsonl(tmp_path / "two_vertex.jsonl") == 2
         assert len(encode_calls) == 1

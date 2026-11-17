@@ -25,7 +25,7 @@ Datagrunt is not an extension of or a replacement for DuckDB, Polars, or PyArrow
 - **Parquet Reading & Writing:** Read `.parquet` files into DataFrames, dicts, Arrow tables, or SQL, and export to CSV, JSON, JSONL, Parquet, or Excel. Backed by a single Polars engine with full `read_options`/`write_options` passthrough.
 - **Robust by Default:** Fail-fast validation with clear errors (invalid engine names, missing paths, directories, encrypted PDFs), graceful handling of empty files, no `UnicodeDecodeError` when constructing a reader over a non-UTF-8 file, and sane comment semantics — only leading `#` lines are treated as comments, so `#`-prefixed data rows such as hex colors are preserved on all engines.
 - **PDF Parsing, OCR & Corpus Bundles:** Read PDFs into a typed document of headings, paragraphs, key-value pairs, tables, lists, and figures — as DataFrames, Arrow tables, dicts, Markdown, or SQL — and write JSON, JSONL, Markdown, Parquet, CSV, images, checksummed single-document bundles (`write_bundle`, `render_pages="vision_only"`), or parallel multi-document corpora (`extract_corpus`, `load_corpus`). Hidden text is flagged, never dropped, and scanned pages are read with optional [Tesseract](https://github.com/tesseract-ocr/tesseract) OCR. Powered by the permissively-licensed **PDFium** engine with an in-process zero-subprocess fast path (`sandbox=False`) and optional process-isolated sandboxing (`sandbox=True`).
-- **Schema-Driven PDF Rationalization (v5.1+):** Extract Pydantic records across PDF documents, bundles, or corpora (`rationalize()`) with adaptive section coalescing, multimodal VLM routing on scanned/image-only pages (`multimodal=True`), normalized identity keys (`Key(normalizer="alnum_upper")`), non-disputing `Informational` fields, cross-family consensus (`min_families=2`), 3-witness quote & key grounding, cross-unit entity folding (`fold_across_units=True`), grounded-union result tiers (`grounded_records`, `include_grounded_union=True`), and offline cloud batch execution (`prepare_batch`, `ingest_batch`).
+- **Schema-Driven PDF Rationalization (v5.1+):** Extract one or many Pydantic schemas across PDF documents, bundles, or corpora (`rationalize()`, `rationalize_many()`, `PassSpec`) with adaptive section coalescing, automatic unit bisection on output truncation (`split_on_truncation=True`), multimodal VLM routing and cross-family scan grounding (`multimodal=True`), normalized identity keys (`Key(normalizer="alnum_upper")`), non-disputing `Informational` fields, cross-family consensus (`min_families=2`), 3-witness quote & key grounding, cross-unit entity folding (`fold_across_units=True`), provenance-by-default atomic JSONL & DataFrame exports (`to_jsonl()`, `to_dataframe()`, `telemetry.to_dict()`), up to 256 concurrent in-flight requests with live telemetry (`event_delivery="live"`), and offline cloud batch execution (`prepare_batch`, `ingest_batch`).
 - **Pythonic API:** Enjoy a clean and intuitive API that integrates seamlessly into your existing Python workflows.
 
 ### Powertools Under The Hood
@@ -587,16 +587,40 @@ result = rationalize(
 
 strict_df = result.to_dataframe()                            # strict consensus records
 union_df = result.to_dataframe(include_grounded_union=True)  # consensus + grounded single-family (_status, _doc_id)
+result.to_jsonl("out/part_mentions.jsonl")                   # atomic UTF-8 JSONL with full provenance + audit rows
+telemetry = result.telemetry.to_dict()                       # pure stdlib-JSON-serializable counters & model usage
 review = result.needs_review                                 # disputed, ungrounded, or cross-page-conflict items
 ```
 
+To run multiple extraction schemas in one pass over the same loaded corpus and shared HTTP connection pool, use `rationalize_many()` with `PassSpec`:
+
+```python
+from datagrunt import PassSpec, rationalize_many
+
+results = rationalize_many(
+    corpus,
+    passes=[
+        PassSpec(schema=DocProfile, prompt="Classify the drawing.", name="profile"),
+        PassSpec(schema=PartMention, prompt="Extract every BOM part.", name="parts", max_output_tokens=16_384),
+    ],
+    models=models,
+    max_concurrency=64,
+    max_concurrency_per_provider=32,
+    event_delivery="live",   # stream TelemetryEvents in arrival order without head-of-line blocking
+    cache_dir=".dg-cache",
+)
+results["parts"].to_jsonl("out/parts.jsonl")
+```
+
 - **Schema markers (`Key` & `Informational`):** `Key` marks identity fields (`Annotated[str, Key]`, `Key("part")`, or `Key("part", normalizer="alnum_upper")`), including nested `model_list` child keys. `Informational` marks non-disputing fields whose wording variance never discards an agreed record — optional scalars prefer populated values over `None`, and `Informational` `list[scalar]` fields unite distinct normalized items in first-seen order across models and units.
-- **Cross-family consensus & result tiers (`min_families=2`):**
+- **Multi-pass execution & automatic truncation bisection:** `rationalize_many()` loads and verifies bundles once in bounded parallel (`load_corpus_documents`), pre-warms `FileCache` keys concurrently, and shares one provider HTTP pool and rate-limiter map across all `PassSpec` passes. Both `rationalize()` and `rationalize_many()` default to `split_on_truncation=True`, automatically bisecting multi-element units and multi-row `Table` / multi-item `BulletList` elements at their midpoint (up to 16 rounds) whenever a provider response hits `finish="truncated"`.
+- **Cross-family consensus, provenance & exports (`min_families=2`):**
   - `result.records`: strict clean tier (`status in ("consensus", "single_model")`, with `must_agree=(...)` enforcing unanimity on critical paths).
   - `result.grounded_records` / `result.grounded_items` (or `to_dataframe(..., include_grounded_union=True)`, `to_dicts`, `to_arrow_table`): grounded-union tier (`"consensus"`, `"single_model"`, and element-grounded `"missing_in_some_models"` items with zero `grounding_reasons`, `disputed_fields`, or `notes`), preserving single-family catches alongside `_status` and `_doc_id` attribution.
+  - `result.to_jsonl(path, *, include_provenance=True, include_disputed=True, include_grounded_union=False)`: atomic UTF-8 JSONL export attaching first-class provenance (`_doc_id`, `_source_name`, `_status`, `_is_grounded`, `_is_grounded_union`, `_unit_ids`, `_supporting_models`, `_grounding_quotes`, `_disputed_fields`, `_notes`, `_grounding_reasons`, and `_sources` page/bounding-box records) and preserving `record=None` audit rows; `result.telemetry.to_dict()` exports JSON-serializable run counters and per-model token/latency usage, and every folded `GroundedRecord` carries `source_name` (omitted from `repr`).
   - `result.needs_review`: `"field_disagreement"` (retaining non-conflicting multi-unit folded records), `"ungrounded_value"`, or `"cross_page_conflict"` items, each carrying `GroundedRecord.sources` (`doc_id`, `page_number`, `element_id`, `bbox`).
-- **3-witness quote and key grounding:** supporting models must cite non-header elements (`source_element_ids`) and provide `grounding_quotes` verified against cited elements (exact substring on digital elements; token containment ≥ 0.85 on vision/OCR elements, out-of-prompt OCR witnesses on multimodal scans, and cross-family peer-quote corroboration on textless `ocr="never"` scans) containing all root and child `Key` values.
-- **Providers & offline cloud batches:** model strings require an explicit prefix (`openai:`, `anthropic:`, `gemini:`, `ollama:`, or `openai-compatible:<model>@<url>`), or pass `GeminiProvider`, `AnthropicProvider` (`schema_mode="native" | "prompt" | "prompt_fallback"`), or `OpenAICompatibleProvider` (with pooled HTTP keep-alive and `GoogleCloudAuth` for Vertex AI). For asynchronous cloud batch APIs, build uncached requests with `plan = prepare_batch(...)`, export via `plan.to_vertex_jsonl(...)` / `plan.to_anthropic_jsonl(...)`, and assemble the full `RationalizedResult` with `ingest_batch(plan, responses)`.
+- **3-witness quote, key, and `image_only` scan grounding:** supporting models must cite non-header elements (`source_element_ids`) and provide `grounding_quotes` verified against cited elements (exact substring on digital elements; token containment ≥ 0.85 on vision/OCR elements, out-of-prompt OCR witnesses on multimodal scans, and cross-family peer-quote or substantive structured field agreement across ≥ `min_families` known model families on pure `image_only` textless scans) containing all root and child `Key` values.
+- **High-concurrency providers, live telemetry & offline cloud batches:** `max_concurrency` and `max_concurrency_per_provider` scale up to `CONCURRENCY_LIMIT = 256` over pooled 64-connection, 60-second TLS keep-alive transports with per-publisher/model Vertex AI rate-limit isolation and `event_delivery="ordered" | "live"` streaming hooks. Model strings require an explicit prefix (`openai:`, `anthropic:`, `gemini:`, `ollama:`, or `openai-compatible:<model>@<url>`), or pass `GeminiProvider`, `AnthropicProvider` (`schema_mode="native" | "prompt" | "prompt_fallback"`), or `OpenAICompatibleProvider` (with `GoogleCloudAuth` for Vertex AI). For asynchronous cloud batch APIs, build uncached requests with `plan = prepare_batch(...)`, export via `plan.to_vertex_jsonl(...)` / `plan.to_anthropic_jsonl(...)`, and assemble the full `RationalizedResult` with `ingest_batch(plan, responses)`.
 
 ## Engine Comparison
 
@@ -628,10 +652,10 @@ _The engines above apply to CSV processing. Whichever you pick, results are cons
 - **`extract_corpus` / `load_corpus`**: Parallel multi-PDF corpus extraction with LPT scheduling, SHA-256 incremental reuse, and `CorpusManifest` verification
 
 ### Rationalization
-- **`rationalize`**: Adaptive multimodal extraction, 3-witness quote/key grounding, cross-family consensus, and cross-unit folding over PDFs, bundles, or `CorpusManifest`s
+- **`rationalize` & `rationalize_many`**: Single- and multi-schema (`PassSpec`) multimodal extraction, automatic truncation bisection (`split_on_truncation=True`), 3-witness quote/key/scan grounding, cross-family consensus, and cross-unit folding over PDFs, bundles, or `CorpusManifest`s
 - **`Key` & `Informational`**: `Annotated` schema markers for entity identity (`Key("part", normalizer="alnum_upper")`) and non-disputing descriptive/list fields (`Informational`)
 - **`prepare_batch` & `ingest_batch`**: Offline Vertex AI and Anthropic Message Batches JSONL generation (`BatchPlan`) and response ingestion
-- **`RationalizedResult` & `GroundedRecord`**: Strict (`records`), grounded-union (`grounded_records`, `grounded_items`, `include_grounded_union=True`), and review (`needs_review`) tiers with `ElementSource` bounding-box provenance, telemetry, and Polars/Arrow/dict exports
+- **`RationalizedResult` & `GroundedRecord`**: Strict (`records`), grounded-union (`grounded_records`, `grounded_items`, `include_grounded_union=True`), and review (`needs_review`) tiers with `GroundedRecord.source_name`, `ElementSource` bounding-box provenance, atomic provenance-by-default `to_jsonl()`, `telemetry.to_dict()`, and Polars/Arrow/dict exports
 
 ## Full Documentation
 

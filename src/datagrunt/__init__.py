@@ -102,7 +102,9 @@ __all__ = [
     "load_corpus",
     "Key",
     "Informational",
+    "PassSpec",
     "rationalize",
+    "rationalize_many",
     "RationalizedResult",
     "BatchItem",
     "BatchPlan",
@@ -132,7 +134,16 @@ _PDF_DIRECT_NAMES = _MappingProxyType(
     }
 )
 _RATIONALIZE_NAMES = frozenset(
-    {"rationalize", "RationalizedResult", "BatchItem", "BatchPlan", "prepare_batch", "ingest_batch"}
+    {
+        "PassSpec",
+        "rationalize",
+        "rationalize_many",
+        "RationalizedResult",
+        "BatchItem",
+        "BatchPlan",
+        "prepare_batch",
+        "ingest_batch",
+    }
 )
 # The subpackages that ``import datagrunt`` bound as its attributes when it imported these APIs eagerly: each is
 # still an attribute, imported at its first access.
@@ -156,10 +167,12 @@ if TYPE_CHECKING:
     from datagrunt.rationalization import (
         BatchItem,
         BatchPlan,
+        PassSpec,
         RationalizedResult,
         ingest_batch,
         prepare_batch,
         rationalize,
+        rationalize_many,
     )
 
 

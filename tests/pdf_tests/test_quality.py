@@ -23,8 +23,22 @@ import datagrunt.pdf
 from datagrunt.pdf import _hidden_rules, _pdfium_recover, elements, quality
 from datagrunt.pdf._hidden_rules import em_reasons
 from datagrunt.pdf.elements import BBox
-from datagrunt.pdf.pdfium_engine import RawImage, RawPage, RawSpan, extract_page, open_document
-from datagrunt.pdf.quality import SpanPiece, assess_page, classify_spans, raster_cover_fraction
+from datagrunt.pdf.pdfium_engine import (
+    ImageStats,
+    ObjectBoxes,
+    PageGeometry,
+    PageImages,
+    PageSegments,
+    PageText,
+    RawImage,
+    RawPage,
+    RawSpan,
+    SegmentStats,
+    TextStats,
+    extract_page,
+    open_document,
+)
+from datagrunt.pdf.quality import SpanPiece, assess_page, classify_spans, needs_background, raster_cover_fraction
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
 from pdf_tests.test_pdfium_spans import SQUEEZED, TURNED, content_page, nested_text_page, two_forms_page
@@ -1071,3 +1085,153 @@ class TestModuleImports:
         assert name not in datagrunt.pdf.__all__
         assert not hasattr(datagrunt.pdf, name)
         assert not hasattr(datagrunt, name)
+
+
+def _synthetic_raw_page(
+    spans: tuple[RawSpan, ...],
+    *,
+    width_pt: float = W,
+    height_pt: float = H,
+    boxes: tuple[tuple[float, float, float, float], ...] = (),
+    glyph_boxes: tuple[tuple[float, float, float, float], ...] = (),
+) -> RawPage:
+    """Build an in-memory RawPage for deterministic quality and gate scaling tests."""
+    char_count = sum(len(s.text) for s in spans)
+    map_err_count = sum(len(s.map_errors) for s in spans)
+    return RawPage(
+        geometry=PageGeometry(
+            page_number=1,
+            width_pt=width_pt,
+            height_pt=height_pt,
+            rotation_deg=0,
+            crop_offset=(0.0, 0.0),
+        ),
+        text=PageText(
+            spans=spans,
+            stats=TextStats(
+                char_count=char_count,
+                generated_count=0,
+                ownerless_count=0,
+                unicode_map_error_count=map_err_count,
+                skipped_nonfinite_objects=0,
+                dropped_text_objects=0,
+                empty_text_objects=0,
+            ),
+        ),
+        segments=PageSegments(segments=(), stats=SegmentStats(skipped_nonfinite_paths=0)),
+        images=PageImages(
+            images=(),
+            stats=ImageStats(
+                skipped_nonfinite_images=0,
+                skipped_oversized_images=0,
+                skipped_unsized_images=0,
+                skipped_over_budget_images=0,
+                skipped_overlong_images=0,
+                max_cover_fraction=0.0,
+            ),
+        ),
+        object_boxes=ObjectBoxes(boxes=boxes, unboxed=0, glyph_stroke_boxes=glyph_boxes),
+    )
+
+
+class TestHotPathScalingAndAsciiFastPath:
+    """Wave-2 hot-path optimizations: split x0 bands, gap-bridge guard, sorted gate bands, and ASCII fast-path."""
+
+    def test_wide_cad_border_and_compound_strokes_do_not_poison_narrow_glyph_bands(self):
+        cad_w, cad_h = 842.0, 595.0
+        strokes: list[tuple[float, float, float, float]] = []
+        for band in range(32):
+            y = 8.0 + band * (cad_h / 32.0)
+            strokes.append((10.0, y, 820.0, y + 12.0))  # >600pt border rule
+            strokes.append((10.0, y, 460.0, y + 12.0))  # 450pt compound path
+        spans: list[RawSpan] = []
+        for idx in range(1_500):
+            r_idx, c_idx = idx % 50, idx // 50
+            bx = 500.0 + (c_idx * 10.5) % 300.0
+            by = 15.0 + r_idx * 11.0
+            word = f"K{idx % 900 + 100}A"
+            cboxes = tuple((bx + k * 4.2, by, bx + k * 4.2 + 3.8, by + 6.0) for k in range(len(word)))
+            for cb in cboxes:
+                strokes.append((cb[0] + 0.3, cb[1] + 0.4, cb[2] - 0.3, cb[3] - 0.4))
+            spans.append(raw_span(word, cboxes, font_size_pt=6.0, em_width_pt=6.0, render_mode=3, object_index=idx))
+        rng = random.Random(99)
+        while len(strokes) < 12_000:
+            sx = rng.uniform(20.0, 480.0)
+            sy = rng.uniform(10.0, 580.0)
+            strokes.append((sx, sy, sx + 2.5, sy + 4.0))
+
+        pieces = classify_spans(tuple(spans), width_pt=cad_w, height_pt=cad_h, images=(), glyph_boxes=tuple(strokes))
+        assert all(not p.hidden_reasons for p in pieces)
+
+        # Compound word outline (200 x 10 pt) still backs normal letters while rejecting rule-like chars.
+        comp_box = ((60.0, 91.0, 260.0, 101.0),)
+        word_span = raw_span("WORD", row(4, 72.0), render_mode=3)
+        rule_span = raw_span("____", row(4, 72.0), render_mode=3)
+        assert [
+            p.hidden_reasons
+            for p in classify_spans((word_span,), width_pt=W, height_pt=H, images=(), glyph_boxes=comp_box)
+        ] == [()]
+        assert [
+            p.hidden_reasons
+            for p in classify_spans((rule_span,), width_pt=W, height_pt=H, images=(), glyph_boxes=comp_box)
+        ] == [("invisible",)]
+
+    def test_bridge_short_drift_gaps_skips_token_glyph_intervals_when_all_chars_backed(self, monkeypatch):
+        cboxes = row(8, 72.0)
+        span = raw_span("PN-20450", cboxes, render_mode=3)
+        strokes = tuple((b[0] + 0.5, b[1] + 1.0, b[2] - 0.5, b[3] - 1.0) for b in cboxes)
+
+        def forbid_intervals(*_args, **_kwargs):
+            raise AssertionError("_token_glyph_intervals must not run when every char is already backed")
+
+        monkeypatch.setattr(quality, "_token_glyph_intervals", forbid_intervals)
+        pieces = classify_spans((span,), width_pt=W, height_pt=H, images=(), glyph_boxes=strokes)
+        assert [(p.text, p.hidden_reasons) for p in pieces] == [("PN-20450", ())]
+
+    def test_gate_selection_x0_sorted_bands_avoids_linear_scan_budget_exhaustion(self, monkeypatch):
+        header_rule = (10.0, 2.0, 390.0, 4.0)
+        left_ticks = tuple(
+            (5.0 + (i % 8) * 3.0, 15.0 + (i * 0.018) % 275.0, 7.0 + (i % 8) * 3.0, 17.0 + (i * 0.018) % 275.0)
+            for i in range(15_000)
+        )
+        spans = tuple(
+            raw_span(
+                f"ITEM-{i:04d}",
+                row(9, 70.0 + (i // 50) * 5.0, 20.0 + (i % 50) * 5.2, width=4.0, height=4.5),
+                font_size_pt=6.0,
+                em_width_pt=6.0,
+                object_index=i,
+            )
+            for i in range(2_500)
+        )
+        raw = _synthetic_raw_page(spans, boxes=(header_rule, *left_ticks))
+        assessed = assess_page(raw)
+
+        assert needs_background(raw, assessed) is False
+
+        monkeypatch.setattr(quality, "MAX_GATE_CHECKS", 0)
+        assert needs_background(raw, assessed) is True
+
+    def test_pure_ascii_map_error_free_spans_bypass_per_char_valid_with_exact_parity(self, monkeypatch):
+        clean_ascii = raw_span("Clean ASCII\ttext\n123!\x07", row(22, 20.0, 30.0), object_index=0)
+        partial_offpage = raw_span("EDGE_VISIBLE", row(12, -18.0, 40.0), object_index=1)
+        mapped_err = raw_span("BadMap", row(6, 20.0, 50.0), map_errors=(2, 4), object_index=2)
+        unicode_leader = raw_span("Café \ufffd\ufffd\ufffd \ue000!", row(11, 20.0, 70.0), object_index=3)
+        hidden_ascii = raw_span("TinyHidden", row(10, 20.0, 90.0), font_size_pt=0.5, object_index=4)
+        page = _synthetic_raw_page((clean_ascii, partial_offpage, mapped_err, unicode_leader, hidden_ascii))
+
+        real_fast = quality._is_clean_ascii_span
+        monkeypatch.setattr(quality, "_is_clean_ascii_span", lambda _span: False)
+        slow_oracle = assess_page(page)
+        monkeypatch.setattr(quality, "_is_clean_ascii_span", real_fast)
+
+        real_valid = quality._valid
+
+        def guarded_valid(span: RawSpan, offset: int) -> bool:
+            if not span.map_errors and span.text.isascii():
+                raise AssertionError(f"_valid called on pure-ASCII map-error-free span {span.text!r}")
+            return real_valid(span, offset)
+
+        monkeypatch.setattr(quality, "_valid", guarded_valid)
+        got = assess_page(page)
+        assert got == slow_oracle

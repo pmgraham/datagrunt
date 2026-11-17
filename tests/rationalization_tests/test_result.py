@@ -1,8 +1,11 @@
 """Tests for ``datagrunt.rationalization.result`` (plan §3, §4.10)."""
 
+import json
+import os
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, Literal
 
@@ -878,3 +881,293 @@ def test_grounded_union_properties_and_exports_exclude_ungrounded_and_disputed()
             result.to_dicts(include_grounded_union=bad_flag)  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="include_grounded_union"):
             result.to_arrow_table(include_grounded_union=bad_flag)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# RationalizeTelemetry.to_dict() & RationalizedResult.to_jsonl()
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def test_telemetry_to_dict_json_roundtrip_and_isolation() -> None:
+    telemetry = make_telemetry(
+        document_count=3,
+        unit_count=7,
+        skipped_unit_count=1,
+        empty_unit_count=2,
+        failed_unit_count=1,
+        oversize_unit_count=1,
+        cache_hits=4,
+        cache_misses=10,
+        cache_corrupt=1,
+        cache_write_failures=2,
+        quarantined_count=3,
+        hidden_excluded_by_reason={"off_page": 2, "tiny_font": 5},
+        escaped_by_category={"control": 1, "bidi": 4},
+    )
+    as_dict = telemetry.to_dict()
+    expected = {
+        "document_count": 3,
+        "unit_count": 7,
+        "skipped_unit_count": 1,
+        "empty_unit_count": 2,
+        "failed_unit_count": 1,
+        "oversize_unit_count": 1,
+        "cache_hits": 4,
+        "cache_misses": 10,
+        "cache_corrupt": 1,
+        "cache_write_failures": 2,
+        "quarantined_count": 3,
+        "hidden_excluded_by_reason": {"off_page": 2, "tiny_font": 5},
+        "escaped_by_category": {"control": 1, "bidi": 4},
+        "models": [
+            {"model_id": G, "model_family": "google", "provider_kind": "gemini"},
+            {"model_id": A, "model_family": "anthropic", "provider_kind": "anthropic"},
+        ],
+        "usage_by_model": {
+            G: {"requests": 2, "retries": 0, "input_tokens": 100, "output_tokens": 50, "latency_ms": 12.5},
+            A: {"requests": 2, "retries": 1, "input_tokens": 110, "output_tokens": 55, "latency_ms": 18.0},
+        },
+    }
+    assert as_dict == expected
+    assert json.loads(json.dumps(as_dict, allow_nan=False)) == expected
+
+    # Mutating returned containers never mutates the frozen telemetry instance.
+    as_dict["hidden_excluded_by_reason"]["off_page"] = 999
+    as_dict["escaped_by_category"]["control"] = 999
+    as_dict["models"].clear()
+    as_dict["usage_by_model"][G]["requests"] = 999
+    assert telemetry.to_dict() == expected
+
+
+def _make_named_company_item(
+    company: Company,
+    *,
+    doc_id: str,
+    status: RecordStatus,
+    source_name: str,
+    quote: str,
+    sources: tuple[ElementSource, ...],
+    both_models: bool,
+) -> GroundedRecord[Company]:
+    dump = company.model_dump(mode="json")
+    a_votes = (dump,) if both_models else ()
+    a_quotes = (quote,) if both_models else ()
+    a_eids = ("p0001_e001",) if both_models else ()
+    return GroundedRecord(
+        doc_id=doc_id,
+        unit_ids=(f"{doc_id}:u1",),
+        status=status,
+        key=(company.company_id,),
+        record=company,
+        disputed_fields=(),
+        notes=(),
+        grounding_reasons=(),
+        sources=sources,
+        grounding_quotes=(quote,),
+        model_votes={G: (dump,), A: a_votes},
+        quotes_by_model={G: (quote,), A: a_quotes},
+        element_ids_by_model={G: ("p0001_e001",), A: a_eids},
+        families={G: "google", A: "anthropic"},
+        source_name=source_name,
+    )
+
+
+def _build_jsonl_fixture() -> RationalizedResult[Company]:
+    c_clean = Company(company_id="C-1", company_name="Café Ω", aliases=["A1"])
+    c_partial = Company(company_id="C-2", company_name="GroundedUnionCo")
+    c_ungrounded = Company(company_id="C-3", company_name="UngroundedCo")
+    src1 = ElementSource(
+        doc_id="doc_1",
+        unit_id="doc_1:u1",
+        element_id="p0001_e001",
+        page_number=1,
+        bbox=BOX,
+        scope_path=("Sec 1",),
+    )
+    it_clean = _make_named_company_item(
+        c_clean,
+        doc_id="doc_1",
+        status="consensus",
+        source_name="alpha_bom.pdf",
+        quote="Café Ω",
+        sources=(src1,),
+        both_models=True,
+    )
+    it_partial = _make_named_company_item(
+        c_partial,
+        doc_id="doc_2",
+        status="missing_in_some_models",
+        source_name="beta_scan.pdf",
+        quote="C-2 GroundedUnionCo",
+        sources=(),
+        both_models=False,
+    )
+    reason = GroundingReason(reason="quote_not_found", model_id=G, index=0, text="hallucinated")
+    it_ungrounded = make_grounded(c_ungrounded, status="ungrounded_value", key=("C-3",), grounding_reasons=(reason,))
+    it_conflict = make_grounded(
+        None,
+        status="cross_page_conflict",
+        key=("C-4",),
+        disputed_fields=("company_name",),
+        notes=("conflict across pages",),
+    )
+    return RationalizedResult(
+        items=(it_clean, it_partial, it_ungrounded, it_conflict),
+        records=(c_clean,),
+        needs_review=(it_partial, it_ungrounded, it_conflict),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=COMPANY_SCHEMA,
+    )
+
+
+def test_to_jsonl_default_provenance_and_audit_rows(tmp_path: Path) -> None:
+    result = _build_jsonl_fixture()
+    out_file = tmp_path / "audit.jsonl"
+    written = result.to_jsonl(out_file)
+    assert written == 4
+
+    raw_text = out_file.read_text(encoding="utf-8")
+    assert raw_text.endswith("\n")
+    assert "Café Ω" in raw_text  # ensure_ascii=False preserves UTF-8 text verbatim
+    rows = [json.loads(line) for line in raw_text.splitlines()]
+    assert len(rows) == 4
+
+    assert rows[0]["company_id"] == "C-1"
+    assert rows[0]["_doc_id"] == "doc_1"
+    assert rows[0]["_source_name"] == "alpha_bom.pdf"
+    assert rows[0]["_status"] == "consensus"
+    assert rows[0]["_is_grounded"] is True
+    assert rows[0]["_is_grounded_union"] is True
+    assert rows[0]["_unit_ids"] == ["doc_1:u1"]
+    assert rows[0]["_supporting_models"] == [G, A]
+    assert rows[0]["_grounding_quotes"] == ["Café Ω"]
+    assert rows[0]["_disputed_fields"] == []
+    assert rows[0]["_notes"] == []
+    assert rows[0]["_grounding_reasons"] == []
+    assert rows[0]["_sources"] == [
+        {
+            "doc_id": "doc_1",
+            "unit_id": "doc_1:u1",
+            "element_id": "p0001_e001",
+            "page_number": 1,
+            "bbox": {"x0": BOX.x0, "y0": BOX.y0, "x1": BOX.x1, "y1": BOX.y1},
+            "scope_path": ["Sec 1"],
+        }
+    ]
+
+    assert rows[1]["_supporting_models"] == [G]
+    assert rows[1]["_source_name"] == "beta_scan.pdf"
+    assert rows[1]["_is_grounded_union"] is True
+
+    assert rows[2]["_status"] == "ungrounded_value"
+    assert rows[2]["_is_grounded"] is False
+    assert rows[2]["_grounding_reasons"] == [
+        {"reason": "quote_not_found", "model_id": G, "index": 0, "key_field": None, "text": "hallucinated"}
+    ]
+
+    # record=None audit row starts from {} and preserves full provenance
+    assert "company_id" not in rows[3]
+    assert rows[3]["_status"] == "cross_page_conflict"
+    assert rows[3]["_disputed_fields"] == ["company_name"]
+    assert rows[3]["_notes"] == ["conflict across pages"]
+
+
+def test_to_jsonl_disputed_and_grounded_union_tiers(tmp_path: Path) -> None:
+    result = _build_jsonl_fixture()
+
+    p_disp_noprov = tmp_path / "disp_noprov.jsonl"
+    assert result.to_jsonl(str(p_disp_noprov), include_provenance=False, include_disputed=True) == 3
+    rows_disp = [json.loads(ln) for ln in p_disp_noprov.read_text(encoding="utf-8").splitlines()]
+    assert [r["company_id"] for r in rows_disp] == ["C-1", "C-2", "C-3"]
+    assert [r["_status"] for r in rows_disp] == ["consensus", "missing_in_some_models", "ungrounded_value"]
+    assert [r["_doc_id"] for r in rows_disp] == ["doc_1", "doc_2", "doc_1"]
+    assert all("_sources" not in r and "_source_name" not in r for r in rows_disp)
+
+    p_gu_prov = tmp_path / "gu_prov.jsonl"
+    assert result.to_jsonl(p_gu_prov, include_disputed=False, include_grounded_union=True) == 2
+    rows_gu_prov = [json.loads(ln) for ln in p_gu_prov.read_text(encoding="utf-8").splitlines()]
+    assert [r["company_id"] for r in rows_gu_prov] == ["C-1", "C-2"]
+    assert [r["_source_name"] for r in rows_gu_prov] == ["alpha_bom.pdf", "beta_scan.pdf"]
+
+    p_gu_noprov = tmp_path / "gu_noprov.jsonl"
+    assert (
+        result.to_jsonl(p_gu_noprov, include_provenance=False, include_disputed=False, include_grounded_union=True) == 2
+    )
+    rows_gu_noprov = [json.loads(ln) for ln in p_gu_noprov.read_text(encoding="utf-8").splitlines()]
+    assert [(r["company_id"], r["_status"], r["_doc_id"]) for r in rows_gu_noprov] == [
+        ("C-1", "consensus", "doc_1"),
+        ("C-2", "missing_in_some_models", "doc_2"),
+    ]
+    assert all("_sources" not in r for r in rows_gu_noprov)
+
+
+def test_to_jsonl_clean_tier_and_empty_result(tmp_path: Path) -> None:
+    result = _build_jsonl_fixture()
+
+    p_clean_prov = tmp_path / "clean_prov.jsonl"
+    assert result.to_jsonl(p_clean_prov, include_disputed=False) == 1
+    (row_clean_prov,) = [json.loads(ln) for ln in p_clean_prov.read_text(encoding="utf-8").splitlines()]
+    assert row_clean_prov["company_id"] == "C-1" and row_clean_prov["_source_name"] == "alpha_bom.pdf"
+
+    p_clean_bare = tmp_path / "clean_bare.jsonl"
+    assert result.to_jsonl(p_clean_bare, include_provenance=False, include_disputed=False) == 1
+    (row_clean_bare,) = [json.loads(ln) for ln in p_clean_bare.read_text(encoding="utf-8").splitlines()]
+    assert row_clean_bare == result.records[0].model_dump(mode="json")
+
+    empty_res: RationalizedResult[Any] = RationalizedResult(
+        items=(),
+        records=(),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+    )
+    p_empty = tmp_path / "empty.jsonl"
+    assert empty_res.to_jsonl(p_empty) == 0
+    assert p_empty.read_text(encoding="utf-8") == ""
+
+
+def test_to_jsonl_validation_and_atomic_replace_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    result = _build_jsonl_fixture()
+    valid_target = tmp_path / "out.jsonl"
+
+    for bad_path in (None, 123, b"out.jsonl"):
+        with pytest.raises(TypeError, match="path"):
+            result.to_jsonl(bad_path)  # type: ignore[arg-type]
+    for blank_path in ("", "   ", "bad\x00name.jsonl"):
+        with pytest.raises(ValueError, match="path"):
+            result.to_jsonl(blank_path)
+
+    for bad_bool in (1, 0, "true", None):
+        with pytest.raises(TypeError, match="include_provenance"):
+            result.to_jsonl(valid_target, include_provenance=bad_bool)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_disputed"):
+            result.to_jsonl(valid_target, include_disputed=bad_bool)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_grounded_union"):
+            result.to_jsonl(valid_target, include_grounded_union=bad_bool)  # type: ignore[arg-type]
+
+    # Missing parent directory and directory target raise RationalizationError and leave no staging files
+    with pytest.raises(RationalizationError):
+        result.to_jsonl(tmp_path / "missing_parent" / "out.jsonl")
+    with pytest.raises(RationalizationError):
+        result.to_jsonl(tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+    # Simulated os.replace OSError preserves pre-existing target and unlinks staging file
+    existing = tmp_path / "existing.jsonl"
+    existing.write_text("KEEP_ME\n", encoding="utf-8")
+
+    def boom_replace(src: object, dst: object) -> None:
+        raise OSError("simulated disk error on replace")
+
+    monkeypatch.setattr(os, "replace", boom_replace)
+    with pytest.raises(RationalizationError):
+        result.to_jsonl(existing)
+    assert existing.read_text(encoding="utf-8") == "KEEP_ME\n"
+    assert [p.name for p in tmp_path.iterdir()] == ["existing.jsonl"]

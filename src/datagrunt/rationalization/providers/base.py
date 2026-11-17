@@ -69,12 +69,15 @@ import inside a function (invariant 9).
 
 import base64
 import encodings.idna  # noqa: F401  # the "idna" codec check_endpoint uses, loaded here rather than on a worker thread
+import hashlib
 import inspect
 import ipaddress
 import math
 import os
 import re
+import threading
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -916,21 +919,102 @@ def api_key_from_env(var: str) -> _Secret | None:
 ImageB64Cache: TypeAlias = tuple[tuple[bytes, ...], tuple[str, ...]]
 """Single-entry per-instance memo tuple ``(raw_png_tuple, base64_ascii_tuple)``."""
 
+IMAGE_B64_CACHE_MAX_ENTRIES = 64
+"""Maximum distinct image tuples retained in the process-wide thread-safe Base64 LRU cache."""
 
-def encode_png_b64(img: bytes) -> str:
-    """Encode raw PNG ``bytes`` to an ASCII base64 string."""
+IMAGE_B64_CACHE_MAX_BYTES = 128 * 1024 * 1024
+"""Maximum total raw PNG bytes represented in the process-wide thread-safe Base64 LRU cache."""
+
+_IMAGE_INFLIGHT_WAIT_S = 5.0
+_ImageTupleKey: TypeAlias = tuple[tuple[int, bytes], ...]
+
+
+def _check_png_bytes(img: object) -> bytes:
+    """Validate that ``img`` is exact ``bytes`` starting with the PNG signature."""
     if type(img) is not bytes:
         raise TypeError(f"img must be bytes, got {type(img).__name__}")
     if not img.startswith(PNG_SIGNATURE):
         raise ValueError("img must start with the PNG signature")
-    return base64.b64encode(img).decode("ascii")
+    return img
+
+
+def encode_png_b64(img: bytes) -> str:
+    """Encode raw PNG ``bytes`` to an ASCII base64 string."""
+    checked = _check_png_bytes(img)
+    return base64.b64encode(checked).decode("ascii")
+
+
+class _ImageB64LRU:
+    """Bounded thread-safe multi-entry LRU + singleflight cache for Base64-encoded PNG tuples."""
+
+    def __init__(self, max_entries: int, max_bytes: int) -> None:
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[_ImageTupleKey, tuple[int, tuple[str, ...]]] = OrderedDict()
+        self._inflight: dict[_ImageTupleKey, threading.Event] = {}
+        self._total_bytes = 0
+
+    def _claim_or_get(
+        self, key: _ImageTupleKey
+    ) -> tuple[tuple[str, ...] | None, threading.Event | None, threading.Event | None]:
+        with self._lock:
+            found = self._entries.get(key)
+            if found is not None:
+                self._entries.move_to_end(key)
+                return found[1], None, None
+            waiter = self._inflight.get(key)
+            if waiter is not None:
+                return None, waiter, None
+            own = threading.Event()
+            self._inflight[key] = own
+            return None, None, own
+
+    def _store(self, key: _ImageTupleKey, raw_bytes: int, encoded: tuple[str, ...]) -> None:
+        if raw_bytes > self._max_bytes:
+            return
+        with self._lock:
+            prev = self._entries.pop(key, None)
+            if prev is not None:
+                self._total_bytes -= prev[0]
+            self._entries[key] = (raw_bytes, encoded)
+            self._total_bytes += raw_bytes
+            while self._entries and (len(self._entries) > self._max_entries or self._total_bytes > self._max_bytes):
+                _, (evicted_bytes, _) = self._entries.popitem(last=False)
+                self._total_bytes -= evicted_bytes
+
+    def get_or_encode(self, images: tuple[bytes, ...]) -> tuple[str, ...]:
+        key: _ImageTupleKey = tuple((len(img), hashlib.sha256(img).digest()) for img in images)
+        hit, waiter, own = self._claim_or_get(key)
+        if hit is not None:
+            return hit
+        if waiter is not None:
+            waiter.wait(timeout=_IMAGE_INFLIGHT_WAIT_S)
+            with self._lock:
+                after = self._entries.get(key)
+                if after is not None:
+                    self._entries.move_to_end(key)
+                    return after[1]
+            return tuple(encode_png_b64(img) for img in images)
+        try:
+            encoded = tuple(encode_png_b64(img) for img in images)
+            self._store(key, sum(len(img) for img in images), encoded)
+            return encoded
+        finally:
+            with self._lock:
+                self._inflight.pop(key, None)
+            if own is not None:
+                own.set()
+
+
+_IMAGE_B64_LRU = _ImageB64LRU(IMAGE_B64_CACHE_MAX_ENTRIES, IMAGE_B64_CACHE_MAX_BYTES)
 
 
 def encode_images_b64(
     images: tuple[bytes, ...],
     cached: ImageB64Cache | None = None,
 ) -> tuple[tuple[str, ...], ImageB64Cache | None]:
-    """Encode ``images`` to ASCII base64 strings, reusing ``cached`` on tuple hit."""
+    """Encode ``images`` to ASCII base64 strings, reusing ``cached`` or the shared thread-safe LRU cache."""
     if not isinstance(images, tuple):
         raise TypeError(f"images must be a tuple of bytes, got {type(images).__name__}")
     if not images:
@@ -941,5 +1025,7 @@ def encode_images_b64(
         and (cached[0] is images or all(a is b or a == b for a, b in zip(cached[0], images, strict=True)))
     ):
         return cached[1], cached
-    encoded = tuple(encode_png_b64(img) for img in images)
+    for img in images:
+        _check_png_bytes(img)
+    encoded = _IMAGE_B64_LRU.get_or_encode(images)
     return encoded, (images, encoded)

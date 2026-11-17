@@ -784,3 +784,50 @@ def test_importing_the_module_loads_neither_pydantic_nor_httpx():
     )
     assert completed.returncode == 0, completed.stderr
     assert json.loads(completed.stdout.strip().splitlines()[-1]) == []
+
+
+def test_parsed_response_walks_safe_json_once_and_preserves_all_invariants(monkeypatch):
+    calls: list[object] = []
+    real_safe_json = responses_module.safe_json
+
+    def spy_safe_json(value: object) -> dict[str, object] | None:
+        calls.append(value)
+        return real_safe_json(value)
+
+    monkeypatch.setattr(responses_module, "safe_json", spy_safe_json)
+    txt = '{"records": [{"code": "PN-100", "note": "x\\ud800"}]}'
+    built = responses_module.parsed_response(
+        json_text=txt,
+        raw_text=txt,
+        finish="complete",
+        input_tokens=10,
+        output_tokens=4,
+    )
+    assert len(calls) == 1  # single safe_json walk (not 2x)
+    assert built == response(
+        content=real_safe_json(json.loads(txt)),
+        raw_text=txt,
+        finish="complete",
+        input_tokens=10,
+        output_tokens=4,
+    )
+    assert built.content is not None
+    built.content["records"].append("mutated")  # type: ignore[union-attr]
+    # Duplicate keys and escaped key collisions are still rejected -> content=None
+    for bad_txt in ('{"a": 1, "a": 2}', '{"\\ud800": 1, "[U+D800]": 2}', "not json", None):
+        rejected = responses_module.parsed_response(
+            json_text=bad_txt,
+            raw_text="raw",
+            finish="complete",
+            input_tokens=1,
+            output_tokens=1,
+        )
+        assert rejected.content is None
+    with pytest.raises(ValueError, match="finish"):
+        responses_module.parsed_response(
+            json_text="{}",
+            raw_text="{}",
+            finish="invalid",  # type: ignore[arg-type]
+            input_tokens=None,
+            output_tokens=None,
+        )

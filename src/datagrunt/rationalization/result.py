@@ -27,11 +27,16 @@ records and child items. The module imports only the standard library, polars, p
 model and its sibling modules: nothing from ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import contextlib
+import json
+import os
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generic, TypeVar
 
@@ -202,6 +207,37 @@ class RationalizeTelemetry:
         )
         object.__setattr__(self, "usage_by_model", _check_usage_by_model(self.usage_by_model))
         _check_models_tuple(self.models, self.usage_by_model)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a pure JSON-serializable dict of all counters, reason maps, models and per-model usage."""
+        return {
+            "document_count": self.document_count,
+            "unit_count": self.unit_count,
+            "skipped_unit_count": self.skipped_unit_count,
+            "empty_unit_count": self.empty_unit_count,
+            "failed_unit_count": self.failed_unit_count,
+            "oversize_unit_count": self.oversize_unit_count,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_corrupt": self.cache_corrupt,
+            "cache_write_failures": self.cache_write_failures,
+            "quarantined_count": self.quarantined_count,
+            "hidden_excluded_by_reason": dict(self.hidden_excluded_by_reason),
+            "escaped_by_category": dict(self.escaped_by_category),
+            "models": [
+                {"model_id": entry[0], "model_family": entry[1], "provider_kind": entry[2]} for entry in self.models
+            ],
+            "usage_by_model": {
+                model_id: {
+                    "requests": usage.requests,
+                    "retries": usage.retries,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "latency_ms": usage.latency_ms,
+                }
+                for model_id, usage in self.usage_by_model.items()
+            },
+        }
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -490,6 +526,48 @@ class RationalizedResult(Generic[T]):
             include_grounded_union=include_grounded_union,
         ).to_arrow()
 
+    def to_jsonl(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        include_provenance: bool = True,
+        include_disputed: bool = True,
+        include_grounded_union: bool = False,
+    ) -> int:
+        """Write selected items as atomic UTF-8 JSONL (provenance-by-default) and return the row count."""
+        target_path = _checked_jsonl_options(
+            path,
+            include_provenance=include_provenance,
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+        )
+        selected = self._select_jsonl_items(
+            include_provenance=include_provenance,
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+        )
+        with_meta = include_disputed or include_grounded_union
+        encoded = [
+            _serialize_jsonl_item(item, include_provenance=include_provenance, with_meta=with_meta) for item in selected
+        ]
+        return _write_jsonl_atomic(target_path, encoded)
+
+    def _select_jsonl_items(
+        self,
+        *,
+        include_provenance: bool,
+        include_disputed: bool,
+        include_grounded_union: bool,
+    ) -> Sequence[GroundedRecord[T]]:
+        """Select :class:`GroundedRecord` items for :meth:`to_jsonl` according to export tier flags."""
+        if include_disputed:
+            if include_provenance:
+                return self.items
+            return tuple(item for item in self.items if item.record is not None)
+        if include_grounded_union:
+            return tuple(item for item in self.grounded_items if item.record is not None)
+        return tuple(item for item in self.items if item.status in _CLEAN_STATUSES and item.record is not None)
+
     def _select_records(
         self,
         *,
@@ -509,6 +587,127 @@ class RationalizedResult(Generic[T]):
                 statuses.append(item.status)
                 doc_ids.append(item.doc_id)
         return records, statuses, doc_ids
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# JSONL provenance export helpers
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _checked_jsonl_options(
+    path: object,
+    *,
+    include_provenance: object,
+    include_disputed: object,
+    include_grounded_union: object,
+) -> Path:
+    """Validate :meth:`RationalizedResult.to_jsonl` path and strict boolean flags."""
+    for flag_name, flag_val in (
+        ("include_provenance", include_provenance),
+        ("include_disputed", include_disputed),
+        ("include_grounded_union", include_grounded_union),
+    ):
+        if not isinstance(flag_val, bool):
+            raise TypeError(f"{flag_name} must be a bool, got {type(flag_val).__name__}")
+    if not isinstance(path, (str, os.PathLike)):
+        raise TypeError(f"path must be a str or PathLike[str], got {type(path).__name__}")
+    raw_path = os.fspath(path)
+    if not isinstance(raw_path, str):
+        raise TypeError(f"path must be a str or PathLike[str], got {type(raw_path).__name__}")
+    if not raw_path or not raw_path.strip() or "\x00" in raw_path:
+        raise ValueError("path must be a non-empty path without NUL bytes")
+    return Path(raw_path)
+
+
+def _provenance_fields(item: GroundedRecord[Any]) -> dict[str, Any]:
+    """Build the first-class provenance dictionary for a :class:`GroundedRecord` JSONL row."""
+    if not isinstance(item, GroundedRecord):
+        raise TypeError(f"item must be a GroundedRecord, got {type(item).__name__}")
+    return {
+        "_doc_id": item.doc_id,
+        "_source_name": item.source_name,
+        "_status": item.status,
+        "_is_grounded": item.is_grounded,
+        "_is_grounded_union": item.is_grounded_union,
+        "_unit_ids": list(item.unit_ids),
+        "_supporting_models": [model_id for model_id, votes in item.model_votes.items() if votes],
+        "_grounding_quotes": list(item.grounding_quotes),
+        "_disputed_fields": list(item.disputed_fields),
+        "_notes": list(item.notes),
+        "_grounding_reasons": [
+            {
+                "reason": r.reason,
+                "model_id": r.model_id,
+                "index": r.index,
+                "key_field": r.key_field,
+                "text": r.text,
+            }
+            for r in item.grounding_reasons
+        ],
+        "_sources": [
+            {
+                "doc_id": s.doc_id,
+                "unit_id": s.unit_id,
+                "element_id": s.element_id,
+                "page_number": s.page_number,
+                "bbox": {"x0": s.bbox.x0, "y0": s.bbox.y0, "x1": s.bbox.x1, "y1": s.bbox.y1},
+                "scope_path": list(s.scope_path),
+            }
+            for s in item.sources
+        ],
+    }
+
+
+def _serialize_jsonl_item(
+    item: GroundedRecord[Any],
+    *,
+    include_provenance: bool,
+    with_meta: bool,
+) -> bytes:
+    """Serialize one :class:`GroundedRecord` into a single UTF-8 JSONL line ending in ``\\n``."""
+    if not isinstance(item, GroundedRecord):
+        raise TypeError(f"item must be a GroundedRecord, got {type(item).__name__}")
+    if not isinstance(include_provenance, bool) or not isinstance(with_meta, bool):
+        raise TypeError("include_provenance and with_meta must be bools")
+    row: dict[str, Any] = item.record.model_dump(mode="json") if item.record is not None else {}
+    if include_provenance:
+        row.update(_provenance_fields(item))
+    elif with_meta:
+        row["_status"] = item.status
+        row["_doc_id"] = item.doc_id
+    try:
+        return (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RationalizationError(f"JSONL row cannot be serialized as strict UTF-8 JSON: {exc}") from exc
+
+
+def _unlink_quietly(path: Path) -> None:
+    """Best-effort unlink of a staging file during error cleanup."""
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def _write_jsonl_atomic(target_path: Path, encoded_rows: Sequence[bytes]) -> int:
+    """Atomically write UTF-8 JSONL ``encoded_rows`` to ``target_path`` via a sibling staging file."""
+    if not isinstance(target_path, Path) or not isinstance(encoded_rows, Sequence):
+        raise TypeError("_write_jsonl_atomic requires a Path and a Sequence of bytes")
+    staging = target_path.parent / f".{target_path.name}.tmp_{secrets.token_hex(16)}"
+    created = False
+    try:
+        fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        created = True
+        with os.fdopen(fd, "wb") as handle:
+            handle.writelines(encoded_rows)
+        os.replace(staging, target_path)
+    except OSError as exc:
+        if created:
+            _unlink_quietly(staging)
+        raise RationalizationError(f"failed to write JSONL to {target_path}: {type(exc).__name__}") from exc
+    except BaseException:
+        if created:
+            _unlink_quietly(staging)
+        raise
+    return len(encoded_rows)
 
 
 # ---------------------------------------------------------------------------------------------------------------

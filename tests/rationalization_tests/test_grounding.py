@@ -3179,3 +3179,539 @@ class TestMultimodalTextlessPeerQuoteGrounding:
             ("quote_not_found", G, 0, None),
             ("key_not_found", G, None, "number"),
         ]
+
+
+class MultiWordEnum(Enum):
+    CENTRIFUGAL_CHILLER = "centrifugal liquid chiller"
+
+
+class SingleEnumSchema(BaseModel):
+    kind: MultiWordEnum
+
+
+class SingleLiteralSchema(BaseModel):
+    kind: Literal["centrifugal liquid chiller"]
+
+
+class SingleBoolSchema(BaseModel):
+    active: bool
+
+
+class OptionalSecondSchema(BaseModel):
+    label: str
+    extra: str | None = None
+    tags: list[str] = []
+
+
+class PairClassificationSchema(BaseModel):
+    category: str
+    status: str
+
+
+SINGLE_ENUM = prepare(SingleEnumSchema)
+SINGLE_LITERAL = prepare(SingleLiteralSchema)
+SINGLE_BOOL = prepare(SingleBoolSchema)
+OPT_SECOND = prepare(OptionalSecondSchema)
+PAIR_CLASS = prepare(PairClassificationSchema)
+
+
+class TestImageOnlyCrossFamilyFieldAgreement:
+    @pytest.mark.parametrize(
+        ("bad_min_families", "exc_type"),
+        [
+            (True, TypeError),
+            (False, TypeError),
+            (2.0, TypeError),
+            ("2", TypeError),
+            (None, TypeError),
+            (0, ValueError),
+            (-3, ValueError),
+        ],
+    )
+    def test_min_families_strictly_validated(self, bad_min_families, exc_type):
+        with pytest.raises(exc_type, match="min_families must be"):
+            call_ground(min_families=bad_min_families)
+
+    def test_grounds_keyless_multi_field_and_substantive_single_field_with_disjoint_scan_headings(self):
+        # 1. Multi-field DocProfile with disjoint headings + short secondary field quote ("Carrier")
+        mm_prof = _make_multimodal_image_only_run(DOC_PROFILE)
+        (uid_prof,) = mm_prof.unit_ids
+        anchor_prof = mm_prof.units[uid_prof].elements[0].element_id
+        rec_prof = {
+            "drawing_number": "30RA402080",
+            "manufacturer": "Carrier",
+            "specs": [{"label": "Material", "value": "Carbon Steel"}],
+        }
+        res_prof = grounded(
+            {
+                (uid_prof, G): response(entry(rec_prof, ("CENTRIFUGAL LIQUID CHILLER", "Carrier"), (anchor_prof,))),
+                (uid_prof, A): response(entry(rec_prof, ("ENGINEERING SUBMITTAL SHEET 1",), (anchor_prof,))),
+            },
+            models=PAIR,
+            schema=DOC_PROFILE,
+            run=mm_prof,
+        )
+        assert (res_prof.items[0].status, res_prof.items[0].grounded, res_prof.items[0].reasons) == (
+            "consensus",
+            True,
+            (),
+        )
+
+        # 2. Keyless 2-field short-scalar classification schema with disjoint >=3-token scan headings
+        mm_cls = _make_multimodal_image_only_run(PAIR_CLASS)
+        (uid_cls,) = mm_cls.unit_ids
+        anchor_cls = mm_cls.units[uid_cls].elements[0].element_id
+        res_cls = grounded(
+            {
+                (uid_cls, G): response(
+                    entry({"category": "HVAC", "status": "Approved"}, ("ROOFTOP PACKAGE SUBMITTAL",), (anchor_cls,))
+                ),
+                (uid_cls, A): response(
+                    entry({"category": "HVAC", "status": "Approved"}, ("APPROVED FOR CONSTRUCTION",), (anchor_cls,))
+                ),
+            },
+            models=PAIR,
+            schema=PAIR_CLASS,
+            run=mm_cls,
+        )
+        assert (res_cls.items[0].status, res_cls.items[0].grounded) == ("consensus", True)
+
+        # 3. Keyless 1-field free-text str schema with >=3 tokens OR code identifier
+        mm_line = _make_multimodal_image_only_run(LINE)
+        (uid_line,) = mm_line.unit_ids
+        anchor_line = mm_line.units[uid_line].elements[0].element_id
+        for substantive_val in ("Centrifugal Liquid Chiller", "30RA402080"):
+            res_sub = grounded(
+                {
+                    (uid_line, G): response(
+                        entry({"text": substantive_val}, ("CHILLER SCHEDULE TABLE",), (anchor_line,))
+                    ),
+                    (uid_line, A): response(
+                        entry({"text": substantive_val}, ("EQUIPMENT SUBMITTAL HEADER",), (anchor_line,))
+                    ),
+                },
+                models=PAIR,
+                schema=LINE,
+                run=mm_line,
+            )
+            assert (res_sub.items[0].status, res_sub.items[0].grounded) == ("consensus", True), substantive_val
+
+    def test_grounds_keyed_root_and_child_records_with_disjoint_scan_quotes_when_keys_self_quoted(self):
+        mm_part = _make_multimodal_image_only_run(PART)
+        (uid_part,) = mm_part.unit_ids
+        anchor_part = mm_part.units[uid_part].elements[0].element_id
+        res_part = grounded(
+            {
+                (uid_part, G): response(
+                    entry(
+                        {"number": "PN-104", "title": "Hex Bolt"},
+                        ("DRAWING SCHEDULE ITEM PN-104 BOLT",),
+                        (anchor_part,),
+                    )
+                ),
+                (uid_part, A): response(
+                    entry(
+                        {"number": "PN-104", "title": "Hex Bolt"},
+                        ("BILL OF MATERIALS PART PN-104",),
+                        (anchor_part,),
+                    )
+                ),
+            },
+            models=PAIR,
+            run=mm_part,
+        )
+        assert (res_part.items[0].status, res_part.items[0].grounded, res_part.items[0].reasons) == (
+            "consensus",
+            True,
+            (),
+        )
+
+        # Child-keyed schema with disjoint scan headings where both models self-quote root + child keys
+        class ChildComp(BaseModel):
+            sku: Annotated[str, Key]
+            qty: int
+
+        class KitAssy(BaseModel):
+            kit_id: Annotated[str, Key(normalizer="alnum_upper")]
+            parts: list[ChildComp]
+
+        kit_schema = prepare(KitAssy)
+        mm_kit = _make_multimodal_image_only_run(kit_schema)
+        (uid_kit,) = mm_kit.unit_ids
+        anchor_kit = mm_kit.units[uid_kit].elements[0].element_id
+        res_kit = grounded(
+            {
+                (uid_kit, G): response(
+                    entry(
+                        {"kit_id": "060G1125", "parts": [{"sku": "PN-10", "qty": 2}]},
+                        ("ASSEMBLY 060G-1125 HEADER", "COMPONENT PN-10 QTY 2"),
+                        (anchor_kit,),
+                    )
+                ),
+                (uid_kit, A): response(
+                    entry(
+                        {"kit_id": "060G-1125", "parts": [{"sku": "PN-10", "qty": 2}]},
+                        ("DRAWING 060G-1125 ITEM PN-10",),
+                        (anchor_kit,),
+                    )
+                ),
+            },
+            models=PAIR,
+            schema=kit_schema,
+            run=mm_kit,
+        )
+        assert (res_kit.items[0].status, res_kit.items[0].grounded, res_kit.items[0].reasons) == (
+            "consensus",
+            True,
+            (),
+        )
+
+    def test_enforces_min_families_floor_and_known_family_diversity(self):
+        mm_cls = _make_multimodal_image_only_run(PAIR_CLASS)
+        (uid_cls,) = mm_cls.unit_ids
+        anchor_cls = mm_cls.units[uid_cls].elements[0].element_id
+        rec = {"category": "HVAC", "status": "Approved"}
+        vote_g = entry(rec, ("ROOFTOP PACKAGE SUBMITTAL",), (anchor_cls,))
+        vote_a = entry(rec, ("APPROVED FOR CONSTRUCTION",), (anchor_cls,))
+        vote_o = entry(rec, ("MECHANICAL EQUIPMENT SCHEDULE",), (anchor_cls,))
+
+        # 2 families fail when ground(..., min_families=3)
+        out_two = outcome_of({(uid_cls, G): response(vote_g), (uid_cls, A): response(vote_a)}, PAIR)
+        cons_two = build_consensus(out_two, PAIR_CLASS, (uid_cls,), min_families=2)
+        res_need_three = ground(
+            cons_two,
+            outcome=out_two,
+            units=mm_cls.units,
+            envelopes=mm_cls.envelopes,
+            documents=documents_of(mm_cls),
+            schema=PAIR_CLASS,
+            min_families=3,
+        )
+        assert (res_need_three.items[0].status, res_need_three.items[0].grounded) == ("ungrounded_value", False)
+
+        # 3 known families succeed when min_families=3
+        three_models = (GOOGLE, ANTHROPIC, OPENAI)
+        out_three = outcome_of(
+            {(uid_cls, G): response(vote_g), (uid_cls, A): response(vote_a), (uid_cls, O_ID): response(vote_o)},
+            three_models,
+        )
+        cons_three = build_consensus(out_three, PAIR_CLASS, (uid_cls,), min_families=3)
+        res_three_ok = ground(
+            cons_three,
+            outcome=out_three,
+            units=mm_cls.units,
+            envelopes=mm_cls.envelopes,
+            documents=documents_of(mm_cls),
+            schema=PAIR_CLASS,
+            min_families=3,
+        )
+        assert (res_three_ok.items[0].status, res_three_ok.items[0].grounded) == ("consensus", True)
+
+        # 1 known + 1 unknown family fails even when min_families=1 (max(2, min_families) == 2)
+        unk_models = (GOOGLE, ("custom:proxy", "unknown", "callable"))
+        out_unk = outcome_of(
+            {(uid_cls, G): response(vote_g), (uid_cls, "custom:proxy"): response(vote_a)},
+            unk_models,
+        )
+        cons_unk = build_consensus(out_unk, PAIR_CLASS, (uid_cls,), min_families=1)
+        res_unk = ground(
+            cons_unk,
+            outcome=out_unk,
+            units=mm_cls.units,
+            envelopes=mm_cls.envelopes,
+            documents=documents_of(mm_cls),
+            schema=PAIR_CLASS,
+            min_families=1,
+        )
+        assert (res_unk.items[0].status, res_unk.items[0].grounded) == ("ungrounded_value", False)
+
+    def test_rejects_low_entropy_coin_flips_smuggled_anchors_bad_quotes_and_unquoted_keys(self):
+        # 1. 1-field Enum (even with 3-word string value), Literal, bool, and 1-populated-field Optional/blank
+        for schema, payload in (
+            (SINGLE_ENUM, {"kind": "centrifugal liquid chiller"}),
+            (SINGLE_LITERAL, {"kind": "centrifugal liquid chiller"}),
+            (SINGLE_BOOL, {"active": True}),
+            (OPT_SECOND, {"label": "row", "extra": None, "tags": []}),
+            (OPT_SECOND, {"label": "row", "extra": "   ", "tags": ["  "]}),
+        ):
+            mm_low = _make_multimodal_image_only_run(schema)
+            (uid_low,) = mm_low.unit_ids
+            anchor_low = mm_low.units[uid_low].elements[0].element_id
+            res_low = grounded(
+                {
+                    (uid_low, G): response(entry(payload, ("ALPHA BETA GAMMA",), (anchor_low,))),
+                    (uid_low, A): response(entry(payload, ("DELTA EPSILON ZETA",), (anchor_low,))),
+                },
+                models=PAIR,
+                schema=schema,
+                run=mm_low,
+            )
+            assert (res_low.items[0].status, res_low.items[0].grounded) == ("ungrounded_value", False), payload
+
+        # 2. Disjoint scan page anchors across a 2-page scan unit must not cross-ground
+        img1 = PageImage(page_number=1, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        img2 = PageImage(page_number=2, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        p1 = dataclasses.replace(
+            page(1, (), route="vision", quality=VISION_QUALITY),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=img1,
+        )
+        p2 = dataclasses.replace(
+            page(2, (), route="vision", quality=VISION_QUALITY),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=img2,
+        )
+        two_scan_doc = document(p1, p2)
+        a1, a2 = vision_page_anchor(p1), vision_page_anchor(p2)
+        two_uid = f"{two_scan_doc.metadata.doc_id}:p0001_e000-p0002_e000"
+        two_blocks = (render_element(a1), render_element(a2))
+        two_unit = Unit(
+            unit_id=two_uid,
+            doc_id=two_scan_doc.metadata.doc_id,
+            elements=(a1, a2),
+            blocks=two_blocks,
+            part_of=(None, None),
+            scope_path=(),
+            scope_entries_excluded=0,
+            page_numbers=(1, 2),
+            vision=True,
+            oversize=False,
+            hidden_excluded=(),
+        )
+        esc_id = two_scan_doc.metadata.doc_id.replace("_", chr(92) + "_")
+        joined_two = "\n\n".join(two_blocks)
+        two_payload = f"<document>{esc_id}</document>\n<scope></scope>\n<elements>\n{joined_two}\n</elements>"
+        two_env = Envelope(
+            unit_id=two_uid,
+            prompt="Extract.",
+            context_json="null",
+            payload=two_payload,
+            schema_json=PAIR_CLASS.wrapper_json,
+            images=(TINY_PNG, TINY_PNG),
+        )
+        two_run = Prepared(document=two_scan_doc, units={two_uid: two_unit}, envelopes={two_uid: two_env})
+        res_disjoint_pages = grounded(
+            {
+                (two_uid, G): response(
+                    entry({"category": "HVAC", "status": "Approved"}, ("ROOFTOP PACKAGE SUBMITTAL",), ("p0001_e000",))
+                ),
+                (two_uid, A): response(
+                    entry({"category": "HVAC", "status": "Approved"}, ("APPROVED FOR CONSTRUCTION",), ("p0002_e000",))
+                ),
+            },
+            models=PAIR,
+            schema=PAIR_CLASS,
+            run=two_run,
+        )
+        assert (res_disjoint_pages.items[0].status, res_disjoint_pages.items[0].grounded) == (
+            "ungrounded_value",
+            False,
+        )
+
+        # 3. Unquoted child key by both models on disjoint scan headings still fails closed
+        class ChildSpec(BaseModel):
+            sku: Annotated[str, Key]
+            qty: int
+
+        class KitSchema(BaseModel):
+            kit_id: Annotated[str, Key]
+            parts: list[ChildSpec]
+
+        kit_schema = prepare(KitSchema)
+        mm_kit = _make_multimodal_image_only_run(kit_schema)
+        (uid_kit,) = mm_kit.unit_ids
+        anchor_kit = mm_kit.units[uid_kit].elements[0].element_id
+        kit_rec = {"kit_id": "KIT-100", "parts": [{"sku": "PN-999", "qty": 2}]}
+        res_unquoted_child = grounded(
+            {
+                (uid_kit, G): response(entry(kit_rec, ("ASSEMBLY KIT-100 HEADER",), (anchor_kit,))),
+                (uid_kit, A): response(entry(kit_rec, ("DRAWING KIT-100 SCHEDULE",), (anchor_kit,))),
+            },
+            models=PAIR,
+            schema=kit_schema,
+            run=mm_kit,
+        )
+        assert (res_unquoted_child.items[0].status, res_unquoted_child.items[0].grounded) == (
+            "ungrounded_value",
+            False,
+        )
+        assert ("key_not_found", G, None, "parts.sku") in reasons(res_unquoted_child.items[0])
+
+        # 4. Smuggling <header_context>, digital <el>, or OCR-backed vision anchor with disjoint headings is rejected
+        hdr_kv = pair(1, 0, "Vendor", "Carrier Corp")
+        p1_txt = para(1, 1, "Cover sheet.")
+        img_p2 = PageImage(page_number=2, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        scan_p2 = dataclasses.replace(
+            page(2, (), route="vision", quality=VISION_QUALITY),
+            status="ocr_unavailable",
+            image_only_reasons=("too_little_text",),
+            page_image=img_p2,
+        )
+        hdr_doc = document(page(1, (hdr_kv, p1_txt)), scan_p2, header_context=(hdr_kv,))
+        hdr_plan = build_units(hdr_doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+        hdr_envs = build_envelopes(
+            hdr_plan.units,
+            hdr_doc,
+            prompt="Extract.",
+            context=None,
+            schema_json=PAIR_CLASS.wrapper_json,
+            multimodal=True,
+        )
+        hdr_run = Prepared(
+            document=hdr_doc,
+            units={u.unit_id: u for u in hdr_plan.units},
+            envelopes={e.unit_id: e for e in hdr_envs},
+        )
+        _, scan_u = hdr_run.unit_ids
+        scan_anc = hdr_run.units[scan_u].elements[0].element_id
+        cls_payload = {"category": "HVAC", "status": "Approved"}
+        res_hdr_smuggle = grounded(
+            {
+                (scan_u, G): response(entry(cls_payload, ("ROOFTOP PACKAGE SUBMITTAL",), (scan_anc, "p0001_e000"))),
+                (scan_u, A): response(entry(cls_payload, ("APPROVED FOR CONSTRUCTION",), (scan_anc,))),
+            },
+            models=PAIR,
+            schema=PAIR_CLASS,
+            run=hdr_run,
+        )
+        assert (res_hdr_smuggle.items[0].status, res_hdr_smuggle.items[0].grounded) == ("ungrounded_value", False)
+
+        ocr_img = PageImage(page_number=1, dpi=150, width_px=8, height_px=8, _loader=lambda: TINY_PNG)
+        ocr_p = dataclasses.replace(
+            page(1, (para(1, 0, "Real OCR line on page."),), route="vision", quality=VISION_QUALITY),
+            page_image=ocr_img,
+        )
+        ocr_doc = document(ocr_p)
+        ocr_plan = build_units(ocr_doc, max_unit_chars=BIG, render=render_element, multimodal=True)
+        ocr_envs = build_envelopes(
+            ocr_plan.units,
+            ocr_doc,
+            prompt="Extract.",
+            context=None,
+            schema_json=PAIR_CLASS.wrapper_json,
+            multimodal=True,
+        )
+        ocr_run = Prepared(
+            document=ocr_doc,
+            units={u.unit_id: u for u in ocr_plan.units},
+            envelopes={e.unit_id: e for e in ocr_envs},
+        )
+        (ocr_u,) = ocr_run.unit_ids
+        ocr_anc = ocr_run.units[ocr_u].elements[0].element_id
+        res_ocr_smuggle = grounded(
+            {
+                (ocr_u, G): response(entry(cls_payload, ("ROOFTOP PACKAGE SUBMITTAL",), (ocr_anc,))),
+                (ocr_u, A): response(entry(cls_payload, ("APPROVED FOR CONSTRUCTION",), (ocr_anc,))),
+            },
+            models=PAIR,
+            schema=PAIR_CLASS,
+            run=ocr_run,
+        )
+        assert (res_ocr_smuggle.items[0].status, res_ocr_smuggle.items[0].grounded) == ("ungrounded_value", False)
+
+        # 5. Blank or punctuation quote alongside substantive quote on multi-field record is rejected
+        mm_cls = _make_multimodal_image_only_run(PAIR_CLASS)
+        (u_cls,) = mm_cls.unit_ids
+        a_cls = mm_cls.units[u_cls].elements[0].element_id
+        for bad_q in ("   ", "-"):
+            res_bad_q = grounded(
+                {
+                    (u_cls, G): response(entry(cls_payload, ("ROOFTOP PACKAGE SUBMITTAL", bad_q), (a_cls,))),
+                    (u_cls, A): response(entry(cls_payload, ("APPROVED FOR CONSTRUCTION",), (a_cls,))),
+                },
+                models=PAIR,
+                schema=PAIR_CLASS,
+                run=mm_cls,
+            )
+            assert (res_bad_q.items[0].status, res_bad_q.items[0].grounded) == ("ungrounded_value", False)
+
+    def test_grounding_functions_obey_length_and_nesting_bounds(self):
+        compound = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)
+
+        def max_nesting(node: ast.AST, depth: int = 0) -> int:
+            best = depth
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                nxt = depth + (1 if isinstance(child, compound) else 0)
+                best = max(best, max_nesting(child, nxt))
+            return best
+
+        checked_names = {
+            "ground",
+            "_check_arguments",
+            "word_set",
+            "joined_plain",
+            "joined_alnum_entry",
+            "_text_key_in_element",
+            "_alnum_key_in_element",
+            "_is_substantive_str",
+            "_is_free_text_scalar",
+            "_field_populated",
+            "_populated_field_count",
+            "_field_has_substantive_str",
+            "_has_substantive_free_text",
+            "_quotes_hold_all_keys",
+            "_model_scan_self_consistent",
+            "_anchors_share_min_families",
+            "_structured_scan_agreement",
+            "_item_reasons",
+            "_model_reasons",
+            "_quote_reasons_ctx",
+            "_quote_reasons",
+            "_key_reasons",
+        }
+        tree = ast.parse(Path(grounding_module.__file__).read_text(encoding="utf-8"))
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in checked_names:
+                seen.add(node.name)
+                span = (node.end_lineno or node.lineno) - node.lineno + 1
+                assert span <= 50, f"{node.name} is {span} lines (> 50)"
+                assert max_nesting(node) <= 3, f"{node.name} exceeds AST nesting 3"
+        assert seen == checked_names
+
+
+class TestWave2Rank2IndexedFieldLookup:
+    def test_unit_texts_word_set_joined_plain_and_joined_alnum_zero_cross_cell_bridging_or_gluing(self):
+        tbl = grid(
+            1,
+            0,
+            ("ColA", "ColB", "ColC"),
+            ("Item #1: PN104 (Rev B)", "200", "Café 港区"),
+            ("PN-10-", "4", "x"),
+            ("4", "-PN-20", "y"),
+        )
+        t_run = prepared(document(page(1, (tbl,))))
+        (uid,) = t_run.unit_ids
+        u_texts = grounding_module._UnitTexts(t_run.units[uid], t_run.envelopes[uid], {}, frozenset())
+
+        # Lazy index methods exist and cache per element_id
+        ws = u_texts.word_set("p0001_e000")
+        assert "PN104" in ws and "Rev" in ws and "200" in ws
+        assert u_texts.word_set("p0001_e000") is ws
+        jp = u_texts.joined_plain("p0001_e000")
+        assert "\x00" in jp and u_texts.joined_plain("p0001_e000") is jp
+        ja = u_texts.joined_alnum_entry("p0001_e000")
+        assert u_texts.joined_alnum_entry("p0001_e000") is ja
+
+        # Positive single-cell text and alnum_upper lookups
+        for ok_text in ("PN104", "Item #1", "(Rev B)", "Café", "港区", "PN-10-", "-PN-20"):
+            assert grounding_module._text_key_in_element(ok_text, "p0001_e000", u_texts) is True, ok_text
+        for ok_alnum in ("PN104", "REVB", "PN10", "PN20"):
+            assert grounding_module._alnum_key_in_element(ok_alnum, "p0001_e000", u_texts) is True, ok_alnum
+
+        # Negative glued, NUL-smuggled, and cross-cell bridge attempts
+        for bad_text in (
+            "PN10",
+            "PN104A",
+            "ColA\x00ColB",
+            "(Rev B)\x00200",
+            "PN-10- 4",
+            "4 -PN-20",
+        ):
+            assert grounding_module._text_key_in_element(bad_text, "p0001_e000", u_texts) is False, bad_text
+        for bad_alnum in ("COLACOLB", "REVB200", "PN104200", "PN104X", "4PN20"):
+            assert grounding_module._alnum_key_in_element(bad_alnum, "p0001_e000", u_texts) is False, bad_alnum

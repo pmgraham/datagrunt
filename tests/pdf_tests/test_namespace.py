@@ -88,7 +88,9 @@ TOP_LEVEL_PDF_NAMES = [
 TOP_LEVEL_RATIONALIZATION_NAMES = [
     "Key",
     "Informational",
+    "PassSpec",
     "rationalize",
+    "rationalize_many",
     "RationalizedResult",
     "BatchItem",
     "BatchPlan",

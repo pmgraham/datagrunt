@@ -197,9 +197,10 @@ from datagrunt.rationalization.providers.google_cloud import (
     GoogleCloudTarget,
     check_access,
     model_id_for,
+    rate_key_for,
 )
 from datagrunt.rationalization.providers.http import MAX_CONNECTIONS_LIMIT, HeaderValue, HttpClient, HttpReply
-from datagrunt.rationalization.providers.responses import parse_json_object, response
+from datagrunt.rationalization.providers.responses import parsed_response, response
 from datagrunt.rationalization.wire import FinishReason, ModelRequest, ProviderResponse
 
 DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -279,6 +280,9 @@ SCHEMA_MAX_NODES = 100_000
 
 SCHEMA_MAX_DEPTH = 64
 """The deepest a schema node may sit (the root is level 1)."""
+
+DEFAULT_MAX_CONNECTIONS = 64
+MAX_CONCURRENCY_CAP = 256
 
 _FINISH_BY_STOP_REASON: Mapping[str, FinishReason] = MappingProxyType(
     {
@@ -793,9 +797,8 @@ def _parse_reply(reply: HttpReply, *, allow_fence: bool = False) -> ProviderResp
     finish = _FINISH_BY_STOP_REASON.get(stop_reason) if isinstance(stop_reason, str) else None
     text = _answer_text(message)
     candidate = _strip_json_fence(text) if (text is not None and allow_fence) else text
-    content = parse_json_object(candidate) if candidate is not None and finish is not None else None
-    return response(
-        content=content,
+    return parsed_response(
+        json_text=candidate if candidate is not None and finish is not None else None,
         raw_text=reply.text if text is None else text,
         finish=finish or "complete",
         input_tokens=_input_tokens(usage),
@@ -892,7 +895,7 @@ class AnthropicProvider:
         api_version: str = DEFAULT_API_VERSION,
         temperature: float | None = None,
         allow_insecure_http: bool = False,
-        max_connections: int = 8,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         transport: object = None,
         schema_mode: SchemaMode = DEFAULT_SCHEMA_MODE,
     ) -> None:
@@ -953,7 +956,7 @@ class AnthropicProvider:
         location: str,
         auth: GoogleCloudAuth,
         temperature: float | None = None,
-        max_connections: int = 8,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         transport: object = None,
         schema_mode: SchemaMode = DEFAULT_SCHEMA_MODE,
     ) -> "AnthropicProvider":
@@ -986,11 +989,12 @@ class AnthropicProvider:
         target = GoogleCloudTarget(project, location)
         check_access(target, checked, interface=GOOGLE_CLOUD_METHOD)
         model_id = model_id_for(target, GOOGLE_CLOUD_PUBLISHER, model)
+        rate_key = rate_key_for(target, publisher=GOOGLE_CLOUD_PUBLISHER, model=model)
         route = _Route(
             url=target.publisher_model_url(GOOGLE_CLOUD_PUBLISHER, model, GOOGLE_CLOUD_METHOD),
             provider_kind=GOOGLE_CLOUD_KIND,
             model_id=model_id,
-            rate_key=model_id,  # quotas are per model: the resource name, never the project's shared key
+            rate_key=rate_key,  # quotas are per model: the resource name, never the project's shared key
             body_fields=MappingProxyType({"anthropic_version": ANTHROPIC_VERSION}),
             params=MappingProxyType({"anthropic_version": ANTHROPIC_VERSION}),
             plain_headers=MappingProxyType({}),
@@ -1057,13 +1061,15 @@ class AnthropicProvider:
 
     @property
     def max_concurrency(self) -> int | None:
-        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        """Optional per-provider concurrency cap (1-256), or ``None``."""
         return self._max_concurrency
 
     def with_max_concurrency(self, max_concurrency: int | None) -> "AnthropicProvider":
-        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
-        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
-            _refuse("max_concurrency must be None or an int in 1-64")
+        """Configure a per-provider concurrency cap (1-256, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (
+            type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_CONCURRENCY_CAP
+        ):
+            _refuse(f"max_concurrency must be None or an int in 1-{MAX_CONCURRENCY_CAP}")
         self._max_concurrency = max_concurrency
         return self
 

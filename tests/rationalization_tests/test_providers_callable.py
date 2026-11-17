@@ -449,11 +449,15 @@ def test_callable_provider_with_max_concurrency():
     assert capped is base
     assert base.max_concurrency == 2
 
+    capped_max = base.with_max_concurrency(256)
+    assert capped_max is base
+    assert base.max_concurrency == 256
+
     uncapped = capped.with_max_concurrency(None)
     assert uncapped is base
     assert base.max_concurrency is None
 
-    for bad in (0, -1, 65, True, False, "2", 2.0):
+    for bad in (0, -1, 257, True, False, "2", 2.0):
         with pytest.raises(RationalizationError, match="max_concurrency"):
             base.with_max_concurrency(bad)  # type: ignore[arg-type]
 

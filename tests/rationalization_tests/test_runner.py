@@ -20,8 +20,12 @@ from datagrunt.rationalization import Key, RationalizationError
 from datagrunt.rationalization import runner as runner_module
 from datagrunt.rationalization.cache import FileCache, MemoryCache, request_key
 from datagrunt.rationalization.envelope import build_envelopes, render_element
+from datagrunt.rationalization.providers.anthropic import AnthropicProvider
 from datagrunt.rationalization.providers.base import PermanentProviderError, ProviderError, TransientProviderError
 from datagrunt.rationalization.providers.callable import CallableProvider
+from datagrunt.rationalization.providers.gemini import GeminiProvider
+from datagrunt.rationalization.providers.google_cloud import GoogleCloudAuth
+from datagrunt.rationalization.providers.openai_compatible import OpenAICompatibleProvider
 from datagrunt.rationalization.runner import (
     EVENT_KINDS,
     FailedUnit,
@@ -255,9 +259,11 @@ def test_outcome_refuses_a_bad_field(changes, error):
 
 def test_limits_defaults_are_the_plan_defaults():
     limits = RunLimits()
+    assert runner_module.CONCURRENCY_LIMIT == 256
+    assert runner_module.EVENT_DELIVERIES == ("ordered", "live")
     assert (limits.max_concurrency, limits.max_concurrency_per_provider, limits.rpm_limit) == (8, 4, None)
     assert (limits.timeout_s, limits.max_retries, limits.max_output_tokens) == (60.0, 2, 8_192)
-    assert (limits.max_requests, limits.strict) == (1_000, False)
+    assert (limits.max_requests, limits.strict, limits.event_delivery) == (1_000, False, "ordered")
     assert type(RunLimits(timeout_s=5).timeout_s) is float
 
 
@@ -265,10 +271,10 @@ def test_limits_defaults_are_the_plan_defaults():
     ("field", "value", "error"),
     [
         ("max_concurrency", 0, ValueError),
-        ("max_concurrency", 65, ValueError),
+        ("max_concurrency", 257, ValueError),
         ("max_concurrency", 2.0, TypeError),
         ("max_concurrency_per_provider", 0, ValueError),
-        ("max_concurrency_per_provider", 65, ValueError),
+        ("max_concurrency_per_provider", 257, ValueError),
         ("max_concurrency_per_provider", True, TypeError),
         ("rpm_limit", 0, ValueError),
         ("rpm_limit", 100_001, ValueError),
@@ -291,6 +297,10 @@ def test_limits_defaults_are_the_plan_defaults():
         ("max_requests", "1000", TypeError),
         ("strict", 1, TypeError),
         ("strict", None, TypeError),
+        ("event_delivery", 1, TypeError),
+        ("event_delivery", None, TypeError),
+        ("event_delivery", "streaming", ValueError),
+        ("event_delivery", "", ValueError),
     ],
 )
 def test_limits_refuse_a_bad_bound(field, value, error):
@@ -303,7 +313,9 @@ def test_limits_refuse_a_bad_bound(field, value, error):
     [
         ("max_concurrency", 1),
         ("max_concurrency", 64),
+        ("max_concurrency", 256),
         ("max_concurrency_per_provider", 64),
+        ("max_concurrency_per_provider", 256),
         ("rpm_limit", 1),
         ("rpm_limit", 100_000),
         ("timeout_s", 1.0),
@@ -315,6 +327,8 @@ def test_limits_refuse_a_bad_bound(field, value, error):
         ("max_requests", 1),
         ("max_requests", 100_000),
         ("strict", True),
+        ("event_delivery", "ordered"),
+        ("event_delivery", "live"),
     ],
 )
 def test_limits_take_each_bound_at_its_edge(field, value):
@@ -2465,3 +2479,228 @@ def test_preflight_plan_reuses_file_lookups_without_second_disk_get(tmp_path, mo
         ("cache_hit", work[0][0].unit_id),
         ("request", work[1][0].unit_id),
     ]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Live event delivery & shared-pool multi-pass runner (PassRunSpec, run_multi_requests)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class Fact(BaseModel):
+    statement: Annotated[str, Key]
+    confidence: int = Field(default=1)
+
+
+FACT_SCHEMA = prepare(Fact)
+
+
+def fact_answer(request) -> ProviderResponse:
+    content = {
+        "records": [
+            {
+                "record": {"statement": f"fact:{request.unit_id}", "confidence": 2},
+                "grounding_quotes": [],
+                "source_element_ids": [],
+            }
+        ]
+    }
+    return ProviderResponse(content=content, raw_text="{}", finish="complete", input_tokens=11, output_tokens=5)
+
+
+def test_snapshot_max_concurrency_accepts_256_and_refuses_257():
+    snap = ProviderSnapshot(**snapshot_fields(max_concurrency=256))
+    assert snap.max_concurrency == 256
+    with pytest.raises(ValueError, match="max_concurrency"):
+        ProviderSnapshot(**snapshot_fields(max_concurrency=257))
+    capped = type("Capped256", (FakeProvider,), {"max_concurrency": 256})()
+    assert snapshot_providers([capped], SCHEMA)[0].max_concurrency == 256
+    over = type("Capped257", (FakeProvider,), {"max_concurrency": 257})()
+    with pytest.raises(RationalizationError, match="max_concurrency"):
+        snapshot_providers([over], SCHEMA)
+
+
+def test_live_event_delivery_delivers_fast_unit_before_blocked_earlier_unit():
+    work = make_work(2)
+    unit_0, unit_1 = work[0][0].unit_id, work[1][0].unit_id
+    unit_0_started = threading.Event()
+    unit_0_release = threading.Event()
+    unit_0_completed = threading.Event()
+    observed = []
+    caller_tid = threading.get_ident()
+
+    def slow_then_fast(request):
+        if request.unit_id == unit_0:
+            unit_0_started.set()
+            assert unit_0_release.wait(timeout=5.0), "unit_0 was never released by unit_1's live event"
+            unit_0_completed.set()
+            return answer(request)
+        assert unit_0_started.wait(timeout=5.0)
+        return answer(request)
+
+    def on_event(event):
+        observed.append((event.kind, event.unit_id, unit_0_completed.is_set(), threading.get_ident()))
+        if event.kind == "request" and event.unit_id == unit_1:
+            unit_0_release.set()
+
+    outcome = run(
+        work,
+        [CallableProvider("callable:a", slow_then_fast)],
+        limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, event_delivery="live"),
+        on_event=on_event,
+    )
+    assert observed == [
+        ("request", unit_1, False, caller_tid),
+        ("request", unit_0, True, caller_tid),
+    ]
+    assert list(outcome.responses) == [(unit_0, "callable:a"), (unit_1, "callable:a")]
+
+
+def test_live_event_delivery_drains_on_worker_failure_and_stops_on_hook_error():
+    work = make_work(2)
+    unit_0, unit_1 = work[0][0].unit_id, work[1][0].unit_id
+    unit_1_done = threading.Event()
+    events = Events()
+
+    def fail_after_fast(request):
+        if request.unit_id == unit_1:
+            unit_1_done.set()
+            return answer(request)
+        unit_1_done.wait(timeout=5.0)
+        raise PermanentProviderError(400, "bad unit_0")
+
+    with pytest.raises(RationalizationError, match="bad unit_0"):
+        run(
+            work,
+            [CallableProvider("callable:a", fail_after_fast)],
+            limits=RunLimits(max_concurrency=2, max_concurrency_per_provider=2, event_delivery="live"),
+            on_event=events,
+        )
+    assert [e.unit_id for e in events.events] == [unit_1, unit_0]
+
+
+def test_pass_run_spec_and_run_multi_requests_validate_arguments():
+    work = make_work(1)
+    snaps = snapshot_providers([CallableProvider("callable:a", answer)], SCHEMA)
+    spec = runner_module.PassRunSpec("entities", work, snaps, SCHEMA, "1.0")
+    assert (spec.pass_name, spec.max_output_tokens, spec.preflight) == ("entities", None, None)
+
+    with pytest.raises(ValueError, match="pass_name"):
+        runner_module.PassRunSpec("  ", work, snaps, SCHEMA, "1.0")
+    with pytest.raises(TypeError, match="pass_name"):
+        runner_module.PassRunSpec(123, work, snaps, SCHEMA, "1.0")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="another schema"):
+        runner_module.PassRunSpec("facts", work, snaps, FACT_SCHEMA, "1.0")
+    with pytest.raises(TypeError, match="max_output_tokens"):
+        runner_module.PassRunSpec("entities", work, snaps, SCHEMA, "1.0", max_output_tokens=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_output_tokens"):
+        runner_module.PassRunSpec("entities", work, snaps, SCHEMA, "1.0", max_output_tokens=0)
+
+    for bad_passes, err in [((), ValueError), ("entities", TypeError), ([spec, spec], ValueError), ([1], TypeError)]:
+        with pytest.raises(err):
+            runner_module.run_multi_requests(bad_passes, memory_cache=MemoryCache())  # type: ignore[arg-type]
+
+
+def test_run_multi_requests_shares_pool_provider_open_and_isolates_pass_outcomes(tmp_path):
+    work_a = make_work(2, schema=SCHEMA, prompt="Extract parts.")
+    work_b = make_work(2, schema=FACT_SCHEMA, prompt="Extract facts.")
+    barrier = threading.Barrier(4, timeout=5.0)
+    seen_by_pass: dict[str, list[tuple[int, dict]]] = {"parts": [], "facts": []}
+    lock = threading.Lock()
+
+    def multi_respond(request):
+        barrier.wait()
+        is_fact = "statement" in json.dumps(request.json_schema)
+        bucket = "facts" if is_fact else "parts"
+        with lock:
+            seen_by_pass[bucket].append((request.max_output_tokens, dict(request.json_schema)))
+        return fact_answer(request) if is_fact else answer(request)
+
+    shared_prov = OpeningProvider("fake:shared", respond=multi_respond, family="google")
+    snaps_a = snapshot_providers([shared_prov], SCHEMA)
+    snaps_b = snapshot_providers([shared_prov], FACT_SCHEMA)
+    file_cache = FileCache(tmp_path)
+    memory_cache = MemoryCache()
+    passes = [
+        runner_module.PassRunSpec("parts", work_a, snaps_a, SCHEMA, "1.0", max_output_tokens=256),
+        runner_module.PassRunSpec("facts", work_b, snaps_b, FACT_SCHEMA, "2.0", max_output_tokens=1024),
+    ]
+    outcomes = runner_module.run_multi_requests(
+        passes,
+        memory_cache=memory_cache,
+        file_cache=file_cache,
+        limits=RunLimits(max_concurrency=8, max_concurrency_per_provider=4),
+    )
+    assert list(outcomes) == ["parts", "facts"]
+    assert len(shared_prov.opened) == 1  # opened once across both passes
+    assert [t for t, _ in seen_by_pass["parts"]] == [256, 256]
+    assert [t for t, _ in seen_by_pass["facts"]] == [1024, 1024]
+    assert outcomes["parts"].cache_misses == 2 and outcomes["parts"].usage["fake:shared"].input_tokens == 14
+    assert outcomes["facts"].cache_misses == 2 and outcomes["facts"].usage["fake:shared"].input_tokens == 22
+
+    # Verify per-pass CacheMeta on disk by reading raw cache files
+    metas = [json.loads(p.read_text(encoding="utf-8"))["meta"] for p in tmp_path.rglob("*.json")]
+    assert len(metas) == 4
+    assert {(m["schema_name"], m["schema_version"], m["schema_sha256"]) for m in metas} == {
+        ("Part", "1.0", SCHEMA.sha256),
+        ("Fact", "2.0", FACT_SCHEMA.sha256),
+    }
+
+
+def test_run_multi_requests_cumulative_max_requests_dedup_and_preflight_stamping(tmp_path):
+    work_a = make_work(2, schema=SCHEMA)
+    work_b = make_work(2, schema=FACT_SCHEMA)
+    prov = OpeningProvider("fake:shared", respond=answer, family="google")
+    snaps_a = snapshot_providers([prov], SCHEMA)
+    snaps_b = snapshot_providers([prov], FACT_SCHEMA)
+    passes = [
+        runner_module.PassRunSpec("parts", work_a, snaps_a, SCHEMA, "1.0"),
+        runner_module.PassRunSpec("facts", work_b, snaps_b, FACT_SCHEMA, "1.0"),
+    ]
+    with pytest.raises(RationalizationError, match=r"4 requests.*max_requests 3"):
+        runner_module.run_multi_requests(passes, memory_cache=MemoryCache(), limits=RunLimits(max_requests=3))
+    assert prov.opened == [] and prov.requests == []
+
+    # Identical keys across two passes send 1 request and count 1 miss against max_requests=1
+    one_work = make_work(1, schema=SCHEMA)
+    dup_prov = OpeningProvider("fake:dup", respond=answer, family="google")
+    dup_snaps = snapshot_providers([dup_prov], SCHEMA)
+    slots, bare_reqs = runner_module._plan(one_work, dup_snaps, RunLimits(max_output_tokens=333), "1.0")
+    preflight = runner_module._PreflightPlan(slots=slots, requests=tuple(bare_reqs), file_lookups={})
+    dup_passes = [
+        runner_module.PassRunSpec("p1", one_work, dup_snaps, SCHEMA, "1.0", max_output_tokens=333, preflight=preflight),
+        runner_module.PassRunSpec("p2", one_work, dup_snaps, SCHEMA, "1.0", max_output_tokens=333),
+    ]
+    cache = FileCache(tmp_path)
+    dup_out = runner_module.run_multi_requests(
+        dup_passes,
+        memory_cache=MemoryCache(),
+        file_cache=cache,
+        limits=RunLimits(max_requests=1),
+    )
+    assert len(dup_prov.requests) == 1 and dup_prov.requests[0].max_output_tokens == 333
+    assert dup_out["p1"].cache_misses == 1 and dup_out["p2"].cache_misses == 0 and dup_out["p2"].cache_hits == 1
+    assert dict(dup_out["p1"].responses) == dict(dup_out["p2"].responses)
+    (meta,) = (json.loads(p.read_text(encoding="utf-8"))["meta"] for p in tmp_path.rglob("*.json"))
+    assert (meta["schema_name"], meta["schema_version"], meta["schema_sha256"]) == ("Part", "1.0", SCHEMA.sha256)
+
+
+def test_vertex_providers_get_isolated_rate_keys_and_unclamped_32_slots_each():
+    auth = GoogleCloudAuth(token=lambda: "ya29-test-token")
+    gemini = GeminiProvider.google_cloud("gemini-2.5-pro", project="my-project", location="us-central1", auth=auth)
+    claude = AnthropicProvider.google_cloud("claude-opus-4-7", project="my-project", location="us-central1", auth=auth)
+    llama = OpenAICompatibleProvider.google_cloud(
+        "meta/llama-4-maverick-17b-128e-instruct-maas",
+        project="my-project",
+        location="us-central1",
+        auth=auth,
+    )
+    try:
+        snaps = snapshot_providers([gemini, claude, llama], SCHEMA)
+        limits = RunLimits(max_concurrency=96, max_concurrency_per_provider=32)
+        slots = runner_module._slot_counts(snaps, limits)
+        assert len(slots) == 3  # 3 isolated rate keys on the same GCP project/location
+        assert list(slots.values()) == [32, 32, 32]  # default max_connections=64 does not clamp 32 down to 8
+    finally:
+        gemini.close()
+        claude.close()
+        llama.close()

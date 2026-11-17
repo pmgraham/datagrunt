@@ -130,6 +130,7 @@ library, pydantic and its sibling modules: nothing from ``datagrunt.core``, and 
 import math
 import re
 import unicodedata
+from collections import deque
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -1183,6 +1184,19 @@ class _UnkeyedFeatures:
     empty: tuple[bool, ...]
     tokens: tuple[frozenset[str] | None, ...]
     keys: tuple[tuple[object, ...], ...]
+    exact_key: tuple[object, ...] | None = None
+
+
+def _exact_unkeyed_signature(rec: _UnkeyedFeatures) -> tuple[object, ...]:
+    """Return the canonical tuple key shared iff two feature vectors score ``1.0``."""
+    if not isinstance(rec, _UnkeyedFeatures):
+        raise TypeError(f"rec must be _UnkeyedFeatures, got {type(rec).__name__}")
+    if rec.exact_key is not None:
+        return rec.exact_key
+    return tuple(
+        0 if rec.empty[idx] else ((1, rec.tokens[idx]) if rec.tokens[idx] else (2, rec.norms[idx]))
+        for idx in range(len(rec.norms))
+    )
 
 
 def _extract_unkeyed_features(instance: BaseModel, active: Sequence[FieldSpec]) -> _UnkeyedFeatures:
@@ -1193,6 +1207,7 @@ def _extract_unkeyed_features(instance: BaseModel, active: Sequence[FieldSpec]) 
     empty: list[bool] = []
     tokens: list[frozenset[str] | None] = []
     keys: list[tuple[object, ...]] = []
+    exact_parts: list[object] = []
     for f_idx, field_spec in enumerate(active):
         norm = _normalized_field(field_spec, getattr(instance, field_spec.name))
         is_empty = norm is None or norm == ()
@@ -1204,8 +1219,10 @@ def _extract_unkeyed_features(instance: BaseModel, active: Sequence[FieldSpec]) 
             word_set = frozenset(_WORD_TOKENS.findall(norm.casefold()))
             tokens.append(word_set)
             keys.extend((f_idx, "tok", tok) for tok in word_set)
+            exact_parts.append((1, word_set) if word_set else (2, norm))
         else:
             tokens.append(None)
+            exact_parts.append(0 if is_empty else (2, norm))
     if all(empty):
         keys.append(("__empty__",))
     return _UnkeyedFeatures(
@@ -1213,6 +1230,7 @@ def _extract_unkeyed_features(instance: BaseModel, active: Sequence[FieldSpec]) 
         empty=tuple(empty),
         tokens=tuple(tokens),
         keys=tuple(dict.fromkeys(keys)),
+        exact_key=tuple(exact_parts),
     )
 
 
@@ -1238,27 +1256,56 @@ def _features_similarity(left: _UnkeyedFeatures, right: _UnkeyedFeatures) -> flo
     return (total / count) if count else 1.0
 
 
+def _exact_unkeyed_prepass(
+    feats0: Sequence[_UnkeyedFeatures],
+    featsm: Sequence[_UnkeyedFeatures],
+) -> tuple[dict[int, int], set[int], list[int]]:
+    """Pair all ``score == 1.0`` equivalents in FIFO index order before building fuzzy postings."""
+    if not isinstance(feats0, Sequence) or not isinstance(featsm, Sequence):
+        raise TypeError("feats0 and featsm must be Sequences of _UnkeyedFeatures")
+    buckets: dict[tuple[object, ...], deque[int]] = {}
+    for posm, recm in enumerate(featsm):
+        buckets.setdefault(_exact_unkeyed_signature(recm), deque()).append(posm)
+    chosen: dict[int, int] = {}
+    used_m: set[int] = set()
+    rem0: list[int] = []
+    for pos0, rec0 in enumerate(feats0):
+        queue = buckets.get(_exact_unkeyed_signature(rec0))
+        if queue:
+            posm = queue.popleft()
+            chosen[pos0] = posm
+            used_m.add(posm)
+        else:
+            rem0.append(pos0)
+    return chosen, used_m, rem0
+
+
 def _match_model_unkeyed(
     feats0: Sequence[_UnkeyedFeatures],
     featsm: Sequence[_UnkeyedFeatures],
 ) -> dict[int, int]:
-    """Greedily pair ``feats0`` to ``featsm`` via an inverted index over positive-similarity features."""
+    """Greedily pair ``feats0`` to ``featsm`` via exact ``1.0`` FIFO pre-pass then inverted-index similarity."""
     if not isinstance(feats0, Sequence) or not isinstance(featsm, Sequence):
         raise TypeError("feats0 and featsm must be Sequences of _UnkeyedFeatures")
+    if not feats0 or not featsm:
+        return {}
+    chosen, used_m, rem0 = _exact_unkeyed_prepass(feats0, featsm)
+    if not rem0 or len(used_m) == len(featsm):
+        return chosen
     postings: dict[tuple[object, ...], list[int]] = {}
     for posm, recm in enumerate(featsm):
-        for key in recm.keys:
-            postings.setdefault(key, []).append(posm)
+        if posm not in used_m:
+            for key in recm.keys:
+                postings.setdefault(key, []).append(posm)
     candidates: list[tuple[float, int, int]] = []
-    for pos0, rec0 in enumerate(feats0):
+    for pos0 in rem0:
+        rec0 = feats0[pos0]
         seen_m = {posm for key in rec0.keys for posm in postings.get(key, ())}
         for posm in seen_m:
             score = _features_similarity(rec0, featsm[posm])
             if score > 0.5:
                 candidates.append((score, pos0, posm))
     candidates.sort(key=lambda entry: (-entry[0], entry[1], entry[2]))
-    chosen: dict[int, int] = {}
-    used_m: set[int] = set()
     for _, pos0, posm in candidates:
         if pos0 not in chosen and posm not in used_m:
             chosen[pos0] = posm

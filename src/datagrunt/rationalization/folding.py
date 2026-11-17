@@ -191,6 +191,8 @@ class GroundedRecord(Generic[T]):
         quotes_by_model: Each requested model's grounding quotes united across the contributing units.
         element_ids_by_model: Each requested model's cited element ids united across the contributing units.
         families: Each requested model's family.
+        source_name: Source filename from ``documents[doc_id].metadata.source_name`` (or ``""`` when constructed
+            manually without a document). Left out of ``repr`` (invariant 7).
 
     Raises:
         TypeError: If a field has the wrong type.
@@ -211,6 +213,7 @@ class GroundedRecord(Generic[T]):
     quotes_by_model: Mapping[str, tuple[str, ...]] = field(repr=False)
     element_ids_by_model: Mapping[str, tuple[str, ...]] = field(repr=False)
     families: Mapping[str, str]
+    source_name: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         _check_text("doc_id", self.doc_id)
@@ -220,6 +223,8 @@ class GroundedRecord(Generic[T]):
             raise TypeError(f"key must be a tuple, got {type(self.key).__name__}")
         if self.record is not None and not isinstance(self.record, BaseModel):
             raise TypeError(f"record must be a pydantic model instance or None, got {type(self.record).__name__}")
+        if not isinstance(self.source_name, str):
+            raise TypeError(f"source_name must be a str, got {type(self.source_name).__name__}")
         _check_strings("disputed_fields", self.disputed_fields)
         if not all(path.strip() for path in self.disputed_fields):
             raise ValueError("disputed_fields must hold non-blank paths")
@@ -297,10 +302,13 @@ class GroundedRecord(Generic[T]):
         quotes_by_model: Mapping[str, tuple[str, ...]],
         element_ids_by_model: Mapping[str, tuple[str, ...]],
         families: Mapping[str, str],
+        source_name: str = "",
     ) -> "GroundedRecord[T]":
         """Construct an internal :class:`GroundedRecord` from read-only mappings without re-copying."""
         if not doc_id or not unit_ids:
             raise ValueError("GroundedRecord._trusted requires non-empty doc_id and unit_ids")
+        if not isinstance(source_name, str):
+            raise TypeError(f"source_name must be a str, got {type(source_name).__name__}")
         self = object.__new__(cls)
         object.__setattr__(self, "doc_id", doc_id)
         object.__setattr__(self, "unit_ids", unit_ids)
@@ -316,6 +324,7 @@ class GroundedRecord(Generic[T]):
         object.__setattr__(self, "quotes_by_model", quotes_by_model)
         object.__setattr__(self, "element_ids_by_model", element_ids_by_model)
         object.__setattr__(self, "families", families)
+        object.__setattr__(self, "source_name", source_name)
         return self
 
 
@@ -580,6 +589,14 @@ class _ProvenanceIndex:
         self._body_ids: dict[str, frozenset[str]] = {}
         self._sources: dict[tuple[str, str], ElementSource | None] = {}
 
+    def source_name(self, doc_id: str) -> str:
+        """Return ``metadata.source_name`` for ``doc_id``."""
+        if not isinstance(doc_id, str) or not doc_id:
+            raise ValueError("doc_id must be a non-empty str")
+        if doc_id not in self._documents:
+            raise KeyError(f"unknown doc_id {doc_id!r}")
+        return self._documents[doc_id].metadata.source_name
+
     def _scopes_for(self, doc_id: str) -> Mapping[str, GroupScope]:
         """Lazily compute :func:`group_scopes` for ``doc_id`` only when a section-scoped body element is cited."""
         if not doc_id or doc_id not in self._documents:
@@ -659,6 +676,7 @@ def _fold_group(
     """Fold one group of :class:`GroundedItem` instances into a :class:`GroundedRecord`."""
     first = group[0]
     doc_id = units[first.item.unit_id].doc_id
+    source_name = provenance.source_name(doc_id)
     sources = provenance.build_sources(group)
     quotes = _united(
         quotes_for_model for grounded in group for quotes_for_model in grounded.item.quotes_by_model.values()
@@ -680,8 +698,16 @@ def _fold_group(
             quotes_by_model=item.quotes_by_model,
             element_ids_by_model=item.element_ids_by_model,
             families=item.families,
+            source_name=source_name,
         )
-    return _fold_multi_unit_group(group, doc_id=doc_id, sources=sources, quotes=quotes, schema=schema)
+    return _fold_multi_unit_group(
+        group,
+        doc_id=doc_id,
+        source_name=source_name,
+        sources=sources,
+        quotes=quotes,
+        schema=schema,
+    )
 
 
 def _aggregate_group_mappings(
@@ -719,6 +745,7 @@ def _fold_multi_unit_group(
     group: Sequence[GroundedItem],
     *,
     doc_id: str,
+    source_name: str = "",
     sources: tuple[ElementSource, ...],
     quotes: tuple[str, ...],
     schema: PreparedSchema,
@@ -734,12 +761,7 @@ def _fold_multi_unit_group(
     wire, valid_sources = folder.fold_model(schema.spec, "", records, 1) if len(records) >= 2 else (None, frozenset())
     disputed.extend(folder.disputed)
     folded_record, has_conflict = _resolve_folded_record(
-        records,
-        wire,
-        valid_sources,
-        schema,
-        has_conflict=bool(folder.disputed),
-        notes=notes,
+        records, wire, valid_sources, schema, has_conflict=bool(folder.disputed), notes=notes
     )
     status = _folded_status(group, has_conflict=has_conflict, has_reasons=bool(reasons))
     if status in ("unmatched", "cross_page_conflict"):
@@ -759,6 +781,7 @@ def _fold_multi_unit_group(
         quotes_by_model=quotes_by_model,
         element_ids_by_model=element_ids_by_model,
         families=first.item.families,
+        source_name=source_name,
     )
 
 
