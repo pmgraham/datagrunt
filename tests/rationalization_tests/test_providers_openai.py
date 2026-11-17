@@ -1957,13 +1957,13 @@ class TestConstructor:
         OpenAICompatibleProvider("llama3", base_url=GATEWAY)
         OpenAICompatibleProvider.ollama("llama3", base_url="http://10.0.0.5:11434/v1", allow_insecure_http=True)
 
-        assert seen == [(3, True), (8, False), (8, True)]
+        assert seen == [(3, True), (64, False), (64, True)]
 
     def test_max_connections_is_exposed_read_only(self):
         provider = OpenAICompatibleProvider("llama3", base_url=GATEWAY, max_connections=3)
 
         assert provider.max_connections == 3
-        assert OpenAICompatibleProvider.ollama("llama3").max_connections == 8
+        assert OpenAICompatibleProvider.ollama("llama3").max_connections == 64
         with pytest.raises(AttributeError):
             provider.max_connections = 4
 
@@ -2245,7 +2245,7 @@ class TestFromModelString:
 # ---------------------------------------------------------------------------------------------------------------
 
 PROJECT = "my-project"
-TOKEN = "ya29.test-TOKEN-secret"
+TOKEN = "tok0.test-TOKEN-secret"
 LLAMA = "meta/llama-4-maverick-17b-128e-instruct-maas"
 CHAT_BODY_HEAD = (
     '"messages":[{"role":"system","content":"SYSTEM-PROMPT-TEXT"},'
@@ -2722,7 +2722,7 @@ class TestGoogleCloudIdentity:
             "max_connections",
             "transport",
         ]
-        assert [parameters[name].default for name in list(parameters)[4:]] == [None, None, None, None, 0.0, 0, 8, None]
+        assert [parameters[name].default for name in list(parameters)[4:]] == [None, None, None, None, 0.0, 0, 64, None]
         assert all(parameters[name].kind is inspect.Parameter.KEYWORD_ONLY for name in list(parameters)[1:])
 
 
@@ -2846,3 +2846,11 @@ class TestMultimodalImages:
         provider.generate(req)
         provider.generate(req)
         assert calls == [False, True]
+
+    def test_openai_compatible_default_pool_and_concurrency_cap_support_256(self):
+        default_prov = OpenAICompatibleProvider("llama3", base_url="http://127.0.0.1:8000/v1")
+        assert default_prov.max_connections == 64
+        assert default_prov._http.keepalive_connections == 64
+        assert default_prov.with_max_concurrency(256).max_concurrency == 256
+        with pytest.raises(RationalizationError, match="max_concurrency"):
+            default_prov.with_max_concurrency(257)

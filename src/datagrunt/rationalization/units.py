@@ -84,7 +84,7 @@ pydantic, no httpx, nothing from ``datagrunt.core``, and no import inside a func
 
 import dataclasses
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Container, Mapping, Sequence, Sized
 from dataclasses import dataclass, field
 from typing import Literal, TypeAlias, TypeGuard, get_args
 
@@ -1319,3 +1319,259 @@ def build_units(
         hidden_elements_total=hidden_elements,
         scope_entries_excluded_total=sum(unit.scope_entries_excluded for unit in units),
     )
+
+
+def _check_bisect_inputs(
+    unit: object,
+    document: object,
+    render: object,
+    multimodal: object,
+    existing_unit_ids: object,
+) -> dict[int, bool]:
+    """Validate :func:`bisect_unit` arguments and return the document's per-page vision map."""
+    if not isinstance(unit, Unit):
+        raise TypeError(f"unit must be a Unit, got {type(unit).__name__}")
+    if not isinstance(document, PDFDocument):
+        raise TypeError(f"document must be a PDFDocument, got {type(document).__name__}")
+    if not callable(render):
+        raise TypeError(f"render must be callable, got {type(render).__name__}")
+    _check_bool("multimodal", multimodal)
+    if not isinstance(existing_unit_ids, Container) or isinstance(existing_unit_ids, (str, bytes, bytearray)):
+        raise TypeError(f"existing_unit_ids must be a Container of str, got {type(existing_unit_ids).__name__}")
+    if unit.doc_id != document.metadata.doc_id:
+        raise ValueError(f"unit {unit.unit_id!r} has doc_id {unit.doc_id!r}, expected {document.metadata.doc_id!r}")
+    vision_pages = {
+        page.page_number: (page.route == "vision" or is_multimodal_page(page, multimodal=bool(multimodal)))
+        for page in document.pages
+    }
+    if any(number not in vision_pages for number in unit.page_numbers):
+        raise ValueError(f"unit {unit.unit_id!r} references page numbers missing from document")
+    return vision_pages
+
+
+def _bisected_child(
+    doc_id: str,
+    vision_pages: Mapping[int, bool],
+    elements: tuple[DocumentElement, ...],
+    blocks: tuple[str, ...],
+    part_of: tuple[PartOf, ...],
+    scope_path: tuple[str, ...],
+    scope_excluded: int,
+    hidden_excluded: HiddenCounts,
+) -> Unit:
+    """Construct one non-oversize child :class:`Unit` produced by :func:`bisect_unit`."""
+    pages = _pages(elements)
+    return Unit(
+        unit_id=_unit_id(doc_id, elements, part_of),
+        doc_id=doc_id,
+        elements=elements,
+        blocks=blocks,
+        part_of=part_of,
+        scope_path=scope_path,
+        scope_entries_excluded=scope_excluded,
+        page_numbers=pages,
+        vision=any(vision_pages[number] for number in pages),
+        oversize=False,
+        hidden_excluded=hidden_excluded,
+    )
+
+
+def _next_part_pair(
+    doc_id: str,
+    element_id: str,
+    parent_part: PartOf,
+    parent_unit_id: str,
+    existing_unit_ids: Container[str],
+    outer_ends: tuple[str | None, str | None] = (None, None),
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Choose two collision-free ``(part_index, part_count)`` pairs for a bisected table or list."""
+    start = 1 if parent_part is None else parent_part[1] + 1
+    max_probes = (len(existing_unit_ids) + 4) if isinstance(existing_unit_ids, Sized) else 100_004
+    chosen: list[int] = []
+    for idx in range(start, start + max_probes):
+        part_end = f"{element_id}.{idx}"
+        candidates = (
+            f"{doc_id}:{part_end}-{part_end}",
+            f"{doc_id}:{outer_ends[0] or part_end}-{part_end}",
+            f"{doc_id}:{part_end}-{outer_ends[1] or part_end}",
+        )
+        if any(cid == parent_unit_id or cid in existing_unit_ids for cid in candidates):
+            continue
+        chosen.append(idx)
+        if len(chosen) == 2:
+            count = max(2, chosen[1], 0 if parent_part is None else parent_part[1])
+            return (chosen[0], count), (chosen[1], count)
+    raise RuntimeError(f"exhausted {max_probes} part indices bisecting {parent_unit_id!r}")
+
+
+def _split_single_element(element: Table | BulletList) -> tuple[Table | BulletList, Table | BulletList] | None:
+    """Split a multi-row :class:`Table` or multi-item :class:`BulletList` at its midpoint, or return ``None``."""
+    if isinstance(element, Table):
+        if len(element.rows) < 2:
+            return None
+        if any(cell.strip() for cell in element.headers):
+            mid = len(element.rows) // 2
+        else:
+            text_rows = [idx for idx, row in enumerate(element.rows) if any(cell.strip() for cell in row)]
+            if len(text_rows) < 2:
+                return None
+            mid = min(max(len(element.rows) // 2, text_rows[0] + 1), text_rows[-1])
+        return _part(element, 0, mid), _part(element, mid, len(element.rows))
+    if len(element.items) < 2:
+        return None
+    mid = len(element.items) // 2
+    return _part(element, 0, mid), _part(element, mid, len(element.items))
+
+
+def _bisect_anchored_splittable(
+    unit: Unit,
+    ti: int,
+    scopes: Mapping[str, GroupScope],
+    vision_pages: Mapping[int, bool],
+    render: Renderer,
+    existing_unit_ids: Container[str],
+) -> tuple[Unit, Unit] | None:
+    """Split the sole text-bearing :class:`Table` or :class:`BulletList` at ``ti`` inside a multi-element unit."""
+    target = unit.elements[ti]
+    if not isinstance(target, (Table, BulletList)):
+        return None
+    halves = _split_single_element(target)
+    if halves is None:
+        return None
+    left_el, right_el = halves
+    left_els = (*unit.elements[:ti], left_el)
+    right_els = (right_el, *unit.elements[ti + 1 :])
+    left_blocks = (*unit.blocks[:ti], _render(render, left_el))
+    right_blocks = (_render(render, right_el), *unit.blocks[ti + 1 :])
+    outer = (
+        _end_id(unit.elements[0], unit.part_of[0]) if ti > 0 else None,
+        _end_id(unit.elements[-1], unit.part_of[-1]) if ti + 1 < len(unit.elements) else None,
+    )
+    l_part, r_part = _next_part_pair(
+        unit.doc_id, target.element_id, unit.part_of[ti], unit.unit_id, existing_unit_ids, outer
+    )
+    l_scope, l_excl = _draft_scope(scopes, left_els)
+    r_scope, r_excl = _draft_scope(scopes, right_els)
+    left = _bisected_child(
+        unit.doc_id,
+        vision_pages,
+        left_els,
+        left_blocks,
+        (*unit.part_of[:ti], l_part),
+        l_scope,
+        l_excl,
+        unit.hidden_excluded,
+    )
+    right = _bisected_child(
+        unit.doc_id, vision_pages, right_els, right_blocks, (r_part, *unit.part_of[ti + 1 :]), r_scope, r_excl, ()
+    )
+    return left, right
+
+
+def _bisect_elements(
+    unit: Unit,
+    document: PDFDocument,
+    vision_pages: Mapping[int, bool],
+    render: Renderer,
+    existing_unit_ids: Container[str],
+    *,
+    multimodal: bool,
+) -> tuple[Unit, Unit] | None:
+    """Split a multi-element :class:`Unit` at its midpoint, keeping ``hidden_excluded`` once on ``left``."""
+    text_indices = [idx for idx, el in enumerate(unit.elements) if _has_text(el)]
+    scopes = group_scopes(document, multimodal=multimodal)
+    if len(text_indices) == 1:
+        return _bisect_anchored_splittable(unit, text_indices[0], scopes, vision_pages, render, existing_unit_ids)
+    if len(text_indices) < 2:
+        return None
+    mid = min(max(len(unit.elements) // 2, text_indices[0] + 1), text_indices[-1])
+    left_scope, left_excl = _draft_scope(scopes, unit.elements[:mid])
+    right_scope, right_excl = _draft_scope(scopes, unit.elements[mid:])
+    left = _bisected_child(
+        unit.doc_id,
+        vision_pages,
+        unit.elements[:mid],
+        unit.blocks[:mid],
+        unit.part_of[:mid],
+        left_scope,
+        left_excl,
+        unit.hidden_excluded,
+    )
+    right = _bisected_child(
+        unit.doc_id,
+        vision_pages,
+        unit.elements[mid:],
+        unit.blocks[mid:],
+        unit.part_of[mid:],
+        right_scope,
+        right_excl,
+        (),
+    )
+    if left.unit_id == right.unit_id:
+        raise ValueError(f"bisecting {unit.unit_id!r} produced colliding child unit_id {left.unit_id!r}")
+    return left, right
+
+
+def _bisect_single_splittable(
+    unit: Unit,
+    element: Table | BulletList,
+    vision_pages: Mapping[int, bool],
+    render: Renderer,
+    existing_unit_ids: Container[str],
+) -> tuple[Unit, Unit] | None:
+    """Split a single-element :class:`Table` or :class:`BulletList` unit into two collision-free child units."""
+    halves = _split_single_element(element)
+    if halves is None:
+        return None
+    left_el, right_el = halves
+    left_block, right_block = _render(render, left_el), _render(render, right_el)
+    left_part, right_part = _next_part_pair(
+        unit.doc_id,
+        element.element_id,
+        unit.part_of[0],
+        unit.unit_id,
+        existing_unit_ids,
+    )
+    left = _bisected_child(
+        unit.doc_id,
+        vision_pages,
+        (left_el,),
+        (left_block,),
+        (left_part,),
+        unit.scope_path,
+        unit.scope_entries_excluded,
+        unit.hidden_excluded,
+    )
+    right = _bisected_child(
+        unit.doc_id,
+        vision_pages,
+        (right_el,),
+        (right_block,),
+        (right_part,),
+        unit.scope_path,
+        unit.scope_entries_excluded,
+        (),
+    )
+    return left, right
+
+
+def bisect_unit(
+    unit: Unit,
+    document: PDFDocument,
+    *,
+    render: Renderer,
+    multimodal: bool = False,
+    existing_unit_ids: Container[str] = (),
+) -> tuple[Unit, Unit] | None:
+    """Deterministically bisect ``unit`` into ``(left, right)``, or return ``None`` when unsplittable."""
+    vision_pages = _check_bisect_inputs(unit, document, render, multimodal, existing_unit_ids)
+    if len(unit.page_numbers) == 1:
+        pages_by_num = {page.page_number: page for page in document.pages}
+        if is_multimodal_page(pages_by_num[unit.page_numbers[0]], multimodal=multimodal):
+            return None
+    if len(unit.elements) >= 2:
+        return _bisect_elements(unit, document, vision_pages, render, existing_unit_ids, multimodal=multimodal)
+    element = unit.elements[0]
+    if not isinstance(element, (Table, BulletList)):
+        return None
+    return _bisect_single_splittable(unit, element, vision_pages, render, existing_unit_ids)

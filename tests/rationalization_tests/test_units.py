@@ -47,19 +47,21 @@ from datagrunt.pdf.elements import (
     Figure,
     Heading,
     KeyValue,
+    PageImage,
     Paragraph,
     PDFDocument,
     Section,
     Table,
 )
 from datagrunt.rationalization import units as units_module
-from datagrunt.rationalization.envelope import render_element
+from datagrunt.rationalization.envelope import build_envelopes, render_element
 from datagrunt.rationalization.units import (
     BLOCK_SEPARATOR,
     GroupScope,
     SkippedUnit,
     Unit,
     UnitPlan,
+    bisect_unit,
     build_units,
     group_scopes,
 )
@@ -2395,3 +2397,307 @@ class TestMonotoneSplittingParity:
         assert len(plan.units) > 5
         part_sizes = [len(u.elements[0].rows) for u in plan.units if isinstance(u.elements[0], Table)]
         assert calls == [300, *part_sizes]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Deterministic unit bisection (bisect_unit, split_on_truncation)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class TestBisectUnit:
+    def test_bisect_multi_element_unit_splits_at_midpoint_and_preserves_hidden_once(self):
+        p1_a = para(1, 0, "alpha")
+        p1_b = para(1, 1, "beta")
+        p1_ghost = para(1, 2, "hidden", hidden=("invisible",))
+        p2_c = para(2, 0, "gamma")
+        p2_d = para(2, 1, "delta")
+        p2_e = para(2, 2, "epsilon")
+        doc = document(
+            page(1, (p1_a, p1_b, p1_ghost), route="digital"),
+            page(2, (p2_c, p2_d, p2_e), route="vision"),
+        )
+        plan = build_units(doc, max_unit_chars=BIG, render=render_element, coalesce_sections=True)
+        (whole,) = plan.units
+        assert whole.vision is True
+        assert whole.hidden_excluded == (("invisible", 1),)
+
+        split = bisect_unit(whole, doc, render=render_element)
+        assert split is not None
+        left, right = split
+        assert left.unit_id != right.unit_id
+        assert element_ids(left) == ["p0001_e000", "p0001_e001"]
+        assert element_ids(right) == ["p0002_e000", "p0002_e001", "p0002_e002"]
+        assert left.blocks + right.blocks == whole.blocks
+        assert left.page_numbers == (1,)
+        assert right.page_numbers == (2,)
+        assert left.vision is False
+        assert right.vision is True
+        assert left.oversize is False
+        assert right.oversize is False
+        assert left.hidden_excluded == (("invisible", 1),)
+        assert right.hidden_excluded == ()
+        envs = build_envelopes(
+            (left, right),
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json='{"type":"object"}',
+            coalesce_sections=True,
+        )
+        assert [e.unit_id for e in envs] == [left.unit_id, right.unit_id]
+
+    def test_bisect_coalesced_multi_element_unit_recomputes_section_scopes(self):
+        h_spec = heading(1, 0, "Spec")
+        h_elec = Heading(**fields(1, 1, ("Spec", "Electrical")), level=2, text="Electrical")
+        p_elec = para(1, 2, "Volts", scope=("Spec", "Electrical"))
+        h_mech = Heading(**fields(1, 3, ("Spec", "Mechanical")), level=2, text="Mechanical")
+        p_mech = para(1, 4, "Torque", scope=("Spec", "Mechanical"))
+        doc = document(
+            page(1, (h_spec, h_elec, p_elec, h_mech, p_mech)),
+            sections=[
+                section((h_spec,), h_spec),
+                section((h_elec, p_elec), h_elec),
+                section((h_mech, p_mech), h_mech),
+            ],
+        )
+        (whole,) = build_units(doc, max_unit_chars=BIG, render=render_element, coalesce_sections=True).units
+        assert whole.scope_path == ("Spec",)
+
+        split = bisect_unit(whole, doc, render=render_element)
+        assert split is not None
+        left, right = split
+        assert left.scope_path == ("Spec",)
+        assert right.scope_path == ("Spec",)
+        sub_right = bisect_unit(right, doc, render=render_element)
+        assert sub_right is not None
+        r_left, r_right = sub_right
+        assert r_left.scope_path == ("Spec", "Electrical")
+        assert r_right.scope_path == ("Spec", "Mechanical")
+        envs = build_envelopes(
+            (left, r_left, r_right),
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json='{"type":"object"}',
+            coalesce_sections=True,
+        )
+        assert len(envs) == 3
+
+    def test_bisect_multi_element_unit_with_split_table_parts_keeps_distinct_ids(self):
+        tbl = table(1, 0, ROWS[:4])
+        doc = document(page(1, (tbl,)))
+        p1 = dataclasses.replace(tbl, rows=tbl.rows[:2])
+        p2 = dataclasses.replace(tbl, rows=tbl.rows[2:4])
+        combined = Unit(
+            unit_id=f"{DOC}:p0001_e000.1-p0001_e000.2",
+            doc_id=DOC,
+            elements=(p1, p2),
+            blocks=(render_element(p1), render_element(p2)),
+            part_of=((1, 2), (2, 2)),
+            scope_path=(),
+            scope_entries_excluded=0,
+            page_numbers=(1,),
+            vision=False,
+            oversize=False,
+            hidden_excluded=(),
+        )
+        split = bisect_unit(combined, doc, render=render_element)
+        assert split is not None
+        left, right = split
+        assert left.unit_id == f"{DOC}:p0001_e000.1-p0001_e000.1"
+        assert right.unit_id == f"{DOC}:p0001_e000.2-p0001_e000.2"
+        assert left.unit_id != right.unit_id
+
+    def test_bisect_repeatedly_converges_and_conserves_hidden_counts_and_unique_ids(self):
+        ghost = para(1, 0, "hidden", hidden=("invisible", "tiny_font"))
+        p_a = para(1, 1, "first paragraph")
+        tbl = table(1, 2, ROWS)
+        lst = bullets(1, 3, ("i1", "i2", "i3"), ordered=True)
+        doc = document(page(1, (ghost, p_a, tbl, lst)))
+        (root,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+
+        current: list[Unit] = [root]
+        seen_ids: set[str] = {root.unit_id}
+        for _ in range(8):
+            next_units: list[Unit] = []
+            changed = False
+            for unit in current:
+                split = bisect_unit(unit, doc, render=render_element, existing_unit_ids=seen_ids)
+                if split is None:
+                    next_units.append(unit)
+                else:
+                    changed = True
+                    seen_ids.update((split[0].unit_id, split[1].unit_id))
+                    next_units.extend(split)
+            current = next_units
+            if not changed:
+                break
+        assert not changed
+        assert len(current) == 1 + len(ROWS) + 3
+        assert len({u.unit_id for u in current}) == len(current)
+        hidden_sum: Counter[str] = Counter()
+        for unit in current:
+            for reason, count in unit.hidden_excluded:
+                hidden_sum[reason] += count
+        assert dict(hidden_sum) == {"invisible": 1, "tiny_font": 1}
+
+    def test_bisect_single_table_preserves_headers_and_document_immutability(self):
+        ghost = para(1, 0, "hidden", hidden=("off_page",))
+        tbl = table(1, 1, ROWS, headers=("Part", "Code"))
+        doc = document(page(1, (ghost, tbl)))
+        doc_before = copy.deepcopy(doc)
+        (whole,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+
+        split = bisect_unit(whole, doc, render=render_element)
+        assert split is not None
+        left, right = split
+        assert doc == doc_before
+        assert left.unit_id == f"{DOC}:p0001_e001.1-p0001_e001.1"
+        assert right.unit_id == f"{DOC}:p0001_e001.2-p0001_e001.2"
+        assert left.part_of == ((1, 2),)
+        assert right.part_of == ((2, 2),)
+        assert isinstance(left.elements[0], Table) and isinstance(right.elements[0], Table)
+        assert left.elements[0].headers == ("Part", "Code")
+        assert right.elements[0].headers == ("Part", "Code")
+        assert left.elements[0].rows == tuple(ROWS[:2])
+        assert right.elements[0].rows == tuple(ROWS[2:])
+        assert left.oversize is False and right.oversize is False
+        assert left.hidden_excluded == (("off_page", 1),)
+        assert right.hidden_excluded == ()
+        envs = build_envelopes(
+            (left, right),
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json='{"type":"object"}',
+        )
+        assert len(envs) == 2
+
+    def test_bisect_already_split_table_parts_never_collides_with_sibling_ids(self):
+        rows = [(f"r{idx:02d}", f"v{idx:02d}") for idx in range(12)]
+        doc = document(page(1, (table(1, 0, rows),)))
+        plan = build_units(doc, max_unit_chars=110, render=render_element)
+        assert len(plan.units) >= 3
+        active_ids = {u.unit_id for u in plan.units}
+
+        first_split = bisect_unit(plan.units[0], doc, render=render_element, existing_unit_ids=active_ids)
+        assert first_split is not None
+        c1, c2 = first_split
+        assert c1.unit_id not in active_ids
+        assert c2.unit_id not in active_ids
+        assert c1.unit_id != c2.unit_id
+        active_ids.remove(plan.units[0].unit_id)
+        active_ids.update((c1.unit_id, c2.unit_id))
+
+        second_split = bisect_unit(plan.units[1], doc, render=render_element, existing_unit_ids=active_ids)
+        assert second_split is not None
+        c3, c4 = second_split
+        assert c3.unit_id not in active_ids
+        assert c4.unit_id not in active_ids
+        assert c3.unit_id != c4.unit_id
+        active_ids.remove(plan.units[1].unit_id)
+        active_ids.update((c3.unit_id, c4.unit_id))
+
+        spliced = (c1, c2, c3, c4, *plan.units[2:])
+        assert len({u.unit_id for u in spliced}) == len(spliced)
+        envs = build_envelopes(
+            spliced,
+            doc,
+            prompt="Extract.",
+            context=None,
+            schema_json='{"type":"object"}',
+        )
+        assert len(envs) == len(spliced)
+
+    def test_bisect_bullet_list_preserves_markers_across_repeated_splits(self):
+        items = ("alpha", "beta", "gamma", "delta")
+        for listing in (
+            bullets(1, 0, items, ordered=False),
+            bullets(1, 0, items, ordered=True),
+            bullets(1, 0, items, ordered=True, markers=("a)", "b)", "c)", "d)")),
+        ):
+            doc = document(page(1, (listing,)))
+            (whole,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+            split = bisect_unit(whole, doc, render=render_element)
+            assert split is not None
+            left, right = split
+            assert isinstance(left.elements[0], BulletList) and isinstance(right.elements[0], BulletList)
+            assert left.elements[0].items == ("alpha", "beta")
+            assert right.elements[0].items == ("gamma", "delta")
+            if listing.ordered and not listing.markers:
+                assert left.elements[0].markers == ("1.", "2.")
+                assert right.elements[0].markers == ("3.", "4.")
+                sub = bisect_unit(right, doc, render=render_element, existing_unit_ids={left.unit_id, right.unit_id})
+                assert sub is not None
+                r1, r2 = sub
+                assert isinstance(r1.elements[0], BulletList) and isinstance(r2.elements[0], BulletList)
+                assert r1.elements[0].markers == ("3.",)
+                assert r2.elements[0].markers == ("4.",)
+                build_envelopes((left, r1, r2), doc, prompt="P", context=None, schema_json='{"type":"object"}')
+
+    def test_bisect_unsplittable_units_return_none(self):
+        single_cases = [
+            document(page(1, (para(1, 0, "single paragraph"),))),
+            document(page(1, (heading(1, 0, "Single Heading"),))),
+            document(page(1, (KeyValue(**fields(1, 0), key="K", value="V"),))),
+            document(page(1, (picture(1, 0, caption="Figure 1"),))),
+            document(page(1, (table(1, 0, [("only", "row")]),))),
+            document(page(1, (table(1, 0, [], headers=("h1", "h2")),))),
+            document(page(1, (bullets(1, 0, ("only item",)),))),
+            document(page(1, (picture(1, 0, caption=None), para(1, 1, "only text")))),
+        ]
+        for doc in single_cases:
+            (unit,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+            assert bisect_unit(unit, doc, render=render_element) is None
+
+        p_img = PageImage(page_number=1, dpi=300.0, width_px=800, height_px=1000, _band_loader=lambda: (PNG_BAND_A,))
+        mm_doc = document(page(1, (para(1, 0, "ocr"),), route="vision", page_image=p_img))
+        (mm_unit,) = build_units(mm_doc, max_unit_chars=BIG, render=render_element, multimodal=True).units
+        assert bisect_unit(mm_unit, mm_doc, render=render_element, multimodal=True) is None
+
+    def test_bisect_captionless_figure_plus_splittable_table_or_list_splits_inner_element(self):
+        fig_pre = picture(1, 0, caption=None)
+        tbl = table(1, 1, ROWS[:4], headers=("Part", "Code"))
+        fig_post = picture(1, 2, caption=None)
+        doc = document(page(1, (fig_pre, tbl, fig_post)))
+        (whole,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+
+        first = bisect_unit(whole, doc, render=render_element, existing_unit_ids={whole.unit_id})
+        assert first is not None
+        left, right = first
+        assert left.unit_id != right.unit_id
+        assert element_ids(left) == ["p0001_e000", "p0001_e001"]
+        assert element_ids(right) == ["p0001_e001", "p0001_e002"]
+        assert isinstance(left.elements[1], Table) and left.elements[1].rows == tuple(ROWS[:2])
+        assert isinstance(right.elements[0], Table) and right.elements[0].rows == tuple(ROWS[2:4])
+
+        # Repeated bisection of left (still holding captionless fig_pre + 2-row table) splits again cleanly!
+        seen = {whole.unit_id, left.unit_id, right.unit_id}
+        second = bisect_unit(left, doc, render=render_element, existing_unit_ids=seen)
+        assert second is not None
+        l1, l2 = second
+        assert l1.unit_id not in seen and l2.unit_id not in seen and l1.unit_id != l2.unit_id
+        assert isinstance(l1.elements[1], Table) and len(l1.elements[1].rows) == 1
+        assert isinstance(l2.elements[0], Table) and len(l2.elements[0].rows) == 1
+        # Once down to 1 row alongside captionless figure, returns None cleanly.
+        assert bisect_unit(l1, doc, render=render_element, existing_unit_ids=seen | {l1.unit_id, l2.unit_id}) is None
+        envs = build_envelopes((l1, l2, right), doc, prompt="P", context=None, schema_json='{"type":"object"}')
+        assert len(envs) == 3
+
+    def test_bisect_validates_inputs(self):
+        doc = document(page(1, (para(1, 0, "a"), para(1, 1, "b"))))
+        other_doc = PDFDocument(metadata=metadata(1, source_name="other.pdf", sha="b" * 64), pages=doc.pages)
+        (unit,) = build_units(doc, max_unit_chars=BIG, render=render_element).units
+
+        with pytest.raises(TypeError):
+            bisect_unit("bad", doc, render=render_element)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            bisect_unit(unit, "bad", render=render_element)  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            bisect_unit(unit, doc, render="bad")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            bisect_unit(unit, doc, render=render_element, multimodal="yes")  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            bisect_unit(unit, doc, render=render_element, existing_unit_ids="not-a-set")
+        with pytest.raises(ValueError, match="doc_id"):
+            bisect_unit(unit, other_doc, render=render_element)

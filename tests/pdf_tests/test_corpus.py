@@ -1,13 +1,19 @@
 """Tests for Stage 1 batch PDF corpus extraction and loading (#463, 5.2): ``datagrunt.pdf.corpus``."""
 
+import ast
 import hashlib
 import json
+import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import datagrunt
 import datagrunt.pdf
+from datagrunt.pdf import _bundle_load
+from datagrunt.pdf import corpus as corpus_module
 from datagrunt.pdf.corpus import (
     CORPUS_FORMAT_VERSION,
     CORPUS_MANIFEST,
@@ -16,6 +22,7 @@ from datagrunt.pdf.corpus import (
     CorpusManifest,
     extract_corpus,
     load_corpus,
+    load_corpus_documents,
 )
 from datagrunt.pdf.exceptions import BundleCorruptError, PDFCorruptError
 from pdf_tests.builders import PageSpec, TextRun, build_pdf
@@ -343,3 +350,345 @@ class TestBatchExtractionAndLoading:
         assert all(e.reused for e in second.entries)
         docs = second.load_documents()
         assert all(page.page_image is None for doc in docs for page in doc.pages)
+
+
+class TestSinglePassAndParallelCorpusLoading:
+    def test_load_corpus_documents_exported_and_avoids_double_bundle_read(self, tmp_path, sample_pdfs, monkeypatch):
+        assert "load_corpus_documents" in corpus_module.__all__
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_single_pass"
+        extracted = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, render_pages=False)
+
+        load_calls: list[Path] = []
+        lock = threading.Lock()
+        real_load_bundle = corpus_module.load_bundle
+
+        def spy_load_bundle(path):
+            with lock:
+                load_calls.append(Path(path))
+            return real_load_bundle(path)
+
+        monkeypatch.setattr(corpus_module, "load_bundle", spy_load_bundle)
+
+        # 1. load_corpus_documents(path) verifies & loads each bundle once; subsequent load_documents() re-reads 0x.
+        manifest, docs = load_corpus_documents(out)
+        assert manifest == extracted
+        assert [d.metadata.source_name for d in docs] == ["alpha.pdf", "beta.pdf"]
+        assert len(load_calls) == 2
+        assert manifest.load_documents() == docs
+        assert len(load_calls) == 2
+
+        # 2. load_corpus(path) followed by manifest.load_documents() verifies & reads each bundle once, not twice.
+        load_calls.clear()
+        loaded_manifest = load_corpus(out / CORPUS_MANIFEST)
+        assert loaded_manifest == extracted
+        assert len(load_calls) == 2
+        docs_from_manifest = loaded_manifest.load_documents()
+        assert docs_from_manifest == docs
+        assert len(load_calls) == 2
+
+        # 3. Uncached manifest (from extract_corpus) caches after first load_documents() call; empty & 1-entry work.
+        load_calls.clear()
+        first_docs = extracted.load_documents()
+        assert len(load_calls) == 2
+        assert extracted.load_documents() == first_docs
+        assert len(load_calls) == 2
+
+        corrupt_pdf = tmp_path / "only_corrupt.pdf"
+        corrupt_pdf.write_bytes(b"%PDF-broken")
+        out_empty = tmp_path / "corpus_zero_entries"
+        extract_corpus(corrupt_pdf, out_empty, dpi=72, vision_dpi=72, strict=False)
+        empty_manifest, empty_docs = load_corpus_documents(out_empty)
+        assert empty_manifest.entries == ()
+        assert empty_docs == ()
+        assert empty_manifest.load_documents() == ()
+
+    def test_cached_manifest_still_detects_post_load_bundle_tampering(self, tmp_path, sample_pdfs):
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_tamper_after_load"
+        extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, render_pages=False)
+
+        # Same-size byte corruption in document.json after load_corpus() must invalidate stamp and raise.
+        m1 = load_corpus(out)
+        doc_json = out / m1.entries[1].bundle_relpath / "json" / "document.json"
+        original = doc_json.read_bytes()
+        corrupted = bytearray(original)
+        idx = original.index(b"Beta Page 1")
+        corrupted[idx : idx + 4] = b"XXXX"
+        assert len(corrupted) == len(original)
+        doc_json.write_bytes(bytes(corrupted))
+        st = doc_json.stat()
+        os.utime(doc_json, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        with pytest.raises(BundleCorruptError):
+            m1.load_documents()
+
+        # Restore document.json, reload cleanly, then delete an artifact file after load_corpus().
+        doc_json.write_bytes(original)
+        m2 = load_corpus(out)
+        md_file = out / m2.entries[0].bundle_relpath / "markdown" / "document.md"
+        md_file.unlink()
+        with pytest.raises(BundleCorruptError):
+            m2.load_documents()
+
+    def test_parallel_entry_verification_preserves_order_and_deterministic_first_error(self, tmp_path, monkeypatch):
+        pdf_dir = tmp_path / "five_pdfs"
+        pdf_dir.mkdir()
+        pdfs = [
+            build_pdf(pdf_dir / f"doc_{i:02d}.pdf", [PageSpec(items=(TextRun(f"Doc {i}", 72.0, 100.0),))])
+            for i in range(5)
+        ]
+        out = tmp_path / "corpus_parallel"
+        extracted = extract_corpus(pdfs, out, dpi=72, vision_dpi=72, render_pages=False)
+
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+        all_started = threading.Event()
+        real_load = _bundle_load._loaded
+
+        def overlapping_load(root: Path):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+                if active >= 2:
+                    all_started.set()
+            all_started.wait(timeout=2.0)
+            try:
+                return real_load(root)
+            finally:
+                with lock:
+                    active -= 1
+
+        monkeypatch.setattr(_bundle_load, "_loaded", overlapping_load)
+        manifest, docs = load_corpus_documents(out)
+        assert peak_active >= 2
+        assert [d.metadata.source_name for d in docs] == [f"doc_{i:02d}.pdf" for i in range(5)]
+        assert manifest == extracted
+        monkeypatch.undo()
+
+        # Deterministic error order: entry 1 fails slower than entry 3, yet entry 1's error is always raised!
+        entry1_rel = extracted.entries[1].bundle_relpath
+        entry3_rel = extracted.entries[3].bundle_relpath
+        real_lb = corpus_module.load_bundle
+
+        def fail_two(path):
+            p = Path(path)
+            if p.name == entry1_rel:
+                time.sleep(0.05)
+                raise BundleCorruptError("corrupt_entry_1")
+            if p.name == entry3_rel:
+                raise BundleCorruptError("corrupt_entry_3")
+            return real_lb(path)
+
+        monkeypatch.setattr(corpus_module, "load_bundle", fail_two)
+        with pytest.raises(BundleCorruptError, match="corrupt_entry_1"):
+            load_corpus(out)
+
+    def test_corpus_functions_obey_length_and_nesting_bounds(self):
+        compound = (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try, ast.Match)
+
+        def max_nesting(node: ast.AST, depth: int = 0) -> int:
+            best = depth
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                nxt = depth + (1 if isinstance(child, compound) else 0)
+                best = max(best, max_nesting(child, nxt))
+            return best
+
+        checked_names = {
+            "load_documents",
+            "_can_spawn_corpus_procs",
+            "_execute_corpus_batch",
+            "load_corpus_documents",
+            "load_corpus",
+            "_resolve_inputs",
+            "_partition_reusable_items",
+            "_run_spawn_batch",
+            "_verified_bundle_doc_raw",
+            "_reused_entry",
+            "_file_stat",
+            "_bundle_artifact_paths",
+            "_capture_bundle_stamp",
+            "_stamps_valid",
+            "_load_one_entry",
+            "_submit_map_window",
+            "_drain_done_map",
+            "_map_bounded",
+            "_load_verified_entries",
+        }
+        tree = ast.parse(Path(corpus_module.__file__).read_text(encoding="utf-8"))
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in checked_names:
+                seen.add(node.name)
+                span = (node.end_lineno or node.lineno) - node.lineno + 1
+                assert span <= 50, f"{node.name} is {span} lines (> 50)"
+                assert max_nesting(node) <= 3, f"{node.name} exceeds AST nesting 3"
+        assert seen == checked_names
+
+
+class TestWave2Rank6ManifestFirstAndParallelReuse:
+    def test_manifest_first_reused_entry_skips_artifacts_on_mismatch_and_skips_full_doc_decode_on_hit(
+        self, tmp_path, sample_pdfs, monkeypatch
+    ):
+        from datagrunt.pdf import codec
+
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_reuse_fast"
+        first = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72)
+        assert len(first.entries) == 2
+
+        verified_calls: list[str] = []
+        decode_calls: list[int] = []
+        lock = threading.Lock()
+        real_verified = _bundle_load._verified
+        real_decode = codec.document_from_json_bytes
+
+        def spy_verified(root: Path, entry, *, keep: bool):
+            with lock:
+                verified_calls.append(entry.path)
+            return real_verified(root, entry, keep=keep)
+
+        def spy_decode(*args, **kwargs):
+            with lock:
+                decode_calls.append(1)
+            return real_decode(*args, **kwargs)
+
+        monkeypatch.setattr(corpus_module, "_verified", spy_verified, raising=False)
+        monkeypatch.setattr(_bundle_load, "_verified", spy_verified)
+        monkeypatch.setattr(codec, "document_from_json_bytes", spy_decode)
+        monkeypatch.setattr(_bundle_load, "document_from_json_bytes", spy_decode)
+
+        # 1. Param mismatch (dpi=150 vs 72): _reused_entry rejects from manifest.json alone without reading artifacts!
+        opts_mismatch = corpus_module.PipelineOptions(dpi=150, vision_dpi=150)
+        items = corpus_module._resolve_inputs([pdf_a, pdf_b])
+        _, exp_mismatch = corpus_module._expected_params_for(opts_mismatch, include_images=True, render_pages=True)
+        for it in items:
+            assert corpus_module._reused_entry(out / it.doc_id, it, it.doc_id, exp_mismatch) is None
+        assert verified_calls == []
+        assert decode_calls == []
+
+        # 2. Clean match: SHA-256-verifies artifacts via _verified, but skips full document_from_json_bytes decode!
+        opts_match = corpus_module.PipelineOptions(dpi=72, vision_dpi=72)
+        _, exp_match = corpus_module._expected_params_for(opts_match, include_images=True, render_pages=True)
+        reused = [corpus_module._reused_entry(out / it.doc_id, it, it.doc_id, exp_match) for it in items]
+        assert all(r is not None and r.reused for r in reused)
+        assert [(r.doc_id, r.page_count, r.degraded_pages) for r in reused if r is not None] == [
+            (e.doc_id, e.page_count, e.degraded_pages) for e in first.entries
+        ]
+        assert any(p.endswith(".png") for p in verified_calls)
+        assert decode_calls == []
+
+    def test_reused_entry_preserves_sha256_symlink_and_metadata_tamper_rejections(self, tmp_path, sample_pdfs):
+        pdf_a, pdf_b = sample_pdfs
+        out = tmp_path / "corpus_tamper_reuse"
+        first = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72)
+        b0 = out / first.entries[0].bundle_relpath
+        b1 = out / first.entries[1].bundle_relpath
+        items = corpus_module._resolve_inputs([pdf_a, pdf_b])
+        opts = corpus_module.PipelineOptions(dpi=72, vision_dpi=72)
+        _, exp = corpus_module._expected_params_for(opts, include_images=True, render_pages=True)
+
+        # 1. Same-size in-place byte corruption of page PNG in bundle 0 -> rejected and cleanly re-extracted!
+        png_path = b0 / "page_images" / "page_0001.png"
+        orig_png = png_path.read_bytes()
+        bad_png = bytearray(orig_png)
+        bad_png[-4:] = bytes(b ^ 0xFF for b in bad_png[-4:])
+        png_path.write_bytes(bytes(bad_png))
+
+        rebuilt = extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, overwrite=False)
+        assert [e.reused for e in rebuilt.entries] == [False, True]
+        assert len(load_corpus(out).entries) == 2
+
+        # 2. Symlinked artifact file or symlinked intermediate directory -> _reused_entry returns None!
+        md_path = b1 / "markdown" / "document.md"
+        outside = tmp_path / "outside.md"
+        outside.write_bytes(md_path.read_bytes())
+        md_path.unlink()
+        md_path.symlink_to(outside)
+        assert corpus_module._reused_entry(b1, items[1], items[1].doc_id, exp) is None
+
+        # 3. Symlinked subdirectory inside bundle -> _reused_entry returns None!
+        md_path.unlink()
+        md_path.write_bytes(outside.read_bytes())
+        assert corpus_module._reused_entry(b1, items[1], items[1].doc_id, exp) is not None
+        real_md_dir = tmp_path / "moved_markdown"
+        os.rename(b1 / "markdown", real_md_dir)
+        (b1 / "markdown").symlink_to(real_md_dir)
+        assert corpus_module._reused_entry(b1, items[1], items[1].doc_id, exp) is None
+
+    def test_parallel_resolve_inputs_and_reused_entry_overlap_and_preserve_error_order(self, tmp_path, monkeypatch):
+        pdf_dir = tmp_path / "par_pdfs"
+        pdf_dir.mkdir()
+        pdfs = [
+            build_pdf(pdf_dir / f"p_{i:02d}.pdf", [PageSpec(items=(TextRun(f"P {i}", 72.0, 100.0),))]) for i in range(4)
+        ]
+        out = tmp_path / "par_out"
+        extract_corpus(pdfs, out, dpi=72, vision_dpi=72, render_pages=False)
+
+        # 1. _resolve_inputs runs _file_sha256_and_identity in bounded parallel
+        active_hash = 0
+        peak_hash = 0
+        hash_started = threading.Event()
+        lock = threading.Lock()
+        real_hash = corpus_module._file_sha256_and_identity
+
+        def overlap_hash(path: Path):
+            nonlocal active_hash, peak_hash
+            with lock:
+                active_hash += 1
+                peak_hash = max(peak_hash, active_hash)
+                if active_hash >= 2:
+                    hash_started.set()
+            hash_started.wait(timeout=2.0)
+            try:
+                return real_hash(path)
+            finally:
+                with lock:
+                    active_hash -= 1
+
+        monkeypatch.setattr(corpus_module, "_file_sha256_and_identity", overlap_hash)
+        resolved_items = corpus_module._resolve_inputs(pdfs)
+        assert peak_hash >= 2
+        assert [it.source_name for it in resolved_items] == [f"p_{i:02d}.pdf" for i in range(4)]
+
+        # Deterministic error precedence in _resolve_inputs: index 1 slower than index 3, index 1 wins!
+        def fail_hash(path: Path):
+            if path.name == "p_01.pdf":
+                time.sleep(0.05)
+                raise OSError("io_err_01")
+            if path.name == "p_03.pdf":
+                raise OSError("io_err_03")
+            return real_hash(path)
+
+        monkeypatch.setattr(corpus_module, "_file_sha256_and_identity", fail_hash)
+        with pytest.raises(OSError, match="io_err_01"):
+            corpus_module._resolve_inputs(pdfs)
+        monkeypatch.setattr(corpus_module, "_file_sha256_and_identity", real_hash)
+
+        # 2. extract_corpus(..., overwrite=False) runs _reused_entry in bounded parallel
+        active_reuse = 0
+        peak_reuse = 0
+        reuse_started = threading.Event()
+        real_reuse = corpus_module._reused_entry
+
+        def overlap_reuse(bdir: Path, item, rel: str, exp: dict[str, object]):
+            nonlocal active_reuse, peak_reuse
+            with lock:
+                active_reuse += 1
+                peak_reuse = max(peak_reuse, active_reuse)
+                if active_reuse >= 2:
+                    reuse_started.set()
+            reuse_started.wait(timeout=2.0)
+            try:
+                return real_reuse(bdir, item, rel, exp)
+            finally:
+                with lock:
+                    active_reuse -= 1
+
+        monkeypatch.setattr(corpus_module, "_reused_entry", overlap_reuse)
+        second = extract_corpus(pdfs, out, max_workers=4, dpi=72, vision_dpi=72, render_pages=False, overwrite=False)
+        assert peak_reuse >= 2
+        assert all(e.reused for e in second.entries)

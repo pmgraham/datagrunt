@@ -124,7 +124,7 @@ from datagrunt.pdf.elements import (
 from datagrunt.rationalization.consensus import ConsensusItem, ConsensusResult, alnum_upper_text, normalized_text
 from datagrunt.rationalization.envelope import Envelope, element_text
 from datagrunt.rationalization.runner import RunOutcome
-from datagrunt.rationalization.schema import MAX_DEPTH, ModelSpec, PreparedSchema
+from datagrunt.rationalization.schema import MAX_DEPTH, FieldSpec, ModelSpec, PreparedSchema, ScalarSpec
 from datagrunt.rationalization.units import Unit, is_multimodal_page, vision_page_anchor
 
 GroundedStatus: TypeAlias = Literal[
@@ -173,6 +173,7 @@ _NUMBER_RUN = re.compile(r"(?<![\w.,])(?>[0-9](?:[0-9.,]*[0-9])?)(?!\w)")
 _NUMBER = re.compile(r"(?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+)(?:\.[0-9]+)?")
 _MINUS = frozenset("-\u2212")
 _ASCII_ALNUM = frozenset(string.ascii_letters + string.digits)
+_ASCII_WORD = re.compile(r"[0-9A-Za-z]+")
 # The renderer's markup around an element's fields (module notes, 3). A cell is escaped text, so its own "|" is
 # "\\|" and each backslash pairs with the character after it; a key-value's key holds no unescaped "*".
 _TABLE_CELL = re.compile(r" ((?:\\.|[^\\|])*?) \|")
@@ -517,30 +518,10 @@ def ground(
     envelopes: Mapping[str, Envelope],
     documents: Mapping[str, PDFDocument],
     schema: PreparedSchema,
+    min_families: int = 2,
 ) -> GroundingResult:
-    """Ground every item of ``consensus`` (module notes).
-
-    Args:
-        consensus: The consensus result of the run.
-        outcome: The run's outcome, whose responses say which units a model answered (module notes, 5).
-        units: Every unit of the run by its id, in document order (the order of ``empty_units``).
-        envelopes: Each unit's envelope by its id: the same ids as ``units``.
-        documents: Each document of the run by its ``doc_id``: its pages' routes say which elements a vision page
-            holds (module notes, 2).
-        schema: The prepared schema the run used.
-
-    Returns:
-        The :class:`GroundingResult`.
-
-    Raises:
-        TypeError: If an argument has the wrong type.
-        ValueError: If a mapping's id is not its value's, ``envelopes`` and ``units`` name other ids, an item, a
-            quarantined item or a response names a unit ``units`` does not, an item's models are not the
-            outcome's, its key does not fit the schema, a header-context id an envelope shows is the element of
-            no unit of its document, a document is under another id, or a unit is not of the pages of a document
-            given (its document or a page of it missing, or its ``vision`` flag not what their routes give).
-    """
-    _check_arguments(consensus, outcome, units, envelopes, schema)
+    """Ground every item of ``consensus`` against its cited elements and model quotes (module notes)."""
+    _check_arguments(consensus, outcome, units, envelopes, schema, min_families)
     headers = _header_elements(units, envelopes)
     vision_pages = _vision_pages(documents, units, envelopes)
     checks = _key_checks(schema.spec)
@@ -552,7 +533,15 @@ def ground(
     for item in consensus.items:
         _check_item(item, model_ids, schema, checks)
         unit_texts = _unit_texts_for(item.unit_id, texts, units, envelopes, headers, vision_pages, documents)
-        found = _item_reasons(item, unit_texts, checks, root_norms=root_norms, child_specs=child_specs)
+        found = _item_reasons(
+            item,
+            unit_texts,
+            checks,
+            root_norms=root_norms,
+            child_specs=child_specs,
+            spec=schema.spec,
+            min_families=min_families,
+        )
         items.append(GroundedItem._trusted(item=item, status=_status(item.status, bool(found)), reasons=found))
     return GroundingResult._trusted(items=tuple(items), empty_units=_empty_units(consensus, outcome, units))
 
@@ -684,7 +673,14 @@ def _check_mapping(name: str, value: object, kind: type, what: str) -> None:
             raise ValueError(f"{name} key {unit_id!r} is not its {what}'s id ({entry.unit_id!r})")
 
 
-def _check_arguments(consensus: object, outcome: object, units: object, envelopes: object, schema: object) -> None:
+def _check_arguments(
+    consensus: object,
+    outcome: object,
+    units: object,
+    envelopes: object,
+    schema: object,
+    min_families: object = 2,
+) -> None:
     """Require each argument's type, and the units to name every unit the others name (the items' checked later)."""
     if not isinstance(consensus, ConsensusResult):
         raise TypeError(f"consensus must be a ConsensusResult, got {type(consensus).__name__}")
@@ -692,6 +688,10 @@ def _check_arguments(consensus: object, outcome: object, units: object, envelope
         raise TypeError(f"outcome must be a RunOutcome, got {type(outcome).__name__}")
     if not isinstance(schema, PreparedSchema):
         raise TypeError(f"schema must be a PreparedSchema, got {type(schema).__name__}")
+    if type(min_families) is not int:
+        raise TypeError(f"min_families must be an int, got {type(min_families).__name__}")
+    if min_families < 1:
+        raise ValueError(f"min_families must be >= 1, got {min_families}")
     _check_mapping("units", units, Unit, "unit")
     _check_mapping("envelopes", envelopes, Envelope, "envelope")
     known = set(cast(Mapping[str, Unit], units))
@@ -770,6 +770,8 @@ class _UnitTexts:
         "_alnum_sets",
         "_blocks",
         "_elements",
+        "_joined_alnum",
+        "_joined_plain",
         "_multimodal",
         "_numbers",
         "_own",
@@ -780,6 +782,7 @@ class _UnitTexts:
         "_tokens",
         "_vision_pages",
         "_witness",
+        "_word_sets",
     )
 
     def __init__(
@@ -808,8 +811,11 @@ class _UnitTexts:
         self._quoted: dict[str, tuple[str, ...]] = {}
         self._plain: dict[str, tuple[str, ...]] = {}
         self._plain_sets: dict[str, frozenset[str]] = {}
+        self._word_sets: dict[str, frozenset[str]] = {}
+        self._joined_plain: dict[str, str] = {}
         self._alnum_entries: dict[str, tuple[tuple[str, str, "array[int]"], ...]] = {}
         self._alnum_sets: dict[str, frozenset[str]] = {}
+        self._joined_alnum: dict[str, tuple[str, str, "array[int]"]] = {}
         self._numbers: dict[str, frozenset[Decimal]] = {}
         self._tokens: dict[str, tuple[Counter[str], ...]] = {}
         self._vision_pages = vision_pages
@@ -883,6 +889,23 @@ class _UnitTexts:
             found = self._plain_sets[element_id] = frozenset(self.plain(element_id))
         return found
 
+    def word_set(self, element_id: str) -> frozenset[str]:
+        """Frozenset of maximal ASCII alphanumeric runs across :meth:`plain` fields for O(1) ``_set_off`` checks."""
+        found = self._word_sets.get(element_id)
+        if found is None:
+            words: set[str] = set()
+            for cell in self.plain(element_id):
+                words.update(_ASCII_WORD.findall(cell))
+            found = self._word_sets[element_id] = frozenset(words)
+        return found
+
+    def joined_plain(self, element_id: str) -> str:
+        """NUL-joined :meth:`plain` fields for single-pass C ``str.find`` ``_set_off`` lookup."""
+        found = self._joined_plain.get(element_id)
+        if found is None:
+            found = self._joined_plain[element_id] = "\x00".join(self.plain(element_id))
+        return found
+
     def alnum_upper_entries(self, element_id: str) -> tuple[tuple[str, str, "array[int]"], ...]:
         """Pre-indexed ``(text, joined_upper, source_indices)`` triples for :meth:`plain` fields."""
         found = self._alnum_entries.get(element_id)
@@ -897,6 +920,13 @@ class _UnitTexts:
             found = self._alnum_sets[element_id] = frozenset(
                 tok for entry in self.alnum_upper_entries(element_id) if (tok := _whole_alnum_token(entry)) is not None
             )
+        return found
+
+    def joined_alnum_entry(self, element_id: str) -> tuple[str, str, "array[int]"]:
+        """Single ``"\\n\\x00\\n"``-joined :func:`_index_alnum_field` entry with zero cross-cell bridging/gluing."""
+        found = self._joined_alnum.get(element_id)
+        if found is None:
+            found = self._joined_alnum[element_id] = _index_alnum_field("\n\x00\n".join(self.plain(element_id)))
         return found
 
     def numbers(self, element_id: str) -> frozenset[Decimal]:
@@ -1272,6 +1302,185 @@ def _raw_root_values(votes: Sequence[Mapping[str, Any]], name: str, kind: _KeyKi
     return tuple(dict.fromkeys(_coerce_key_val(v[name], kind) for v in votes if isinstance(v, Mapping) and name in v))
 
 
+def _is_substantive_str(value: str) -> bool:
+    """Whether ``value`` has >= ``QUOTE_MIN_TOKENS`` length or is a code identifier."""
+    comp = _comparable(value)
+    return bool(comp) and (_length(comp) >= QUOTE_MIN_TOKENS or _is_code_identifier(comp))
+
+
+def _is_free_text_scalar(scalar: ScalarSpec | None) -> bool:
+    """Whether ``scalar`` is a non-Enum, non-Literal ``str`` field."""
+    return scalar is not None and scalar.base is str and scalar.enum is None and scalar.literal is None
+
+
+def _field_populated(value: object, field_spec: FieldSpec, depth: int) -> bool:
+    """Whether ``value`` is a non-None, non-empty populated value for ``field_spec``."""
+    if value is None or depth > MAX_DEPTH:
+        return False
+    if field_spec.kind == "scalar":
+        return bool(_comparable(value)) if type(value) is str else True
+    if field_spec.kind == "scalar_list":
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or not value:
+            return False
+        return any(bool(_comparable(v)) if type(v) is str else v is not None for v in value)
+    if field_spec.kind == "model" and field_spec.child is not None:
+        return _populated_field_count(value, field_spec.child, depth + 1) >= 1
+    if field_spec.kind == "model_list" and field_spec.child is not None and isinstance(value, Sequence):
+        return any(_populated_field_count(child, field_spec.child, depth + 1) >= 1 for child in value)
+    return False
+
+
+def _populated_field_count(record: object, spec: ModelSpec, depth: int = 1) -> int:
+    """Count populated non-None / non-empty fields on ``record`` according to ``spec``."""
+    if record is None or depth > MAX_DEPTH:
+        return 0
+    return sum(1 for f in spec.fields if _field_populated(getattr(record, f.name, None), f, depth))
+
+
+def _field_has_substantive_str(value: object, field_spec: FieldSpec, depth: int) -> bool:
+    """Whether ``field_spec``'s ``value`` contains a substantive free-text ``str``."""
+    if value is None or depth > MAX_DEPTH:
+        return False
+    if field_spec.kind == "scalar":
+        return _is_free_text_scalar(field_spec.scalar) and type(value) is str and _is_substantive_str(value)
+    if field_spec.kind == "scalar_list":
+        if not _is_free_text_scalar(field_spec.scalar) or not isinstance(value, Sequence):
+            return False
+        return any(type(v) is str and _is_substantive_str(v) for v in value)
+    if field_spec.kind == "model" and field_spec.child is not None:
+        return _has_substantive_free_text(value, field_spec.child, depth + 1)
+    if field_spec.kind == "model_list" and field_spec.child is not None and isinstance(value, Sequence):
+        return any(_has_substantive_free_text(child, field_spec.child, depth + 1) for child in value)
+    return False
+
+
+def _has_substantive_free_text(record: object, spec: ModelSpec, depth: int = 1) -> bool:
+    """Whether ``record`` carries at least one substantive free-text ``str`` value across ``spec``."""
+    if record is None or depth > MAX_DEPTH:
+        return False
+    return any(_field_has_substantive_str(getattr(record, f.name, None), f, depth) for f in spec.fields)
+
+
+def _quotes_hold_all_keys(
+    quotes: tuple[str, ...],
+    key: tuple[object, ...],
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    norms: Mapping[str, str | None],
+    root_raw: tuple[tuple[object, ...], ...],
+    child_specs: tuple[_ChildKeySpec, ...],
+    child_vals: tuple[tuple[object, ...], ...],
+) -> bool:
+    """Whether ``quotes`` self-consistently hold every checked root and child-list key value."""
+    if not checks and not child_specs:
+        return True
+    read = tuple(_comparable(unescape_markdown(q)) for q in quotes)
+    num_cache: list[frozenset[Decimal] | None] = [None] * len(read)
+    for idx, (position, name, kind) in enumerate(checks):
+        raw_vals = root_raw[idx] if idx < len(root_raw) and root_raw[idx] else (key[position],)
+        if not all(_key_quoted(val, kind, read, num_cache, norms.get(name)) for val in raw_vals):
+            return False
+    for (_, _, kind, norm), c_vals in zip(child_specs, child_vals, strict=True):
+        if c_vals and not all(_key_quoted(val, kind, read, num_cache, norm) for val in c_vals):
+            return False
+    return True
+
+
+def _model_scan_self_consistent(
+    item: ConsensusItem,
+    model_id: str,
+    votes: Sequence[Mapping[str, Any]],
+    texts: _UnitTexts,
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    norms: Mapping[str, str | None],
+    child_specs: tuple[_ChildKeySpec, ...],
+    peer_map: Mapping[str, _PeerEntry],
+    *,
+    has_substantive_str: bool,
+) -> bool:
+    """Whether supporting ``model_id`` cites pure textless anchors with valid self-consistent quotes."""
+    eids = item.element_ids_by_model[model_id]
+    quotes = item.quotes_by_model[model_id]
+    if not eids or not quotes or _cited_reasons(model_id, eids, texts):
+        return False
+    if not all(texts.textless_anchor(eid) for eid in eids):
+        return False
+    comp = [_comparable(q) for q in quotes]
+    if not all(_tokens(cq) for cq in comp):
+        return False
+    if not checks:
+        sub_q = [_length(cq) >= QUOTE_MIN_TOKENS or _is_code_identifier(cq) for cq in comp]
+        if not (any(sub_q) if has_substantive_str else all(sub_q)):
+            return False
+    root_raw = tuple(_raw_root_values(votes, name, kind) if norms.get(name) else () for _, name, kind in checks)
+    child_vals = tuple(_extract_spec_values(votes, steps, kind) for steps, _, kind, _ in child_specs)
+    if not _quotes_hold_all_keys(quotes, item.key, checks, norms, root_raw, child_specs, child_vals):
+        return False
+    if not checks:
+        return True
+    cited = list(eids)
+    witness = _peer_witness_for(item, model_id, frozenset(eids), peer_map)
+    matched = [_quote_found(cq, cited, texts, witness) for cq in comp]
+    return not any(matched) or _matched_quotes_hold_keys(quotes, matched, item.key, checks, norms, root_raw)
+
+
+def _anchors_share_min_families(
+    supporting_ids: Sequence[str],
+    item: ConsensusItem,
+    required_families: int,
+) -> bool:
+    """Whether each supporting model shares a cited anchor with >= ``required_families`` known families."""
+    anchor_sets = {mid: frozenset(item.element_ids_by_model[mid]) for mid in supporting_ids}
+    for mid in supporting_ids:
+        own_set = anchor_sets[mid]
+        shared_fams = {
+            fam
+            for pid in supporting_ids
+            if (fam := item.families.get(pid, "unknown")) != "unknown" and not own_set.isdisjoint(anchor_sets[pid])
+        }
+        if len(shared_fams) < required_families:
+            return False
+    return True
+
+
+def _structured_scan_agreement(
+    item: ConsensusItem,
+    texts: _UnitTexts,
+    spec: ModelSpec | None,
+    checks: tuple[tuple[int, str, _KeyKind], ...],
+    norms: Mapping[str, str | None],
+    child_specs: tuple[_ChildKeySpec, ...],
+    peer_map: Mapping[str, _PeerEntry],
+    min_families: int,
+) -> bool:
+    """Whether pure ``image_only`` scan cross-family structured field agreement witnesses ``item``."""
+    if spec is None or not texts.multimodal or item.status != "consensus" or item.record is None:
+        return False
+    if item.disputed_fields or item.notes:
+        return False
+    has_sub_str = _has_substantive_free_text(item.record, spec)
+    if not has_sub_str and _populated_field_count(item.record, spec) < 2:
+        return False
+    supporting = [(mid, votes) for mid, votes in item.model_votes.items() if votes]
+    if not _anchors_share_min_families([mid for mid, _ in supporting], item, max(2, min_families)):
+        return False
+    return all(
+        _model_scan_self_consistent(
+            item, mid, votes, texts, checks, norms, child_specs, peer_map, has_substantive_str=has_sub_str
+        )
+        for mid, votes in supporting
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ModelSpecCtx:
+    """Per-item key-checking metadata passed into :func:`_model_reasons`."""
+
+    checks: tuple[tuple[int, str, _KeyKind], ...]
+    norms: Mapping[str, str | None]
+    child_specs: tuple[_ChildKeySpec, ...]
+    scan_agreed: bool = False
+
+
 def _item_reasons(
     item: ConsensusItem,
     texts: _UnitTexts,
@@ -1279,11 +1488,15 @@ def _item_reasons(
     *,
     root_norms: Mapping[str, str | None] | None = None,
     child_specs: tuple[_ChildKeySpec, ...] = (),
+    spec: ModelSpec | None = None,
+    min_families: int = 2,
 ) -> tuple[GroundingReason, ...]:
     """Every supporting model's reasons, in model order (module notes, 4)."""
     norms = root_norms or {}
     has_norm = any(norms.values())
     peer_map = _build_multimodal_peer_map(item, texts) if texts.multimodal else {}
+    scan_agreed = _structured_scan_agreement(item, texts, spec, checks, norms, child_specs, peer_map, min_families)
+    ctx = _ModelSpecCtx(checks=checks, norms=norms, child_specs=child_specs, scan_agreed=scan_agreed)
     found: list[GroundingReason] = []
     seen: dict[tuple[object, ...], list[GroundingReason]] = {}
     for model_id, votes in item.model_votes.items():
@@ -1298,13 +1511,10 @@ def _item_reasons(
         )
         child_vals = tuple(_extract_spec_values(votes, steps, kind) for steps, _, kind, _ in child_specs)
         evidence = (element_ids, quotes, cache_tag, root_sig, child_vals)
-        cached = seen.get(evidence)
-        if cached is not None:
+        if (cached := seen.get(evidence)) is not None:
             found.extend(replace(reason, model_id=model_id) for reason in cached)
             continue
-        own = _model_reasons(
-            item, model_id, element_ids, quotes, texts, checks, peer_map, norms, root_sig, child_specs, child_vals
-        )
+        own = _model_reasons(item, model_id, element_ids, quotes, texts, peer_map, ctx, root_sig, child_vals)
         seen[evidence] = own
         found.extend(own)
     return tuple(found)
@@ -1316,11 +1526,9 @@ def _model_reasons(
     element_ids: tuple[str, ...],
     quotes: tuple[str, ...],
     texts: _UnitTexts,
-    checks: tuple[tuple[int, str, _KeyKind], ...],
     peer_map: Mapping[str, _PeerEntry],
-    norms: Mapping[str, str | None],
+    ctx: _ModelSpecCtx,
     root_sig: tuple[tuple[object, ...], ...],
-    child_specs: tuple[_ChildKeySpec, ...],
     child_vals: tuple[tuple[object, ...], ...],
 ) -> list[GroundingReason]:
     """Compute cited-element, quote, and key grounding reasons for one supporting ``model_id``."""
@@ -1330,36 +1538,50 @@ def _model_reasons(
     anchors = frozenset(eid for eid in cited if texts.multimodal_anchor(eid)) if texts.multimodal else frozenset()
     witness = _peer_witness_for(item, model_id, anchors, peer_map) if anchors else _EMPTY_WITNESS
     own = _cited_reasons(model_id, element_ids, texts)
-    own.extend(
-        _quote_reasons(
-            model_id,
-            quotes,
-            cited,
-            texts,
-            keyless=not checks,
-            witness=witness,
-            key=item.key,
-            checks=checks,
-            norms=norms,
-            root_raw=root_sig,
-        )
-    )
+    own.extend(_quote_reasons_ctx(model_id, quotes, cited, texts, witness, item.key, ctx, root_sig))
     own.extend(
         _key_reasons(
             model_id,
             item.key,
-            checks,
+            ctx.checks,
             cited,
             quotes,
             texts,
             peer_plain=witness.plain,
             root_raw=root_sig,
-            root_norms=norms,
-            child_specs=child_specs,
+            root_norms=ctx.norms,
+            child_specs=ctx.child_specs,
             child_vals=child_vals,
+            scan_agreed=ctx.scan_agreed,
         )
     )
     return own
+
+
+def _quote_reasons_ctx(
+    model_id: str,
+    quotes: tuple[str, ...],
+    cited: list[str],
+    texts: _UnitTexts,
+    witness: _PeerWitness,
+    key: tuple[object, ...],
+    ctx: _ModelSpecCtx,
+    root_sig: tuple[tuple[object, ...], ...],
+) -> list[GroundingReason]:
+    """Dispatch :func:`_quote_reasons` using unpacked :class:`_ModelSpecCtx` metadata."""
+    return _quote_reasons(
+        model_id,
+        quotes,
+        cited,
+        texts,
+        keyless=not ctx.checks,
+        witness=witness,
+        key=key,
+        checks=ctx.checks,
+        norms=ctx.norms,
+        root_raw=root_sig,
+        scan_agreed=ctx.scan_agreed,
+    )
 
 
 def _cited_reasons(model_id: str, element_ids: tuple[str, ...], texts: _UnitTexts) -> list[GroundingReason]:
@@ -1389,11 +1611,14 @@ def _quote_reasons(
     checks: tuple[tuple[int, str, _KeyKind], ...] = (),
     norms: Mapping[str, str | None] | None = None,
     root_raw: tuple[tuple[object, ...], ...] = (),
+    scan_agreed: bool = False,
 ) -> list[GroundingReason]:
     """One model's reasons about its quotes (module notes, 2): each must lie within one element it cited; when no
     key is checked (``keyless``), one of them must hold :data:`QUOTE_MIN_TOKENS` tokens."""
     if not quotes:
         return [GroundingReason._trusted("no_quotes", model_id)]
+    if scan_agreed:
+        return []
     comparable = [_comparable(quote) for quote in quotes]
     matched = [_quote_found(comp, cited, texts, witness) for comp in comparable]
     allow_extra = (
@@ -1720,6 +1945,7 @@ def _key_reasons(
     root_norms: Mapping[str, str | None] | None = None,
     child_specs: tuple[_ChildKeySpec, ...] = (),
     child_vals: tuple[tuple[object, ...], ...] = (),
+    scan_agreed: bool = False,
 ) -> list[GroundingReason]:
     """One model's reasons about the item's root and child-list key values (module notes, 3)."""
     if not checks and not child_specs:
@@ -1738,12 +1964,18 @@ def _key_reasons(
     for idx, (position, name, kind) in enumerate(checks):
         norm = norms.get(name)
         raw_vals = root_raw[idx] if idx < len(root_raw) and root_raw[idx] else (key[position],)
-        if not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in raw_vals):
+        if not scan_agreed and not all(
+            _key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in raw_vals
+        ):
             found.append(GroundingReason._trusted("key_not_found", model_id, key_field=name))
         if quotes and not all(_key_quoted(val, kind, read, quote_num_cache, norm) for val in raw_vals):
             found.append(GroundingReason._trusted("key_not_quoted", model_id, key_field=name))
     for (_, dotted, kind, norm), c_vals in zip(child_specs, child_vals, strict=True):
-        if c_vals and not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in c_vals):
+        if (
+            not scan_agreed
+            and c_vals
+            and not all(_key_found(val, kind, cited, texts, peer_plain, peer_numbers, norm) for val in c_vals)
+        ):
             found.append(GroundingReason._trusted("key_not_found", model_id, key_field=dotted))
     return found
 
@@ -1781,21 +2013,25 @@ def _key_quoted(
 
 
 def _text_key_in_element(wanted: str, element_id: str, texts: _UnitTexts) -> bool:
-    """Whether ``wanted`` matches ``element_id`` by O(1) whole-field set lookup or ``_set_off``."""
+    """Whether ``wanted`` matches ``element_id`` by O(1) whole-field/word set lookup or joined ``_set_off``."""
     if not wanted or not element_id:
         raise ValueError("_text_key_in_element requires non-empty wanted and element_id")
     if wanted in texts.plain_set(element_id):
         return True
-    return any(_set_off(wanted, text) for text in texts.plain(element_id))
+    if wanted.isascii() and wanted.isalnum():
+        return wanted in texts.word_set(element_id)
+    if "\x00" in wanted:
+        return any(_set_off(wanted, text) for text in texts.plain(element_id))
+    return _set_off(wanted, texts.joined_plain(element_id))
 
 
 def _alnum_key_in_element(target: str, element_id: str, texts: _UnitTexts) -> bool:
-    """Whether ``alnum_upper`` ``target`` matches ``element_id`` via whole-cell set or indexed scan."""
+    """Whether ``alnum_upper`` ``target`` matches ``element_id`` via whole-cell set or joined indexed scan."""
     if not target or not element_id:
         raise ValueError("_alnum_key_in_element requires non-empty target and element_id")
     if target in texts.alnum_upper_set(element_id):
         return True
-    return any(_match_alnum_entry(target, entry) for entry in texts.alnum_upper_entries(element_id))
+    return _match_alnum_entry(target, texts.joined_alnum_entry(element_id))
 
 
 def _key_found(

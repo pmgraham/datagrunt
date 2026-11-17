@@ -730,7 +730,7 @@ def test_max_connections_is_exposed_read_only():
     provider = make_provider(max_connections=3)
 
     assert provider.max_connections == 3
-    assert make_provider().max_connections == 8
+    assert make_provider().max_connections == 64
     with pytest.raises(AttributeError):
         provider.max_connections = 4
 
@@ -1970,8 +1970,9 @@ def test_the_google_cloud_identity():
     )
     assert regional.rate_key == regional.model_id
     assert provider.rate_key != rate_key_for(target)
+    assert provider.rate_key == rate_key_for(target, publisher="anthropic", model=GC_MODEL)
     assert provider.model_family == "anthropic" == family_for_publisher("anthropic")
-    assert provider.max_connections == 8
+    assert provider.max_connections == 64
     assert canonical_json(provider.generation_params) == (
         '{"anthropic_version":"vertex-2023-10-16","mechanism":"json_schema","wire":"messages/1"}'
     )
@@ -2363,3 +2364,11 @@ class TestSchemaMode:
         provider.generate(req)
         provider.generate(req)
         assert calls == [False, True]
+
+    def test_anthropic_default_pool_and_concurrency_cap_support_256(self):
+        default_prov = AnthropicProvider("claude-opus-4-7", api_key=KEY)
+        assert default_prov.max_connections == 64
+        assert default_prov._http.keepalive_connections == 64
+        assert default_prov.with_max_concurrency(256).max_concurrency == 256
+        with pytest.raises(RationalizationError, match="max_concurrency"):
+            default_prov.with_max_concurrency(257)

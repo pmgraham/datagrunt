@@ -393,32 +393,45 @@ def classify_spans(
     return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands)
 
 
+_NARROW_BAND_MAX_PT = 36.0
 _MAX_COMPOUND_WORD_PT = 600.0
 _RULE_LIKE_CHARS = frozenset("_-—–=")
 
 
 class _GlyphBand(NamedTuple):
-    """Horizontal page band of glyph stroke boxes sorted by ``x0`` for O(log B) range lookup."""
+    """Horizontal page band of x0-sorted narrow (<= 36 pt) and wide (> 36 pt) boxes for O(log B) lookup."""
 
     boxes: tuple[Box, ...]
     x0s: tuple[float, ...]
     max_w: float
+    wide_boxes: tuple[Box, ...] = ()
+    wide_x0s: tuple[float, ...] = ()
+    wide_max_w: float = 0.0
 
 
-def _glyph_bands(boxes: tuple[Box, ...], height: float) -> tuple[_GlyphBand, ...]:
-    """Index ``boxes`` into horizontal bands sorted by ``x0`` in O(G log G)."""
-    if not boxes:
+def _build_glyph_band(narrow: list[Box], wide: list[Box]) -> _GlyphBand:
+    """Sort narrow and wide band buckets by ``x0`` and precompute each bucket's maximum width."""
+    narrow.sort(key=lambda b: b[0])
+    wide.sort(key=lambda b: b[0])
+    nw = max((b[2] - b[0] for b in narrow), default=0.0)
+    ww = max((b[2] - b[0] for b in wide), default=0.0)
+    return _GlyphBand(tuple(narrow), tuple(b[0] for b in narrow), nw, tuple(wide), tuple(b[0] for b in wide), ww)
+
+
+def _glyph_bands(boxes: tuple[Box, ...], height: float, *, glyph_only: bool = True) -> tuple[_GlyphBand, ...]:
+    """Index ``boxes`` into narrow (<= 36 pt) and wide x0-sorted horizontal bands in O(G log G)."""
+    if not boxes or height <= 0.0:
         return ()
-    buckets: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
+    narrow_b: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
+    wide_b: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
     for box in boxes:
+        vw, vh = box[2] - box[0], box[3] - box[1]
+        if glyph_only and (min(vw, vh) > _NARROW_BAND_MAX_PT or max(vw, vh) > _MAX_COMPOUND_WORD_PT):
+            continue
+        target = narrow_b if vw <= _NARROW_BAND_MAX_PT else wide_b
         for band in _bands_of(box[1], box[3], height):
-            buckets[band].append(box)
-    indexed: list[_GlyphBand] = []
-    for bucket in buckets:
-        bucket.sort(key=lambda b: b[0])
-        max_w = max((b[2] - b[0] for b in bucket), default=0.0)
-        indexed.append(_GlyphBand(tuple(bucket), tuple(b[0] for b in bucket), max_w))
-    return tuple(indexed)
+            target[band].append(box)
+    return tuple(_build_glyph_band(nb, wb) for nb, wb in zip(narrow_b, wide_b, strict=True))
 
 
 def _box_backs_char(ch: str, cw: float, ch_h: float, max_side: float, vw: float, vh: float) -> bool:
@@ -446,29 +459,59 @@ def _x_backs_char(cx0: float, cx1: float, cw: float, vx0: float, vx1: float) -> 
     return min(cx1, vx1) - max(cx0, vx0) >= max(0.30 * cw, 0.5)
 
 
+def _bucket_backs_char(
+    boxes: tuple[Box, ...],
+    x0s: tuple[float, ...],
+    max_w: float,
+    ch: str,
+    cbox: Box,
+    cw: float,
+    ch_h: float,
+    max_side: float,
+    qy0: float,
+    qy1: float,
+    budget: list[int],
+) -> bool:
+    """True when an x0-sorted stroke bucket holds a glyph or compound box backing ``cbox``."""
+    if not boxes:
+        return False
+    cx0, _, cx1, _ = cbox
+    lo = bisect.bisect_left(x0s, cx0 - 0.15 - max_w - 1e-6)
+    hi = bisect.bisect_right(x0s, cx1 + 0.15)
+    for idx in range(lo, hi):
+        budget[0] -= 1
+        if budget[0] < 0:
+            return False
+        vx0, vy0, vx1, vy1 = boxes[idx]
+        if (
+            vy0 <= qy1
+            and qy0 <= vy1
+            and _x_backs_char(cx0, cx1, cw, vx0, vx1)
+            and _box_backs_char(ch, cw, ch_h, max_side, vx1 - vx0, vy1 - vy0)
+        ):
+            return True
+    return False
+
+
 def _char_has_glyph_stroke(ch: str, cbox: Box, bands: tuple[_GlyphBand, ...], height: float, budget: list[int]) -> bool:
     """True when a visible non-white glyph/word stroke box backs ``cbox`` without bleeding into neighbours."""
     cx0, cy0, cx1, cy1 = cbox
     cw, ch_h = max(cx1 - cx0, 0.0), max(cy1 - cy0, 0.0)
     max_side = min(max(2.5 * max(cw, ch_h, 4.0), 18.0), 36.0)
-    qx0, qx1 = cx0 - 0.15, cx1 + 0.15
     qy0, qy1 = cy0 - _VECTOR_TOL_PT, cy1 + _VECTOR_TOL_PT
+    allow_wide = ch not in _RULE_LIKE_CHARS
     for band_idx in _bands_of(qy0, qy1, height):
         gband = bands[band_idx]
-        lo = bisect.bisect_left(gband.x0s, qx0 - gband.max_w - 1e-6)
-        hi = bisect.bisect_right(gband.x0s, qx1)
-        for idx in range(lo, hi):
-            budget[0] -= 1
-            if budget[0] < 0:
-                return False
-            vx0, vy0, vx1, vy1 = gband.boxes[idx]
-            if (
-                vy0 <= qy1
-                and qy0 <= vy1
-                and _x_backs_char(cx0, cx1, cw, vx0, vx1)
-                and _box_backs_char(ch, cw, ch_h, max_side, vx1 - vx0, vy1 - vy0)
-            ):
-                return True
+        if _bucket_backs_char(gband.boxes, gband.x0s, gband.max_w, ch, cbox, cw, ch_h, max_side, qy0, qy1, budget):
+            return True
+        if budget[0] < 0:
+            return False
+        if allow_wide and _bucket_backs_char(
+            gband.wide_boxes, gband.wide_x0s, gband.wide_max_w, ch, cbox, cw, ch_h, max_side, qy0, qy1, budget
+        ):
+            return True
+        if budget[0] < 0:
+            return False
     return False
 
 
@@ -718,7 +761,7 @@ def _bridge_short_drift_gaps(
 ) -> None:
     """Bridge strictly interior <= 2-char kerning/Vernier drift gaps in O(N) when physically stroke-continuous."""
     n = len(on_page)
-    if n < 3 or not text:
+    if n < 3 or not text or all(backed[i] for i in on_page):
         return
     word_upper = "".join(text[i] for i in on_page if text[i].isalnum()).upper()
     if word_upper in _UNSAFE_BRIDGE_WORDS:
@@ -746,6 +789,39 @@ def _bridge_short_drift_gaps(
         pos = end
 
 
+def _scan_word_bound_bucket(
+    boxes: tuple[Box, ...],
+    x0s: tuple[float, ...],
+    max_w: float,
+    wx0: float,
+    wx1: float,
+    qy0: float,
+    qy1: float,
+    reach: float,
+    budget: list[int],
+    best: float | None,
+    *,
+    right_side: bool,
+) -> float | None:
+    """Scan one x0-sorted char-box bucket for the nearest adjacent 3 Tr edge within ``reach``."""
+    if not boxes:
+        return best
+    lo = bisect.bisect_right(x0s, wx1 + 0.05) if right_side else bisect.bisect_left(x0s, wx0 - reach - max_w - 1e-6)
+    hi = bisect.bisect_right(x0s, wx1 + reach) if right_side else bisect.bisect_left(x0s, wx0 - 0.05)
+    for idx in range(lo, hi):
+        budget[0] -= 1
+        if budget[0] < 0:
+            return best
+        bx0, by0, bx1, by1 = boxes[idx]
+        if by0 > qy1 or qy0 > by1:
+            continue
+        if right_side and bx0 > wx1 + 0.05:
+            best = bx0 if best is None else min(best, bx0)
+        if not right_side and bx1 < wx0 - 0.05:
+            best = bx1 if best is None else max(best, bx1)
+    return best
+
+
 def _adjacent_word_bound(
     edge_box: Box, tr3_bands: tuple[_GlyphBand, ...], height: float, budget: list[int], *, right_side: bool
 ) -> float | None:
@@ -761,21 +837,26 @@ def _adjacent_word_bound(
     best: float | None = None
     for band_idx in _bands_of(qy0, qy1, height):
         gband = tr3_bands[band_idx]
-        lo = (
-            bisect.bisect_right(gband.x0s, wx1 + 0.05)
-            if right_side
-            else bisect.bisect_left(gband.x0s, wx0 - reach - gband.max_w - 1e-6)
+        best = _scan_word_bound_bucket(
+            gband.boxes, gband.x0s, gband.max_w, wx0, wx1, qy0, qy1, reach, budget, best, right_side=right_side
         )
-        hi = bisect.bisect_right(gband.x0s, wx1 + reach) if right_side else bisect.bisect_left(gband.x0s, wx0 - 0.05)
-        for idx in range(lo, hi):
-            budget[0] -= 1
-            if budget[0] < 0:
-                return best
-            bx0, by0, bx1, by1 = gband.boxes[idx]
-            if by0 <= qy1 and qy0 <= by1 and right_side and bx0 > wx1 + 0.05:
-                best = bx0 if best is None else min(best, bx0)
-            elif by0 <= qy1 and qy0 <= by1 and not right_side and bx1 < wx0 - 0.05:
-                best = bx1 if best is None else max(best, bx1)
+        if budget[0] < 0:
+            return best
+        best = _scan_word_bound_bucket(
+            gband.wide_boxes,
+            gband.wide_x0s,
+            gband.wide_max_w,
+            wx0,
+            wx1,
+            qy0,
+            qy1,
+            reach,
+            budget,
+            best,
+            right_side=right_side,
+        )
+        if budget[0] < 0:
+            return best
     return best
 
 
@@ -1287,7 +1368,7 @@ def _classify(
         if v_bands
         else ()
     )
-    tr3_bands = _glyph_bands(tr3_boxes, height) if tr3_boxes else ()
+    tr3_bands = _glyph_bands(tr3_boxes, height, glyph_only=False) if tr3_boxes else ()
     return tuple(
         piece for span in spans for piece in _span_pieces(span, width, height, raster, v_bands, budget, tr3_bands)
     )
@@ -1810,27 +1891,19 @@ def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
 def _gate_selection(pieces: tuple[SpanPiece, ...], page: RawPage) -> tuple[bool, ...]:
     """For each piece, whether the gate selects it: visible, painting, and near white or over paint (module notes)."""
     found, height = page.object_boxes, page.geometry.height_pt
-    bands = _banded(found.boxes, height)
+    bands = _glyph_bands(found.boxes, height, glyph_only=False)
     budget = MAX_GATE_CHECKS
     selected: list[bool] = []
     for piece in pieces:  # bounded: the pieces; their box checks, by the budget
         if piece.hidden_reasons or piece.span.render_mode in _NO_PAINT_MODES:
             selected.append(False)
-        elif found.unboxed or _near(_paint_rgb(piece.span), _WHITE_RGB):
+            continue
+        if found.unboxed or _near(_paint_rgb(piece.span), _WHITE_RGB):
             selected.append(True)
-        else:
-            over, budget = _over_paint(piece.bbox, bands, height, budget)
-            selected.append(over)
+            continue
+        over, budget = _over_paint(piece.bbox, bands, height, budget)
+        selected.append(over)
     return tuple(selected)
-
-
-def _banded(boxes: tuple[Box, ...], height: float) -> tuple[tuple[Box, ...], ...]:
-    """``boxes`` by the bands of the page each one meets; a box past an edge is in the edge's band."""
-    bands: list[list[Box]] = [[] for _ in range(_GATE_BANDS)]
-    for box in boxes:  # bounded: the boxes, each in at most _GATE_BANDS bands
-        for band in _bands_of(box[1], box[3], height):
-            bands[band].append(box)
-    return tuple(tuple(band) for band in bands)
 
 
 def _bands_of(top: float, bottom: float, height: float) -> range:
@@ -1840,14 +1913,38 @@ def _bands_of(top: float, bottom: float, height: float) -> range:
     return range(first, last + 1)
 
 
-def _over_paint(box: Box, bands: tuple[tuple[Box, ...], ...], height: float, budget: int) -> tuple[bool, int]:
-    """Whether ``box`` shares area with a box in the bands it meets, and the budget left; past the budget, True."""
+def _bucket_overlaps(
+    boxes: tuple[Box, ...], x0s: tuple[float, ...], max_w: float, box: Box, budget: int
+) -> tuple[bool, int]:
+    """Whether ``box`` shares area with an x0-sorted bucket; fail closed when ``budget`` runs out."""
+    if not boxes:
+        return False, budget
+    budget -= 1
+    if budget < 0:
+        return True, budget
     x0, y0, x1, y1 = box
-    for band in _bands_of(y0, y1, height):
-        for cover in bands[band]:
-            budget -= 1
-            if budget < 0 or (cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3]):
-                return True, budget
+    lo = bisect.bisect_left(x0s, x0 - max_w - 1e-6)
+    hi = bisect.bisect_left(x0s, x1)
+    for idx in range(lo, hi):
+        budget -= 1
+        cover = boxes[idx]
+        if budget < 0 or (cover[0] < x1 and x0 < cover[2] and cover[1] < y1 and y0 < cover[3]):
+            return True, budget
+    return False, budget
+
+
+def _over_paint(box: Box, bands: tuple[_GlyphBand, ...], height: float, budget: int) -> tuple[bool, int]:
+    """Whether ``box`` shares area with a box in the bands it meets, and the budget left; past the budget, True."""
+    if not bands:
+        return False, budget
+    for band in _bands_of(box[1], box[3], height):
+        gband = bands[band]
+        over, budget = _bucket_overlaps(gband.boxes, gband.x0s, gband.max_w, box, budget)
+        if over:
+            return True, budget
+        over, budget = _bucket_overlaps(gband.wide_boxes, gband.wide_x0s, gband.wide_max_w, box, budget)
+        if over:
+            return True, budget
     return False, budget
 
 
@@ -2004,6 +2101,18 @@ def _valid_char(char: str) -> bool:
     return char != _REPLACEMENT_CHAR and unicodedata.category(char) not in _INVALID_CATEGORIES
 
 
+def _is_clean_ascii_span(span: RawSpan) -> bool:
+    """True when ``span`` has no Unicode map errors and only ASCII chars (all valid under A3's rule)."""
+    return not span.map_errors and span.text.isascii()
+
+
+def _span_valid_count(span: RawSpan) -> int:
+    """Count valid chars in ``span``: O(1) on map-error-free ASCII spans, else per-char."""
+    if _is_clean_ascii_span(span):
+        return len(span.text)
+    return sum(1 for offset in range(len(span.text)) if _valid(span, offset))
+
+
 def _quality(page: RawPage, pieces: tuple[SpanPiece, ...], *, _initial: PageAssessment | None = None) -> PageQuality:
     """The page's quality signals; every span char, hidden or not, counts toward the ratio.
 
@@ -2015,7 +2124,7 @@ def _quality(page: RawPage, pieces: tuple[SpanPiece, ...], *, _initial: PageAsse
     else:
         spans = page.text.spans
         count = sum(len(span.text) for span in spans)
-        valid = sum(1 for span in spans for offset in range(len(span.text)) if _valid(span, offset))
+        valid = sum(_span_valid_count(span) for span in spans)
         ratio = valid / count if count else None
     return PageQuality(
         valid_char_ratio=ratio,
@@ -2069,13 +2178,20 @@ def _visible_text(pieces: tuple[SpanPiece, ...]) -> _VisibleText:
         if piece.hidden_reasons:
             continue
         span = piece.span
+        if _is_clean_ascii_span(span):
+            segment = span.text[piece.start : piece.end]
+            length = len(segment)
+            chars, valid = chars + length, valid + length
+            counted += sum(1 for char in segment if not char.isspace())
+            continue
         runs = groupby(range(piece.start, piece.end), key=lambda offset: (span.text[offset], _valid(span, offset)))
         for (char, is_valid), run in runs:
             length = sum(1 for _ in run)
             if is_valid:
                 chars, valid = chars + length, valid + length
                 counted += 0 if char.isspace() else length
-            elif length < _MIN_LEADER_RUN:
+                continue
+            if length < _MIN_LEADER_RUN:
                 chars += length
     return _VisibleText(chars=chars, valid=valid, counted=counted)
 
@@ -2203,7 +2319,12 @@ def _shortfalls(
 
 def _unmapped_regions(pieces: tuple[SpanPiece, ...]) -> tuple[Box, ...]:
     """The box of each invalid-char run in a visible piece, in piece order (hidden text is not OCR'd)."""
-    return tuple(region for piece in pieces if not piece.hidden_reasons for region in _invalid_runs(piece))
+    return tuple(
+        region
+        for piece in pieces
+        if not piece.hidden_reasons and not _is_clean_ascii_span(piece.span)
+        for region in _invalid_runs(piece)
+    )
 
 
 def _invalid_runs(piece: SpanPiece) -> Iterator[Box]:

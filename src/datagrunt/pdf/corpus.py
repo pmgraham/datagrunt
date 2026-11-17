@@ -17,23 +17,34 @@ import sys
 import threading
 import uuid
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
-from typing import IO, Final, NamedTuple, cast
+from typing import IO, Final, NamedTuple, TypeAlias, TypeVar, cast
 
 import datagrunt
 from datagrunt.pdf._bundle_load import (
+    _FORMATS,
     _MAX_ARTIFACT_BYTES,
+    _PAGE_MARKDOWN_DIR,
     BUNDLE_FORMAT_VERSION,
-    _loaded,
+    DOCUMENT_JSON,
+    DOCUMENT_MARKDOWN,
+    ELEMENTS_JSONL,
+    MANIFEST,
+    _bundle_root,
+    _document_paths,
+    _Manifest,
     _opened,
+    _page_markdown,
     _read_fd,
+    _read_manifest,
     _regular,
     _same_output_params,
+    _verified,
     load_bundle,
 )
 from datagrunt.pdf._extra import load as _load_extra
@@ -73,7 +84,15 @@ from datagrunt.pdf._validate import (
     strict_bool,
     typed_tuple,
 )
-from datagrunt.pdf.codec import _array, _object, contained_path, parse_json
+from datagrunt.pdf.codec import (
+    _DOCUMENT_KEYS,
+    _array,
+    _check_format,
+    _metadata,
+    _object,
+    contained_path,
+    parse_json,
+)
 from datagrunt.pdf.elements import DocumentMetadata, PDFDocument
 from datagrunt.pdf.exceptions import BundleCorruptError, DatagruntPDFError
 from datagrunt.pdf.pipeline import PageWorkerPool, PipelineOptions, _pool_size, extract_document
@@ -89,11 +108,17 @@ __all__ = [
     "CorpusManifest",
     "extract_corpus",
     "load_corpus",
+    "load_corpus_documents",
 ]
 
 CORPUS_FORMAT_VERSION: Final[str] = "5.2"
 CORPUS_MANIFEST: Final[str] = "corpus_manifest.json"
 _MAX_CORPUS_WORKERS: Final[int] = 64
+_MAX_LOAD_WORKERS: Final[int] = 16
+_FileStat: TypeAlias = tuple[int, int, int, int, int] | None
+_BundleStamp: TypeAlias = tuple[_FileStat, ...]
+_T = TypeVar("_T")
+_R = TypeVar("_R")
 _MANIFEST_KEYS: Final[tuple[str, ...]] = ("corpus_format_version", "entries", "failures")
 _ENTRY_KEYS: Final[tuple[str, ...]] = (
     "doc_id",
@@ -167,6 +192,8 @@ class CorpusManifest:
     output_dir: Path
     entries: tuple[CorpusEntry, ...]
     failures: tuple[CorpusFailure, ...] = ()
+    _documents: tuple[PDFDocument, ...] | None = field(default=None, kw_only=True, repr=False, compare=False)
+    _stamps: tuple[_BundleStamp, ...] | None = field(default=None, kw_only=True, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.corpus_format_version, str):
@@ -180,6 +207,12 @@ class CorpusManifest:
             raise TypeError(f"output_dir must be a Path, got {type(self.output_dir).__name__}")
         typed_tuple("entries", self.entries, CorpusEntry)
         typed_tuple("failures", self.failures, CorpusFailure)
+        if self._documents is not None:
+            typed_tuple("_documents", self._documents, PDFDocument)
+            if len(self._documents) != len(self.entries):
+                raise ValueError("_documents length must match entries length")
+        if self._stamps is not None and (not isinstance(self._stamps, tuple) or len(self._stamps) != len(self.entries)):
+            raise ValueError("_stamps must be a tuple matching entries length")
 
     @property
     def bundle_paths(self) -> tuple[Path, ...]:
@@ -188,7 +221,13 @@ class CorpusManifest:
 
     def load_documents(self) -> tuple[PDFDocument, ...]:
         """Load and verify every bundle in ``entries`` via :func:`load_bundle`."""
-        return tuple(_verified_entry_document(self.output_dir, entry) for entry in self.entries)
+        cached, stamps = self._documents, self._stamps
+        if cached is not None and (stamps is None or _stamps_valid(self.output_dir, self.entries, cached, stamps)):
+            return cached
+        docs, new_stamps = _load_verified_entries(self.output_dir, self.entries)
+        object.__setattr__(self, "_documents", docs)
+        object.__setattr__(self, "_stamps", new_stamps)
+        return docs
 
 
 def extract_corpus(
@@ -233,45 +272,17 @@ def extract_corpus(
     items = _resolve_inputs(inputs)
     write_bundle_fn = _load_extra("write_bundle")
     target.mkdir(parents=True, exist_ok=True)
-    batch_workers = min(max_workers, len(items))
-    can_spawn_procs = (
-        batch_workers > 1
-        and not options.sandbox
-        and not getattr(sys, "frozen", False)
-        and bool(sys.executable)
-        and extract_document is _default_extract_document
-        and _load_extra is _default_load_extra
-        and getattr(write_bundle_fn, "__module__", "") == "datagrunt.pdf.bundle"
+    outcomes = _execute_corpus_batch(
+        items,
+        target,
+        checked_pwd,
+        options,
+        replace,
+        write_bundle_fn,
+        include_images=checked_include_images,
+        render_pages=checked_render_pgs,
+        batch_workers=min(max_workers, len(items)),
     )
-    if can_spawn_procs:
-        outcomes = _run_spawn_batch(
-            items,
-            target,
-            checked_pwd,
-            options,
-            replace,
-            include_images=checked_include_images,
-            render_pages=checked_render_pgs,
-            workers=batch_workers,
-        )
-    else:
-        use_pool = options.sandbox or _pool_size(options.workers) > 1
-        with PageWorkerPool() if use_pool else nullcontext() as worker_pool:
-            outcomes = _run_batch(
-                items,
-                lambda item: _process_item(
-                    item,
-                    target,
-                    checked_pwd,
-                    options,
-                    replace,
-                    write_bundle_fn,
-                    include_images=checked_include_images,
-                    render_pages=checked_render_pgs,
-                    worker_pool=worker_pool,
-                ),
-                batch_workers,
-            )
     entries = tuple(res for res in outcomes if isinstance(res, CorpusEntry))
     failures = tuple(res for res in outcomes if isinstance(res, CorpusFailure))
     manifest = CorpusManifest(
@@ -284,16 +295,95 @@ def extract_corpus(
     return manifest
 
 
-def load_corpus(path: str | os.PathLike[str]) -> CorpusManifest:
-    """Load and verify the corpus manifest and its bundles at ``path`` (directory or ``corpus_manifest.json``)."""
+def _can_spawn_corpus_procs(
+    batch_workers: int, options: PipelineOptions, write_bundle_fn: Callable[..., object]
+) -> bool:
+    """Whether ``extract_corpus`` can dispatch multi-document extraction across isolated child processes."""
+    return (
+        batch_workers > 1
+        and not options.sandbox
+        and not getattr(sys, "frozen", False)
+        and bool(sys.executable)
+        and extract_document is _default_extract_document
+        and _load_extra is _default_load_extra
+        and getattr(write_bundle_fn, "__module__", "") == "datagrunt.pdf.bundle"
+    )
+
+
+def _execute_corpus_batch(
+    items: tuple[_SourceItem, ...],
+    target: Path,
+    password: str | None,
+    options: PipelineOptions,
+    overwrite: bool,
+    write_bundle_fn: Callable[..., object],
+    *,
+    include_images: bool,
+    render_pages: RenderPagesMode,
+    batch_workers: int,
+) -> list[CorpusEntry | CorpusFailure]:
+    """Execute reusable-bundle partition and remaining extractions via process pool or in-process pool."""
+    if _can_spawn_corpus_procs(batch_workers, options, write_bundle_fn):
+        return _run_spawn_batch(
+            items,
+            target,
+            password,
+            options,
+            overwrite,
+            include_images=include_images,
+            render_pages=render_pages,
+            workers=batch_workers,
+        )
+    _, expected_params = _expected_params_for(options, include_images=include_images, render_pages=render_pages)
+    outcomes, todo_indices = _partition_reusable_items(items, target, overwrite, expected_params)
+    if not todo_indices:
+        return [outcomes[i] for i in range(len(items))]
+    todo_items = tuple(items[i] for i in todo_indices)
+    use_pool = options.sandbox or _pool_size(options.workers) > 1
+    with PageWorkerPool() if use_pool else nullcontext() as worker_pool:
+        todo_outcomes = _run_batch(
+            todo_items,
+            lambda item: _process_item(
+                item,
+                target,
+                password,
+                options,
+                True,
+                write_bundle_fn,
+                include_images=include_images,
+                render_pages=render_pages,
+                worker_pool=worker_pool,
+            ),
+            min(batch_workers, len(todo_items)),
+        )
+    for idx, res in zip(todo_indices, todo_outcomes, strict=True):
+        outcomes[idx] = res
+    return [outcomes[i] for i in range(len(items))]
+
+
+def load_corpus_documents(path: str | os.PathLike[str]) -> tuple[CorpusManifest, tuple[PDFDocument, ...]]:
+    """Load and verify the corpus manifest and all bundle documents at ``path`` in a single bounded-parallel pass."""
     root = _corpus_root(path)
     raw = _read_corpus_manifest_bytes(root)
     try:
-        manifest = _corpus_manifest_of(parse_json(raw, CORPUS_MANIFEST), root)
+        parsed = _corpus_manifest_of(parse_json(raw, CORPUS_MANIFEST), root)
     except (TypeError, ValueError) as exc:
         raise BundleCorruptError(f"{CORPUS_MANIFEST}: {exc}") from exc
-    for entry in manifest.entries:
-        _verified_entry_document(root, entry)
+    docs, stamps = _load_verified_entries(root, parsed.entries)
+    manifest = CorpusManifest(
+        corpus_format_version=parsed.corpus_format_version,
+        output_dir=parsed.output_dir,
+        entries=parsed.entries,
+        failures=parsed.failures,
+        _documents=docs,
+        _stamps=stamps,
+    )
+    return manifest, docs
+
+
+def load_corpus(path: str | os.PathLike[str]) -> CorpusManifest:
+    """Load and verify the corpus manifest and its bundles at ``path`` (directory or ``corpus_manifest.json``)."""
+    manifest, _ = load_corpus_documents(path)
     return manifest
 
 
@@ -310,15 +400,18 @@ def _checked_corpus_dir(output_dir: object) -> Path:
 def _resolve_inputs(inputs: object) -> tuple[_SourceItem, ...]:
     """Resolve and validate ``inputs`` (directory, single file, or sequence of files) before any writes."""
     raw_paths = _discover_paths(inputs)
-    items: list[_SourceItem] = []
+    resolved_paths: list[Path] = []
     seen_paths: set[Path] = set()
-    seen_doc_ids: set[str] = set()
     for path in raw_paths:
         resolved = path.resolve()
         if resolved in seen_paths:
             raise ValueError(f"duplicate input path in inputs: {resolved}")
         seen_paths.add(resolved)
-        sha256, identity = _file_sha256_and_identity(resolved)
+        resolved_paths.append(resolved)
+    hashed = _map_bounded(resolved_paths, _file_sha256_and_identity)
+    items: list[_SourceItem] = []
+    seen_doc_ids: set[str] = set()
+    for resolved, (sha256, identity) in zip(resolved_paths, hashed, strict=True):
         doc_id = DocumentMetadata.make_doc_id(resolved.name, sha256)
         if doc_id in seen_doc_ids:
             raise ValueError(f"duplicate doc_id {doc_id!r} across inputs: {resolved}")
@@ -704,6 +797,29 @@ def _lpt_todo_indices(items: tuple[_SourceItem, ...], todo_indices: list[int], *
     return sorted(todo_indices, key=lambda idx: (-_safe_file_size(items[idx].path), idx))
 
 
+def _partition_reusable_items(
+    items: tuple[_SourceItem, ...],
+    target: Path,
+    overwrite: bool,
+    expected_params: dict[str, object],
+) -> tuple[dict[int, CorpusEntry | CorpusFailure], list[int]]:
+    """Verify reusable bundles in bounded parallel, returning ``(reused_outcomes, todo_indices)``."""
+    if overwrite or not items:
+        return {}, list(range(len(items)))
+    cand = [idx for idx, item in enumerate(items) if (target / item.doc_id).is_dir()]
+    if not cand:
+        return {}, list(range(len(items)))
+    checked = _map_bounded(
+        cand,
+        lambda idx: _reused_entry(target / items[idx].doc_id, items[idx], items[idx].doc_id, expected_params),
+    )
+    outcomes: dict[int, CorpusEntry | CorpusFailure] = {
+        idx: entry for idx, entry in zip(cand, checked, strict=True) if entry is not None
+    }
+    todo = [idx for idx in range(len(items)) if idx not in outcomes]
+    return outcomes, todo
+
+
 def _run_spawn_batch(
     items: tuple[_SourceItem, ...],
     target: Path,
@@ -716,16 +832,8 @@ def _run_spawn_batch(
     workers: int,
 ) -> list[CorpusEntry | CorpusFailure]:
     """Verify reusable bundles first, then extract remaining PDFs across isolated worker processes."""
-    outcomes: dict[int, CorpusEntry | CorpusFailure] = {}
-    todo_indices: list[int] = []
     _, expected_params = _expected_params_for(options, include_images=include_images, render_pages=render_pages)
-    for index, item in enumerate(items):
-        if not overwrite and (target / item.doc_id).is_dir():
-            reused = _reused_entry(target / item.doc_id, item, item.doc_id, expected_params)
-            if reused is not None:
-                outcomes[index] = reused
-                continue
-        todo_indices.append(index)
+    outcomes, todo_indices = _partition_reusable_items(items, target, overwrite, expected_params)
     if not todo_indices:
         return [outcomes[i] for i in range(len(items))]
     if len(todo_indices) == 1:
@@ -735,7 +843,7 @@ def _run_spawn_batch(
             target,
             password,
             options,
-            overwrite,
+            True,
             _default_load_extra("write_bundle"),
             include_images=include_images,
             render_pages=render_pages,
@@ -753,7 +861,7 @@ def _run_spawn_batch(
                 target,
                 password,
                 options,
-                overwrite,
+                True,
                 include_images=include_images,
                 render_pages=render_pages,
             )[1],
@@ -952,37 +1060,59 @@ def _process_item(
     )
 
 
+def _verified_bundle_doc_raw(root: Path, manifest: _Manifest) -> bytes:
+    """Verify every listed artifact in ``manifest`` (size, regular file, symlink, SHA-256); return ``DOCUMENT_JSON``."""
+    doc_raw = b""
+    for entry in manifest.artifacts:
+        if entry.path == DOCUMENT_JSON:
+            doc_raw = _verified(root, entry, keep=True)
+        else:
+            _verified(root, entry, keep=False)
+    return doc_raw
+
+
 def _reused_entry(
     bundle_dir: Path,
     item: _SourceItem,
     bundle_relpath: str,
     expected_params: dict[str, object],
 ) -> CorpusEntry | None:
-    """Return a ``reused=True`` entry if ``bundle_dir`` holds a valid matching bundle.
-
-    Matching means this datagrunt's version and bundle format (an older format, 5.0, records no image-only
-    reasons: #470), the item's source sha256, doc id and name, and the expected extraction parameters.
-    """
+    """Return a ``reused=True`` entry if ``bundle_dir`` holds a valid matching bundle."""
     try:
-        manifest, doc = _loaded(bundle_dir)
+        root = _bundle_root(bundle_dir)
+        manifest = _read_manifest(root)
+        if (
+            manifest.datagrunt_version != datagrunt.__version__
+            or manifest.bundle_format_version != BUNDLE_FORMAT_VERSION
+            or manifest.source_sha256 != item.sha256
+            or not _same_output_params(manifest.extraction_params, expected_params)
+        ):
+            return None
+        doc_raw = _verified_bundle_doc_raw(root, manifest)
+        doc_top = _object("document", parse_json(doc_raw, DOCUMENT_JSON), _DOCUMENT_KEYS)
+        _check_format(doc_top, _FORMATS[manifest.bundle_format_version].codec_version)
+        meta = _metadata("metadata", doc_top["metadata"])
+        raw_pages = _array("pages", doc_top["pages"])
     except (BundleCorruptError, OSError, ValueError, TypeError):
         return None
-    if manifest.datagrunt_version != datagrunt.__version__:
-        return None
-    if manifest.bundle_format_version != BUNDLE_FORMAT_VERSION:
-        return None
-    if manifest.source_sha256 != item.sha256 or not _same_output_params(manifest.extraction_params, expected_params):
-        return None
-    if doc.metadata.doc_id != item.doc_id or doc.metadata.source_name != item.source_name:
+    expected_md = {_page_markdown(p) for p in range(1, meta.page_count + 1)}
+    present_md = {e.path for e in manifest.artifacts if e.path.startswith(_PAGE_MARKDOWN_DIR)}
+    if (
+        meta.doc_id != item.doc_id
+        or meta.source_name != item.source_name
+        or meta.sha256 != manifest.source_sha256
+        or len(raw_pages) != meta.page_count
+        or present_md != expected_md
+    ):
         return None
     return CorpusEntry(
-        doc_id=doc.metadata.doc_id,
-        source_name=doc.metadata.source_name,
-        source_sha256=doc.metadata.sha256,
+        doc_id=meta.doc_id,
+        source_name=meta.source_name,
+        source_sha256=meta.sha256,
         bundle_relpath=bundle_relpath,
-        page_count=doc.metadata.page_count,
-        integrity_verified=doc.integrity_verified,
-        degraded_pages=doc.degraded_pages,
+        page_count=meta.page_count,
+        integrity_verified=manifest.integrity_verified,
+        degraded_pages=manifest.degraded_pages,
         reused=True,
     )
 
@@ -1079,6 +1209,128 @@ def _failure_of(name: str, value: object) -> CorpusFailure:
         error_type=non_blank_str(f"{name}.error_type", data["error_type"]),
         message=non_blank_str(f"{name}.message", data["message"]),
     )
+
+
+def _file_stat(path: Path) -> _FileStat:
+    """Capture lightweight ``os.lstat`` metadata without opening or reading ``path``."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st.st_mode, st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_ino
+
+
+def _bundle_artifact_paths(bundle_dir: Path, doc: PDFDocument) -> tuple[Path, ...]:
+    """Return all manifest, JSON, Markdown, figure, and page-image paths for ``doc`` in ``bundle_dir``."""
+    core = (
+        bundle_dir / MANIFEST,
+        bundle_dir / DOCUMENT_JSON,
+        bundle_dir / ELEMENTS_JSONL,
+        bundle_dir / DOCUMENT_MARKDOWN,
+    )
+    pages = tuple(bundle_dir / _page_markdown(p) for p in range(1, doc.metadata.page_count + 1))
+    return (*core, *pages, *_document_paths(doc))
+
+
+def _capture_bundle_stamp(root: Path, entry: CorpusEntry, doc: PDFDocument) -> _BundleStamp:
+    """Capture lightweight ``lstat`` stamps for every artifact of ``entry``'s bundle."""
+    try:
+        bundle_dir = contained_path("bundle_relpath", entry.bundle_relpath, root)
+    except (TypeError, ValueError):
+        return ()
+    return tuple(_file_stat(p) for p in _bundle_artifact_paths(bundle_dir, doc))
+
+
+def _stamps_valid(
+    root: Path,
+    entries: tuple[CorpusEntry, ...],
+    docs: tuple[PDFDocument, ...],
+    stamps: tuple[_BundleStamp, ...],
+) -> bool:
+    """Return True iff every cached bundle's ``lstat`` stamp still matches ``stamps``."""
+    if len(entries) != len(docs) or len(entries) != len(stamps):
+        return False
+    return all(
+        bool(stamp) and _capture_bundle_stamp(root, entry, doc) == stamp
+        for entry, doc, stamp in zip(entries, docs, stamps, strict=True)
+    )
+
+
+def _load_one_entry(root: Path, entry: CorpusEntry) -> tuple[PDFDocument, _BundleStamp]:
+    """Verify and load ``entry`` under ``root`` and capture its lightweight file stamp."""
+    doc = _verified_entry_document(root, entry)
+    return doc, _capture_bundle_stamp(root, entry, doc)
+
+
+def _submit_map_window(
+    pool: ThreadPoolExecutor,
+    items: Sequence[_T],
+    fn: Callable[[_T], _R],
+    queued: Iterator[int],
+    running: dict[Future[_R], int],
+    workers: int,
+) -> None:
+    """Fill ``running`` up to ``workers`` from ``queued``."""
+    for index in islice(queued, workers - len(running)):
+        running[pool.submit(fn, items[index])] = index
+
+
+def _drain_done_map(
+    done: set[Future[_R]],
+    running: dict[Future[_R], int],
+    loaded: dict[int, _R],
+    errors: dict[int, BaseException],
+) -> None:
+    """Collect completed map futures into ``loaded`` or ``errors`` by input index."""
+    for future in done:
+        idx = running.pop(future)
+        exc = future.exception()
+        if exc is not None:
+            errors[idx] = exc
+        else:
+            loaded[idx] = future.result()
+
+
+def _map_bounded(
+    items: Sequence[_T],
+    fn: Callable[[_T], _R],
+    *,
+    max_workers: int = _MAX_LOAD_WORKERS,
+) -> tuple[_R, ...]:
+    """Apply ``fn`` across ``items`` in bounded parallel, preserving order and lowest-index error precedence."""
+    if not items:
+        return ()
+    if len(items) == 1 or max_workers <= 1:
+        return tuple(fn(item) for item in items)
+    workers = min(max_workers, len(items))
+    loaded: dict[int, _R] = {}
+    errors: dict[int, BaseException] = {}
+    queued = iter(range(len(items)))
+    running: dict[Future[_R], int] = {}
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="datagrunt-corpus-io")
+    try:
+        for _ in range(len(items) + 1):
+            if not errors:
+                _submit_map_window(pool, items, fn, queued, running, workers)
+            if not running:
+                break
+            done, _ = wait(running, return_when=FIRST_COMPLETED)
+            _drain_done_map(done, running, loaded, errors)
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+    if errors:
+        raise errors[min(errors)]
+    return tuple(loaded[i] for i in range(len(items)))
+
+
+def _load_verified_entries(
+    root: Path, entries: tuple[CorpusEntry, ...]
+) -> tuple[tuple[PDFDocument, ...], tuple[_BundleStamp, ...]]:
+    """Verify and load ``entries`` in bounded parallel, preserving order and first-entry error precedence."""
+    if not entries:
+        return (), ()
+    pairs = _map_bounded(entries, lambda entry: _load_one_entry(root, entry))
+    return tuple(doc for doc, _ in pairs), tuple(stamp for _, stamp in pairs)
 
 
 def _verified_entry_document(root: Path, entry: CorpusEntry) -> PDFDocument:

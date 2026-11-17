@@ -10,12 +10,15 @@ model id, since the cache key holds no URL. An API key lives in a ``_Secret``, w
 """
 
 import ast
+import base64
 import copy
 import json
 import pickle
 import subprocess
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
@@ -1771,3 +1774,50 @@ def test_encode_png_b64_and_encode_images_b64_validate_and_reuse_cache():
         base_module.encode_png_b64(b"JFIF")
     with pytest.raises(TypeError, match="tuple"):
         base_module.encode_images_b64([png_a], None)
+
+
+def test_encode_images_b64_thread_safe_lru_encodes_each_png_once_without_thrashing(monkeypatch):
+    real_b64encode = base64.b64encode
+    lock = threading.Lock()
+    encoded_inputs: list[bytes] = []
+
+    def counting_b64encode(data):
+        with lock:
+            encoded_inputs.append(bytes(data))
+        return real_b64encode(data)
+
+    monkeypatch.setattr(base_module.base64, "b64encode", counting_b64encode)
+    pages = [b"\x89PNG\r\n\x1a\nCONCURRENT_LRU_PAGE_" + f"{idx:03d}".encode("ascii") for idx in range(8)]
+    expected = [real_b64encode(p).decode("ascii") for p in pages]
+    barrier = threading.Barrier(16, timeout=5.0)
+
+    def worker(_tid: int) -> None:
+        barrier.wait()
+        for idx, png in enumerate(pages):
+            got, _ = base_module.encode_images_b64((png,), None)
+            assert got == (expected[idx],)
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futs = [pool.submit(worker, i) for i in range(16)]
+        for fut in futs:
+            fut.result(timeout=10.0)
+
+    # All 8 distinct PNGs across 16 concurrent threads (128 calls with cached=None) encoded once each
+    assert len(encoded_inputs) == 8
+    assert set(encoded_inputs) == set(pages)
+
+
+def test_encode_images_b64_lru_is_bounded_by_entry_count(monkeypatch):
+    limit = base_module.IMAGE_B64_CACHE_MAX_ENTRIES
+    assert limit >= 64
+    first_png = b"\x89PNG\r\n\x1a\nLRU_BOUND_FIRST"
+    base_module.encode_images_b64((first_png,), None)
+    for idx in range(limit + 4):
+        other = b"\x89PNG\r\n\x1a\nLRU_BOUND_FILL_" + f"{idx:04d}".encode("ascii")
+        base_module.encode_images_b64((other,), None)
+    calls = []
+    real_b64 = base_module.base64.b64encode
+    monkeypatch.setattr(base_module.base64, "b64encode", lambda data: (calls.append(1), real_b64(data))[1])
+    # Oldest entry was evicted cleanly once capacity was exceeded
+    base_module.encode_images_b64((first_png,), None)
+    assert len(calls) == 1

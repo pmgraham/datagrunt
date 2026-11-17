@@ -8,6 +8,7 @@ import dataclasses
 import gc
 import json
 import math
+import random
 import time
 import warnings
 from datetime import date, datetime, timedelta, timezone
@@ -3496,3 +3497,140 @@ class TestInformationalListAndOptionalConsensus:
         assert found.record == PrefixedInfoTags.model_validate({"doc_key": "DOC-3", "tags": ["alpha", "beta", "gamma"]})
         assert found.record is not None
         assert found.record.tags == ["PFX_alpha", "PFX_beta", "PFX_gamma"]
+
+
+class UnkeyedBomRow(BaseModel):
+    part_desc: str | None = None
+    material: str | None = None
+    uom: str | None = None
+    qty: int | None = None
+    tags: list[str] = []
+
+
+UNKEYED_BOM = prepare(UnkeyedBomRow)
+
+
+def _naive_unkeyed_oracle(
+    feats0: list[consensus_module._UnkeyedFeatures],
+    featsm: list[consensus_module._UnkeyedFeatures],
+) -> dict[int, int]:
+    """Reference O(R^2) inverted-index matcher without exact score==1.0 pre-pass."""
+    postings: dict[tuple[object, ...], list[int]] = {}
+    for posm, recm in enumerate(featsm):
+        for key in recm.keys:
+            postings.setdefault(key, []).append(posm)
+    candidates: list[tuple[float, int, int]] = []
+    for pos0, rec0 in enumerate(feats0):
+        seen_m = {posm for key in rec0.keys for posm in postings.get(key, ())}
+        for posm in seen_m:
+            score = consensus_module._features_similarity(rec0, featsm[posm])
+            if score > 0.5:
+                candidates.append((score, pos0, posm))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+    chosen: dict[int, int] = {}
+    used_m: set[int] = set()
+    for _, pos0, posm in candidates:
+        if pos0 not in chosen and posm not in used_m:
+            chosen[pos0] = posm
+            used_m.add(posm)
+    return chosen
+
+
+class TestUnkeyedExactPrepassParity:
+    def test_exact_prepass_prunes_quadratic_similarity_calls_on_200_row_table(self, monkeypatch):
+        active = list(UNKEYED_BOM.spec.fields)
+        rows0: list[UnkeyedBomRow] = []
+        rowsm: list[UnkeyedBomRow] = []
+        for idx in range(200):
+            desc0 = f"Hex Socket Screw M{(idx % 12) + 4}x{10 + idx}"
+            rows0.append(UnkeyedBomRow(part_desc=desc0, material="Alloy Steel", uom="EA", qty=(idx % 10) + 1))
+            if idx % 25 == 0:
+                descm = f"{desc0} Zinc Plated"
+            elif idx % 5 == 0:
+                descm = f"M{(idx % 12) + 4}x{10 + idx} Screw Socket Hex"  # token reorder -> score == 1.0
+            else:
+                descm = desc0
+            rowsm.append(UnkeyedBomRow(part_desc=descm, material="Alloy Steel", uom="EA", qty=(idx % 10) + 1))
+
+        f0 = [consensus_module._extract_unkeyed_features(r, active) for r in rows0]
+        fm = [consensus_module._extract_unkeyed_features(r, active) for r in rowsm]
+        expected = _naive_unkeyed_oracle(f0, fm)
+
+        sim_calls = 0
+        real_sim = consensus_module._features_similarity
+
+        def counting_sim(left, right):
+            nonlocal sim_calls
+            sim_calls += 1
+            return real_sim(left, right)
+
+        monkeypatch.setattr(consensus_module, "_features_similarity", counting_sim)
+        actual = consensus_module._match_model_unkeyed(f0, fm)
+        assert actual == expected
+        # Only the 8 non-1.0 rows (idx % 25 == 0) remain for fuzzy candidate scoring (8 * 8 = 64 << 40,000)
+        assert sim_calls <= 64
+
+    def test_bit_identical_parity_on_ties_empty_rows_punctuation_and_token_reorders(self):
+        active = list(UNKEYED_BOM.spec.fields)
+        edge_0 = [
+            UnkeyedBomRow(),  # empty #1
+            UnkeyedBomRow(),  # empty #2 (surplus empty -> unmatched or fuzzy)
+            UnkeyedBomRow(part_desc="", material="---", uom="EA", qty=1),
+            UnkeyedBomRow(part_desc=None, material="---", uom="EA", qty=1),
+            UnkeyedBomRow(part_desc="***", material="***", uom="EA", qty=1),
+            UnkeyedBomRow(part_desc="rev a hex bolt", material="Steel", uom="EA", qty=2),
+            UnkeyedBomRow(part_desc="hex bolt rev a", material="Steel", uom="EA", qty=2),
+            UnkeyedBomRow(part_desc="hex bolt rev a", material="Steel", uom="EA", qty=2),
+        ]
+        edge_m = [
+            UnkeyedBomRow(part_desc="BOLT HEX REV-A", material="Steel", uom="EA", qty=2),
+            UnkeyedBomRow(part_desc="hex bolt rev b", material="Steel", uom="EA", qty=2),
+            UnkeyedBomRow(part_desc="hex bolt rev a", material="Steel", uom="EA", qty=2),
+            UnkeyedBomRow(part_desc="", material="***", uom="EA", qty=1),
+            UnkeyedBomRow(part_desc="", material="---", uom="EA", qty=1),
+            UnkeyedBomRow(),  # single empty in m
+        ]
+        f0 = [consensus_module._extract_unkeyed_features(r, active) for r in edge_0]
+        fm = [consensus_module._extract_unkeyed_features(r, active) for r in edge_m]
+        assert consensus_module._match_model_unkeyed(f0, fm) == _naive_unkeyed_oracle(f0, fm)
+
+        # End-to-end build_consensus check on ties + token reorders + empty rows
+        res = blend(
+            {
+                (U1, GOOGLE): answer(*[r.model_dump() for r in edge_0]),
+                (U1, ANTHROPIC): answer(*[r.model_dump() for r in edge_m]),
+            },
+            schema=UNKEYED_BOM,
+        )
+        statuses = [it.status for it in res.items]
+        assert statuses.count("consensus") >= 3
+        assert statuses.count("field_disagreement") >= 1
+
+    def test_randomized_adversarial_parity_against_naive_oracle(self):
+        active = list(UNKEYED_BOM.spec.fields)
+        rng = random.Random(20261117)
+        vocab = ["bolt", "m6", "hex", "---", "***", ""]
+        for _ in range(30):
+            r0 = [
+                UnkeyedBomRow(
+                    part_desc=rng.choice([None, "", "---", "***", " ".join(rng.choices(vocab, k=2))]),
+                    material=rng.choice([None, "Steel", "Brass", "---"]),
+                    uom=rng.choice([None, "EA", "MM"]),
+                    qty=rng.choice([None, 1, 2]),
+                    tags=rng.choice([[], ["a"], ["a", "b"]]),
+                )
+                for _ in range(28)
+            ]
+            rm = [
+                UnkeyedBomRow(
+                    part_desc=rng.choice([None, "", "---", "***", " ".join(rng.choices(vocab, k=2))]),
+                    material=rng.choice([None, "Steel", "Brass", "---"]),
+                    uom=rng.choice([None, "EA", "MM"]),
+                    qty=rng.choice([None, 1, 2]),
+                    tags=rng.choice([[], ["a"], ["a", "b"]]),
+                )
+                for _ in range(28)
+            ]
+            f0 = [consensus_module._extract_unkeyed_features(x, active) for x in r0]
+            fm = [consensus_module._extract_unkeyed_features(x, active) for x in rm]
+            assert consensus_module._match_model_unkeyed(f0, fm) == _naive_unkeyed_oracle(f0, fm)

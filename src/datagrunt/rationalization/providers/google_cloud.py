@@ -146,6 +146,7 @@ nothing from ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
 import re
+import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -510,27 +511,62 @@ class _TokenFailure:
     detail: str
 
 
-def _token_secret(source: TokenSource) -> _Secret | _TokenFailure:
-    """The token ``source()`` returns as a ``_Secret``, or the failure; it never raises for the source's sake."""
+class _CachedBearer:
+    """One validated OAuth token and its ``Bearer <token>`` secret; ``repr`` never reveals either."""
+
+    __slots__ = ("bearer", "token")
+
+    def __init__(self, token: str, bearer: _Secret) -> None:
+        self.token = token
+        self.bearer = bearer
+
+    def __repr__(self) -> str:
+        return "<cached-bearer>"
+
+
+def _validate_and_build_bearer(value: object) -> _CachedBearer | _TokenFailure:
+    """Validate ``value`` as an OAuth token and return its :class:`_CachedBearer` or :class:`_TokenFailure`."""
+    failure = _token_problem(value)
+    if failure:
+        return _TokenFailure(False, f"{_TOKEN_FAILED} ({failure})")
+    token_str = str(value)
+    try:
+        bearer = _Secret(token_str).prefixed("Bearer ")
+    except ValueError:  # unreachable: _token_problem's rule is stricter than _Secret's
+        return _TokenFailure(False, f"{_TOKEN_FAILED} (it returned no valid token)")
+    return _CachedBearer(token_str, bearer)
+
+
+def _fetch_bearer(auth: "GoogleCloudAuth") -> _Secret | _TokenFailure:
+    """Call the token source once, reusing ``auth._cached_bearer`` on exact ``str`` hit without re-running regexes."""
+    source = auth._credential
+    if isinstance(source, _Secret):
+        return source
     value: object = None
     failure = ""
     transient = False
     try:
         value = source()
-    except TransientProviderError:  # the source's own signal of a failure worth a retry; its detail is never kept
+    except TransientProviderError:
         transient = True
-    except Exception as error:  # the caller's code: whatever else it raises fails the request, named by class only
+    except Exception as error:
         failure = type(error).__name__
     if transient:
         return _TokenFailure(True, _TOKEN_TRANSIENT)
-    if not failure:
-        failure = _token_problem(value)
     if failure:
         return _TokenFailure(False, f"{_TOKEN_FAILED} ({failure})")
-    try:
-        return _Secret(str(value))
-    except ValueError:  # unreachable: _token_problem's rule is stricter than _Secret's
-        return _TokenFailure(False, f"{_TOKEN_FAILED} (it returned no valid token)")
+    cached = auth._cached_bearer
+    if type(value) is str and cached is not None and (value is cached.token or value == cached.token):
+        return cached.bearer
+    with auth._cache_lock:
+        cached = auth._cached_bearer
+        if type(value) is str and cached is not None and (value is cached.token or value == cached.token):
+            return cached.bearer
+        built = _validate_and_build_bearer(value)
+        if isinstance(built, _TokenFailure):
+            return built
+        object.__setattr__(auth, "_cached_bearer", built)
+        return built.bearer
 
 
 class GoogleCloudAuth:
@@ -549,9 +585,11 @@ class GoogleCloudAuth:
             leading or trailing whitespace (an exact ``str``), or ``token`` is not callable; never quoting either.
     """
 
-    __slots__ = ("_credential",)
+    __slots__ = ("_cache_lock", "_cached_bearer", "_credential")
 
     _credential: "_Secret | TokenSource"
+    _cached_bearer: _CachedBearer | None
+    _cache_lock: threading.Lock
 
     def __init__(self, *, api_key: "str | _Secret | None" = None, token: TokenSource | None = None) -> None:
         credential, problem = _credential(api_key, token)
@@ -559,6 +597,8 @@ class GoogleCloudAuth:
         if credential is None:
             raise RationalizationError(problem)
         object.__setattr__(self, "_credential", credential)
+        object.__setattr__(self, "_cached_bearer", None)
+        object.__setattr__(self, "_cache_lock", threading.Lock())
 
     @classmethod
     def from_env(cls, var: str = API_KEY_ENV) -> "GoogleCloudAuth":
@@ -592,12 +632,12 @@ class GoogleCloudAuth:
         """
         if isinstance(self._credential, _Secret):
             return {API_KEY_HEADER: self._credential}
-        secret = _token_secret(self._credential)  # no local here holds the source (its repr) or the raw token
-        if isinstance(secret, _TokenFailure):
-            if secret.transient:
-                raise TransientProviderError(None, None, secret.detail)
-            raise PermanentProviderError(None, secret.detail)
-        return {"authorization": secret.prefixed("Bearer ")}
+        bearer = _fetch_bearer(self)  # no local here holds the source (its repr) or the raw token
+        if isinstance(bearer, _TokenFailure):
+            if bearer.transient:
+                raise TransientProviderError(None, None, bearer.detail)
+            raise PermanentProviderError(None, bearer.detail)
+        return {"authorization": bearer}
 
     def __setattr__(self, name: str, value: object) -> NoReturn:
         raise AttributeError("a GoogleCloudAuth is immutable")
@@ -698,15 +738,32 @@ def dedicated_model_id(target: GoogleCloudTarget, endpoint_id: str) -> str:
     return _identity(f"{MODEL_ID_PREFIX}{path}", "model id")
 
 
-def rate_key_for(target: GoogleCloudTarget) -> str:
-    """The host and ``/projects/{project}`` (``/express`` in express mode) (module notes, 3).
+def rate_key_for(
+    target: GoogleCloudTarget,
+    *,
+    publisher: str | None = None,
+    model: str | None = None,
+) -> str:
+    """The rate-limit scope on ``target``: the per-model resource id when ``publisher`` and ``model`` are named,
+    per publisher when ``publisher`` alone is named, else ``{host}/projects/{project}`` (``{host}/express`` in
+    express mode) (module notes, 3).
 
     Raises:
-        RationalizationError: If ``target`` is not a :class:`GoogleCloudTarget`, or the key passes the identity
-            bound.
+        RationalizationError: If ``target`` is not a :class:`GoogleCloudTarget`, ``model`` is given without
+            ``publisher``, a segment or express rule is broken, or the key passes the identity bound.
     """
     checked = _check_target(target)
+    if model is not None and publisher is None:
+        raise RationalizationError("rate_key_for requires publisher when model is given")
+    if publisher is not None and model is not None:
+        path = checked.publisher_model_path(publisher, model)
+        return _identity(f"{MODEL_ID_PREFIX}{path}", "rate key")
     scope = "express" if checked.project is None else f"projects/{checked.project}"
+    if publisher is not None:
+        source = _segment(publisher, "a Google Cloud publisher")
+        if checked.project is None and source != "google":
+            raise RationalizationError("express mode serves only Google's models (publisher google)")
+        return _identity(f"{checked.host}/{scope}/publishers/{source}", "rate key")
     return _identity(f"{checked.host}/{scope}", "rate key")
 
 

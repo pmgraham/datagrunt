@@ -159,9 +159,10 @@ from datagrunt.rationalization.providers.google_cloud import (
     GoogleCloudTarget,
     check_access,
     model_id_for,
+    rate_key_for,
 )
 from datagrunt.rationalization.providers.http import MAX_CONNECTIONS_LIMIT, HeaderValue, HttpClient, HttpReply
-from datagrunt.rationalization.providers.responses import parse_json_object, response
+from datagrunt.rationalization.providers.responses import parsed_response, response
 from datagrunt.rationalization.wire import TOKEN_COUNT_MAX, FinishReason, ModelRequest, ProviderResponse
 
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
@@ -194,6 +195,9 @@ SCHEMA_MAX_NODES = 100_000
 
 SCHEMA_MAX_DEPTH = 64
 """The deepest schema object a transform builds, the root at depth 1."""
+
+DEFAULT_MAX_CONNECTIONS = 64
+MAX_CONCURRENCY_CAP = 256
 
 TRUNCATED_REASONS = frozenset({"MAX_TOKENS", "CONTINUATION"})
 """The finish reasons of an answer the output limit cut."""
@@ -395,8 +399,9 @@ def _gemini_endpoint(model: str) -> _Endpoint:
 def _google_cloud_endpoint(model: str, target: GoogleCloudTarget) -> _Endpoint:
     """``generateContent`` on Google's publisher model at ``target`` (module notes, 1, 6), by the shared builders."""
     url = target.publisher_model_url(GOOGLE_CLOUD_PUBLISHER, model, "generateContent")
-    model_id = model_id_for(target, GOOGLE_CLOUD_PUBLISHER, model)  # the rate key too: quotas are per model
-    return _Endpoint(GOOGLE_CLOUD_KIND, model_id, model_id, url, GOOGLE_CLOUD_API_VERSION, OPENAPI_SCHEMA_FIELD)
+    model_id = model_id_for(target, GOOGLE_CLOUD_PUBLISHER, model)
+    rate_key = rate_key_for(target, publisher=GOOGLE_CLOUD_PUBLISHER, model=model)
+    return _Endpoint(GOOGLE_CLOUD_KIND, model_id, rate_key, url, GOOGLE_CLOUD_API_VERSION, OPENAPI_SCHEMA_FIELD)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -783,9 +788,8 @@ def _parse_reply(reply: HttpReply) -> ProviderResponse:
     finish = _finish(body)
     text = _candidate_text(body)
     inputs, outputs = _usage(body.get("usageMetadata"))
-    content = None if text is None or finish == "refused" else parse_json_object(text)
-    return response(
-        content=content,
+    return parsed_response(
+        json_text=None if text is None or finish == "refused" else text,
         raw_text=reply.text if text is None else text,
         finish=finish,
         input_tokens=inputs,
@@ -837,7 +841,7 @@ class GeminiProvider:
         temperature: float | None = None,
         seed: int | None = 0,
         thinking_level: ThinkingLevel | str | None = None,
-        max_connections: int = 8,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         transport: object = None,
     ) -> None:
         key = _api_key(api_key)
@@ -861,7 +865,7 @@ class GeminiProvider:
         temperature: float | None = None,
         seed: int | None = 0,
         thinking_level: ThinkingLevel | str | None = None,
-        max_connections: int = 8,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         transport: object = None,
     ) -> "GeminiProvider":
         """Gemini on Google Cloud (Agent Platform, formerly Vertex AI) in a named project and location, with an API
@@ -915,7 +919,7 @@ class GeminiProvider:
         temperature: float | None = None,
         seed: int | None = 0,
         thinking_level: ThinkingLevel | str | None = None,
-        max_connections: int = 8,
+        max_connections: int = DEFAULT_MAX_CONNECTIONS,
         transport: object = None,
     ) -> "GeminiProvider":
         """Gemini on Google Cloud in express mode: an API key, no project, the global host (module notes, 1, 6).
@@ -1048,13 +1052,15 @@ class GeminiProvider:
 
     @property
     def max_concurrency(self) -> int | None:
-        """Optional per-provider concurrency cap (1-64), or ``None``."""
+        """Optional per-provider concurrency cap (1-256), or ``None``."""
         return self._max_concurrency
 
     def with_max_concurrency(self, max_concurrency: int | None) -> "GeminiProvider":
-        """Configure a per-provider concurrency cap (1-64, or ``None``) and return ``self``."""
-        if max_concurrency is not None and (type(max_concurrency) is not int or not 1 <= max_concurrency <= 64):
-            raise RationalizationError("max_concurrency must be None or an int in 1-64")
+        """Configure a per-provider concurrency cap (1-256, or ``None``) and return ``self``."""
+        if max_concurrency is not None and (
+            type(max_concurrency) is not int or not 1 <= max_concurrency <= MAX_CONCURRENCY_CAP
+        ):
+            raise RationalizationError(f"max_concurrency must be None or an int in 1-{MAX_CONCURRENCY_CAP}")
         self._max_concurrency = max_concurrency
         return self
 

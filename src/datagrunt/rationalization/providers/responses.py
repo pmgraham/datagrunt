@@ -112,6 +112,8 @@ def safe_text(text: str) -> str:
     """
     if not isinstance(text, str):
         raise TypeError(f"text must be a str, got {type(text).__name__}")
+    if type(text) is str and text.isascii():
+        return text
     return _SURROGATE.sub(_token, text)
 
 
@@ -124,6 +126,8 @@ def bounded_raw_text(text: str) -> str:
     if not isinstance(text, str):
         raise TypeError(f"text must be a str, got {type(text).__name__}")
     escaped = safe_text(text[: RAW_TEXT_MAX_BYTES + 1])  # every character takes a byte or more: the rest is cut
+    if len(escaped) * 4 <= RAW_TEXT_MAX_BYTES:
+        return escaped
     data = escaped.encode("utf-8")
     if len(data) <= RAW_TEXT_MAX_BYTES:
         return escaped
@@ -190,6 +194,10 @@ def _escaped_copy(root: dict[Any, Any]) -> dict[str, object]:
 
 def _copy_members(source: dict[Any, Any], target: dict[str, object], depth: int, stack: list[_Frame]) -> None:
     """Copy an object's members into ``target`` in sorted key order, refusing non-``str`` or colliding keys."""
+    if all(type(key) is str and key.isascii() for key in source):
+        for name in sorted(source):
+            target[name] = _copy_value(source[name], depth, stack)
+        return
     pairs: list[tuple[str, Any]] = []
     for key, item in source.items():
         if type(key) is not str:
@@ -248,9 +256,9 @@ def parse_json_object(text: object) -> dict[str, object] | None:
     Args:
         text: The model's text; anything but a ``str`` is ``None``.
     """
-    if type(text) is not str:
+    if type(text) is not str or len(text) > RAW_TEXT_MAX_BYTES:
         return None
-    if len(text) > RAW_TEXT_MAX_BYTES or len(text.encode("utf-8", "surrogatepass")) > RAW_TEXT_MAX_BYTES:
+    if len(text) * 4 > RAW_TEXT_MAX_BYTES and len(text.encode("utf-8", "surrogatepass")) > RAW_TEXT_MAX_BYTES:
         return None
     try:
         value = strict_loads(text)
@@ -295,6 +303,28 @@ def response(
         raise ValueError(f"finish must be one of {FINISH_REASONS}: the adapter maps the provider's reason to one")
     return _trusted_provider_response(
         content=None if content is None else safe_json(content),
+        raw_text=bounded_raw_text(raw_text) if isinstance(raw_text, str) else "",
+        finish=finish,
+        input_tokens=_token_count(input_tokens),
+        output_tokens=_token_count(output_tokens),
+    )
+
+
+def parsed_response(
+    *,
+    json_text: object,
+    raw_text: object,
+    finish: FinishReason,
+    input_tokens: object,
+    output_tokens: object,
+) -> ProviderResponse:
+    """Parse ``json_text`` once via :func:`parse_json_object` and build a :class:`ProviderResponse` without a
+    redundant second :func:`safe_json` walk."""
+    if type(finish) is not str or finish not in FINISH_REASONS:
+        raise ValueError(f"finish must be one of {FINISH_REASONS}: the adapter maps the provider's reason to one")
+    content = None if json_text is None else parse_json_object(json_text)
+    return _trusted_provider_response(
+        content=content,
         raw_text=bounded_raw_text(raw_text) if isinstance(raw_text, str) else "",
         finish=finish,
         input_tokens=_token_count(input_tokens),

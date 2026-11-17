@@ -16,7 +16,9 @@ import copy
 import pickle
 import re
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 from pathlib import Path
 from types import MappingProxyType
@@ -64,7 +66,7 @@ from datagrunt.rationalization.providers.google_cloud import (
 )
 
 KEY = "AIza-test-KEY-hunter2"
-TOKEN = "ya29.test-TOKEN-hunter2"
+TOKEN = "tok0.test-TOKEN-hunter2"
 SECRET_VALUES = (KEY, TOKEN, "hunter2")
 PROJECT = "my-project"
 MODEL = "gemini-2.5-pro"
@@ -633,18 +635,53 @@ class TestTokenAuth:
         assert headers["authorization"].reveal() == f"Bearer {TOKEN}"
 
     def test_the_token_is_called_once_per_headers_call_never_at_construction(self):
-        source = TokenSource("ya29.first-hunter2", "ya29.second-hunter2")
+        source = TokenSource("tok0.first-hunter2", "tok0.second-hunter2")
         auth = GoogleCloudAuth(token=source)
         assert source.calls == 0
         assert auth.kind == "token"
         repr(auth)
         assert source.calls == 0
-        assert auth.headers()["authorization"].reveal() == "Bearer ya29.first-hunter2"
+        assert auth.headers()["authorization"].reveal() == "Bearer tok0.first-hunter2"
         assert source.calls == 1
-        assert auth.headers()["authorization"].reveal() == "Bearer ya29.second-hunter2"
+        assert auth.headers()["authorization"].reveal() == "Bearer tok0.second-hunter2"
         assert source.calls == 2
 
-    @pytest.mark.parametrize("value", ["a", "ya29." + "x" * (TOKEN_MAX_CHARS - 5), "tok!#$%&'*+-.^_`|~"])
+    def test_token_auth_caches_validated_bearer_secret_across_unchanged_tokens(self, monkeypatch):
+        checks: list[object] = []
+        real_problem = google_cloud_module._token_problem
+
+        def spy_problem(val: object) -> str:
+            checks.append(1)
+            return real_problem(val)
+
+        monkeypatch.setattr(google_cloud_module, "_token_problem", spy_problem)
+        current: dict[str, object] = {"val": "ya29-cached-hunter2"}
+        call_lock = threading.Lock()
+        calls = {"n": 0}
+
+        def source() -> object:
+            with call_lock:
+                calls["n"] += 1
+            return current["val"]
+
+        auth = GoogleCloudAuth(token=source)
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futs = [pool.submit(auth.headers) for _ in range(64)]
+            results = [f.result(timeout=5.0) for f in futs]
+        assert calls["n"] == 64
+        assert all(r["authorization"].reveal() == "Bearer ya29-cached-hunter2" for r in results)
+        assert len(checks) == 1  # validated once across 64 calls while token is unchanged
+
+        current["val"] = "ya29-rotated-hunter2"
+        assert auth.headers()["authorization"].reveal() == "Bearer ya29-rotated-hunter2"
+        assert len(checks) == 2
+
+        current["val"] = TokenText("ya29-rotated-hunter2")
+        with pytest.raises(PermanentProviderError, match="TokenText") as raised:
+            auth.headers()
+        assert_secret_free(raised.value)
+
+    @pytest.mark.parametrize("value", ["a", "tok0." + "x" * (TOKEN_MAX_CHARS - 5), "tok!#$%&'*+-.^_`|~"])
     def test_a_token_of_printable_ascii_without_whitespace_is_sent(self, value):
         assert GoogleCloudAuth(token=lambda: value).headers()["authorization"].reveal() == f"Bearer {value}"
 
@@ -690,7 +727,7 @@ class TestTokenAuth:
             "ya29\thunter2",
             f"{TOKEN}\n",
             f" {TOKEN}",
-            "ya29.tök-hunter2",
+            "tok0.tök-hunter2",
             "ya29\x00hunter2",
             "ya29\x7fhunter2",
             "hunter2" * (TOKEN_MAX_CHARS // 7 + 1),
@@ -1043,6 +1080,25 @@ class TestRateKey:
         keys = [rate_key_for(GoogleCloudTarget(p, loc)) for p, loc in product(projects, locations)]
         keys.append(rate_key_for(GoogleCloudTarget.express()))
         assert len(keys) == len(set(keys))
+
+    def test_rate_key_for_isolates_publisher_and_model_on_same_project(self):
+        made = target("us-central1", PROJECT)
+        gemini_key = rate_key_for(made, publisher="google", model="gemini-2.5-pro")
+        claude_key = rate_key_for(made, publisher="anthropic", model="claude-opus-4-7")
+        llama_key = rate_key_for(made, publisher="meta", model=LLAMA)
+        assert gemini_key == model_id_for(made, "google", "gemini-2.5-pro")
+        assert claude_key == model_id_for(made, "anthropic", "claude-opus-4-7")
+        assert llama_key == model_id_for(made, "meta", LLAMA)
+        assert len({rate_key_for(made), gemini_key, claude_key, llama_key}) == 4
+        assert rate_key_for(made, publisher="google") != rate_key_for(made, publisher="anthropic")
+        assert (
+            rate_key_for(GoogleCloudTarget.express(), publisher="google", model="gemini-2.5-flash")
+            == "google-cloud:publishers/google/models/gemini-2.5-flash"
+        )
+        with pytest.raises(RationalizationError, match="publisher"):
+            rate_key_for(made, model="gemini-2.5-pro")
+        with pytest.raises(RationalizationError, match="express"):
+            rate_key_for(GoogleCloudTarget.express(), publisher="anthropic")
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -154,10 +154,15 @@ EventKind: TypeAlias = Literal["cache_hit", "cache_corrupt", "request", "retry",
 
 EVENT_KINDS: tuple[EventKind, ...] = get_args(EventKind)
 
+EventDelivery: TypeAlias = Literal["ordered", "live"]
+"""How worker :class:`TelemetryEvent` items reach ``on_event``: in miss order, or immediately as each arrives."""
+
+EVENT_DELIVERIES: tuple[EventDelivery, ...] = get_args(EventDelivery)
+
 MAX_RETRIES_LIMIT = 10
 """The most retries a request may take (plan §5): at most 11 attempts."""
 
-CONCURRENCY_LIMIT = 64
+CONCURRENCY_LIMIT = 256
 """The most worker threads (``max_concurrency``) and the most requests in flight per rate key."""
 
 RPM_LIMIT_MAX = 100_000
@@ -497,6 +502,7 @@ class RunLimits:
     max_output_tokens: int = 8_192
     max_requests: int = 1_000
     strict: bool = False
+    event_delivery: EventDelivery = "ordered"
 
     def __post_init__(self) -> None:
         _check_int("max_concurrency", self.max_concurrency, 1, CONCURRENCY_LIMIT)
@@ -509,6 +515,10 @@ class RunLimits:
         _check_int("max_requests", self.max_requests, 1, REQUESTS_LIMIT)
         if not isinstance(self.strict, bool):
             raise TypeError(f"strict must be a bool, got {type(self.strict).__name__}")
+        if not isinstance(self.event_delivery, str):
+            raise TypeError(f"event_delivery must be a str, got {type(self.event_delivery).__name__}")
+        if self.event_delivery not in EVENT_DELIVERIES:
+            raise ValueError(f"event_delivery must be one of {EVENT_DELIVERIES}")
 
     def unit_deadline_s(self, slots: int) -> float:
         """The wall time one request may take on a rate key of ``slots`` slots (module notes, 3).
@@ -733,6 +743,10 @@ class _Request:
     unit: Unit
     envelope: Envelope
     provider: ProviderSnapshot
+    max_output_tokens: int | None = None
+    schema_name: str | None = None
+    schema_version: str | None = None
+    schema_sha256: str | None = None
 
 
 def _refuse(owner: str, message: str) -> NoReturn:
@@ -858,20 +872,81 @@ class _PreflightPlan:
     file_lookups: Mapping[str, CacheLookup]
 
 
+@dataclass(frozen=True, slots=True)
+class PassRunSpec:
+    """One extraction pass in a shared-pool multi-pass run (:func:`run_multi_requests`)."""
+
+    pass_name: str
+    work: Sequence[tuple[Unit, Envelope]]
+    providers: Sequence[ProviderSnapshot]
+    schema: PreparedSchema
+    schema_version: str
+    max_output_tokens: int | None = None
+    preflight: _PreflightPlan | None = None
+
+    def __post_init__(self) -> None:
+        _check_id("pass_name", self.pass_name)
+        pairs = _check_work(self.work)
+        if not isinstance(self.schema, PreparedSchema):
+            raise TypeError(f"schema must be a PreparedSchema, got {type(self.schema).__name__}")
+        _check_id("schema_version", self.schema_version)
+        for unit, envelope in pairs:
+            if envelope.schema_json != self.schema.wrapper_json:
+                raise ValueError(f"the envelope of unit {unit.unit_id} carries another schema than the pass's")
+        snapshots = _check_snapshots(self.providers, self.schema)
+        if self.max_output_tokens is not None:
+            _check_int("max_output_tokens", self.max_output_tokens, 1, MAX_OUTPUT_TOKENS)
+        if self.preflight is not None and not isinstance(self.preflight, _PreflightPlan):
+            raise TypeError(f"preflight must be a _PreflightPlan or None, got {type(self.preflight).__name__}")
+        object.__setattr__(self, "work", pairs)
+        object.__setattr__(self, "providers", snapshots)
+
+
+def _stamp_request(req: _Request, max_output_tokens: int, schema: PreparedSchema, schema_version: str) -> _Request:
+    """Populate per-pass token limit and schema metadata on ``req`` when left unset."""
+    s_name = schema.model.__name__
+    if (
+        req.max_output_tokens == max_output_tokens
+        and req.schema_name == s_name
+        and req.schema_version == schema_version
+        and req.schema_sha256 == schema.sha256
+    ):
+        return req
+    return _Request(
+        key=req.key,
+        unit=req.unit,
+        envelope=req.envelope,
+        provider=req.provider,
+        max_output_tokens=max_output_tokens if req.max_output_tokens is None else req.max_output_tokens,
+        schema_name=s_name if req.schema_name is None else req.schema_name,
+        schema_version=schema_version if req.schema_version is None else req.schema_version,
+        schema_sha256=schema.sha256 if req.schema_sha256 is None else req.schema_sha256,
+    )
+
+
 def _plan(
-    work: Sequence[tuple[Unit, Envelope]], providers: Sequence[ProviderSnapshot], limits: RunLimits, schema_version: str
+    work: Sequence[tuple[Unit, Envelope]],
+    providers: Sequence[ProviderSnapshot],
+    limits: RunLimits,
+    schema_version: str,
+    *,
+    max_output_tokens: int | None = None,
+    schema: PreparedSchema | None = None,
 ) -> tuple[dict[tuple[str, str], str], list[_Request]]:
     """Each (unit, model) slot's key, in unit then provider order, and the distinct requests in first-seen order.
 
     The key's ``generation_params`` are the provider's with the request's ``max_output_tokens``.
     """
+    eff_tokens = limits.max_output_tokens if max_output_tokens is None else max_output_tokens
+    s_name = None if schema is None else schema.model.__name__
+    s_sha = None if schema is None else schema.sha256
     slots: dict[tuple[str, str], str] = {}
     requests: dict[str, _Request] = {}
     suffixes = {
         provider.model_id: _provider_key_suffix(
             provider_kind=provider.provider_kind,
             model_id=provider.model_id,
-            generation_params={**provider.generation_params, "max_output_tokens": limits.max_output_tokens},
+            generation_params={**provider.generation_params, "max_output_tokens": eff_tokens},
             provider_schema_json=provider.provider_schema_json,
             schema_version=schema_version,
         )
@@ -884,7 +959,19 @@ def _plan(
             slot = (unit.unit_id, provider.model_id)
             if slots.setdefault(slot, key) != key:
                 raise ValueError(f"unit {unit.unit_id} appears twice with different envelopes")
-            requests.setdefault(key, _Request(key, unit, envelope, provider))
+            requests.setdefault(
+                key,
+                _Request(
+                    key,
+                    unit,
+                    envelope,
+                    provider,
+                    max_output_tokens=eff_tokens,
+                    schema_name=s_name,
+                    schema_version=schema_version,
+                    schema_sha256=s_sha,
+                ),
+            )
     return slots, list(requests.values())
 
 
@@ -1084,7 +1171,9 @@ class _Run:
         self.semaphores = {key: threading.BoundedSemaphore(size) for key, size in slots.items()}
         self.deadlines = {key: limits.unit_deadline_s(size) for key, size in slots.items()}
         self.events: queue.SimpleQueue[tuple[int, TelemetryEvent]] = queue.SimpleQueue()
-        self._schemas = {provider.model_id: provider.provider_schema for provider in providers}  # parsed once
+        self._schemas = {
+            (provider.model_id, provider.schema_sha256): provider.provider_schema for provider in providers
+        }
         self._attempt_ends: dict[int, float] = {}
         self._attempt_lock = threading.Lock()
         rpm = limits.rpm_limit
@@ -1217,9 +1306,9 @@ class _Run:
             model_id=request.provider.model_id,
             unit_id=request.unit.unit_id,
             doc_id=request.unit.doc_id,
-            schema_name=stores.schema_name,
-            schema_version=stores.schema_version,
-            schema_sha256=stores.schema_sha256,
+            schema_name=stores.schema_name if request.schema_name is None else request.schema_name,
+            schema_version=stores.schema_version if request.schema_version is None else request.schema_version,
+            schema_sha256=stores.schema_sha256 if request.schema_sha256 is None else request.schema_sha256,
             prompt_sha256=prompt_hash,
             latency_ms=latency_ms,
             created_at=datetime.now(timezone.utc).isoformat(),
@@ -1260,13 +1349,14 @@ class _Run:
     def _send(self, job: _Job, tally: _Tally, timeout_s: float) -> ProviderResponse:
         request = job.request
         system, user = self._render(request)
+        max_tokens = self.limits.max_output_tokens if request.max_output_tokens is None else request.max_output_tokens
         model_request = _trusted_model_request(
             unit_id=request.unit.unit_id,
             model_id=request.provider.model_id,
             system_prompt=system,
             user_envelope=user,
-            json_schema=self._schemas[request.provider.model_id],
-            max_output_tokens=self.limits.max_output_tokens,
+            json_schema=self._schemas[(request.provider.model_id, request.provider.schema_sha256)],
+            max_output_tokens=max_tokens,
             timeout_s=timeout_s,
             images=request.envelope.images,
         )
@@ -1393,6 +1483,33 @@ class _EventOrder:
             self._next += 1
 
 
+class _LiveEventOrder:
+    """Delivers the workers' events on the caller's thread immediately in arrival order, without holding fast
+    requests back behind an unfinished earlier request."""
+
+    def __init__(
+        self,
+        events: "queue.SimpleQueue[tuple[int, TelemetryEvent]]",
+        deliver: Callable[[TelemetryEvent], None],
+    ) -> None:
+        self._events = events
+        self._deliver = deliver
+
+    def flush(self, finished: Mapping[int, _Result]) -> None:
+        """Drain the queue and deliver every queued event immediately on the caller's thread."""
+        del finished
+        self.drain()
+
+    def drain(self) -> None:
+        """Drain the queue and deliver every remaining queued event in arrival order."""
+        while True:
+            try:
+                _, event = self._events.get_nowait()
+            except queue.Empty:
+                return
+            self._deliver(event)
+
+
 class _Overrun(Exception):
     """A request passed its own bound, or the caller's loop its: a call outlived every deadline."""
 
@@ -1427,7 +1544,7 @@ def _drive(
     run: _Run,
     pool: ThreadPoolExecutor,
     misses: Sequence[_Request],
-    order: _EventOrder,
+    order: _EventOrder | _LiveEventOrder,
     flights: dict["Future[_Result]", _Flight],
 ) -> dict[int, _Result]:
     """Submit the misses into free slots, collect their results and deliver their events until every one is done.
@@ -1521,7 +1638,7 @@ def _stop(
     run: _Run,
     pool: ThreadPoolExecutor,
     flights: Mapping["Future[_Result]", _Flight],
-    order: _EventOrder,
+    order: _EventOrder | _LiveEventOrder,
     failure: BaseException,
 ) -> BaseException:
     """Stop a failing run (module notes, 6) and return what to raise.
@@ -1561,7 +1678,11 @@ def _execute(run: _Run, misses: Sequence[_Request], deliver: Callable[[Telemetry
     if not misses:
         return {}
     pool = ThreadPoolExecutor(max_workers=min(run.limits.max_concurrency, len(misses)), thread_name_prefix=_THREADS)
-    order = _EventOrder(run.events, len(misses), deliver)
+    order: _EventOrder | _LiveEventOrder = (
+        _LiveEventOrder(run.events, deliver)
+        if run.limits.event_delivery == "live"
+        else _EventOrder(run.events, len(misses), deliver)
+    )
     flights: dict[Future[_Result], _Flight] = {}
     try:
         results = _drive(run, pool, misses, order, flights)
@@ -1732,3 +1853,173 @@ def run_requests(
     stores = _Stores(memory_cache, file_cache, schema.model.__name__, schema_version, schema.sha256, prompt_hashes)
     results = _execute(_Run(checked, snapshots, hooks, stores), probe.misses, deliver)
     return _assemble(slots, probe, results, snapshots)
+
+
+@dataclass(frozen=True, slots=True)
+class _PassProbe:
+    """One pass's preflight state inside :func:`run_multi_requests`."""
+
+    spec: PassRunSpec
+    slots: Mapping[tuple[str, str], str]
+    hits: Mapping[str, ProviderResponse]
+    owned_misses: tuple[tuple[int, _Request], ...]
+    shared_miss_positions: Mapping[str, int]
+    corrupt: int
+
+
+def _check_passes(passes: object) -> tuple[PassRunSpec, ...]:
+    """Require a non-empty sequence of :class:`PassRunSpec` with distinct ``pass_name`` values."""
+    if isinstance(passes, (str, bytes, bytearray)) or not isinstance(passes, Sequence):
+        raise TypeError(f"passes must be a Sequence of PassRunSpec, got {type(passes).__name__}")
+    items = tuple(passes)
+    if not items:
+        raise ValueError("passes must not be empty")
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, PassRunSpec):
+            raise TypeError(f"each pass must be a PassRunSpec, got {type(item).__name__}")
+        if item.pass_name in seen:
+            raise ValueError(f"duplicate pass_name {item.pass_name!r}: each pass needs its own")
+        seen.add(item.pass_name)
+    return items
+
+
+def _plan_pass_requests(
+    spec: PassRunSpec, limits: RunLimits
+) -> tuple[Mapping[tuple[str, str], str], tuple[_Request, ...], Mapping[str, CacheLookup] | None]:
+    """Resolve ``(slots, stamped_requests, file_lookups)`` for one :class:`PassRunSpec`."""
+    eff_tokens = limits.max_output_tokens if spec.max_output_tokens is None else spec.max_output_tokens
+    if spec.preflight is None:
+        slots, reqs = _plan(
+            spec.work, spec.providers, limits, spec.schema_version, max_output_tokens=eff_tokens, schema=spec.schema
+        )
+        return slots, tuple(reqs), None
+    stamped = tuple(_stamp_request(r, eff_tokens, spec.schema, spec.schema_version) for r in spec.preflight.requests)
+    return spec.preflight.slots, stamped, spec.preflight.file_lookups
+
+
+def _probe_one_pass(
+    spec: PassRunSpec,
+    limits: RunLimits,
+    memory: MemoryCache,
+    file_cache: FileCache | None,
+    deliver: Callable[[TelemetryEvent], None],
+    seen_hits: dict[str, ProviderResponse],
+    miss_pos: dict[str, int],
+    global_misses: list[_Request],
+) -> _PassProbe:
+    """Probe caches for ``spec``, deduplicating identical keys across passes into ``global_misses``."""
+    slots, requests, file_lookups = _plan_pass_requests(spec, limits)
+    hits: dict[str, ProviderResponse] = {}
+    owned: list[tuple[int, _Request]] = []
+    shared: dict[str, int] = {}
+    corrupt = 0
+    for req in requests:
+        if req.key in seen_hits:
+            hits[req.key] = seen_hits[req.key]
+            continue
+        if req.key in miss_pos:
+            shared[req.key] = miss_pos[req.key]
+            continue
+        lookup, store = _lookup(req.key, memory, file_cache, file_lookups)
+        if lookup.response is not None:
+            seen_hits[req.key] = lookup.response
+            hits[req.key] = lookup.response
+            deliver(_event(req, "cache_hit", 0, None, None, store))
+            continue
+        if lookup.corrupt:
+            corrupt += 1
+            deliver(_event(req, "cache_corrupt", 0, None, None, str(lookup.reason)))
+        miss_pos[req.key] = len(global_misses)
+        owned.append((len(global_misses), req))
+        global_misses.append(req)
+    return _PassProbe(spec, slots, hits, tuple(owned), shared, corrupt)
+
+
+def _open_unique_providers(passes: Sequence[PassRunSpec], misses: Sequence[_Request]) -> None:
+    """Call ``open()`` at most once per unique underlying provider object with at least one miss."""
+    used = {id(req.provider.provider) for req in misses}
+    opened: set[int] = set()
+    snapshots = [snap for spec in passes for snap in spec.providers]
+    for snap in snapshots:
+        pid = id(snap.provider)
+        if snap.open is not None and pid in used and pid not in opened:
+            opened.add(pid)
+            snap.open()
+
+
+def _assemble_pass(probe: _PassProbe, results: Mapping[int, _Result]) -> RunOutcome:
+    """Assemble the isolated deterministic :class:`RunOutcome` for one pass."""
+    keyed: dict[str, ProviderResponse | FailedUnit] = dict(probe.hits)
+    hit_count = len(probe.hits)
+    for pos, req in probe.owned_misses:
+        res = results[pos]
+        found = res.response if res.response is not None else res.failed
+        if found is None:
+            raise RuntimeError(f"request for unit {req.unit.unit_id} ended with neither a response nor a failure")
+        keyed[req.key] = found
+    for key, pos in probe.shared_miss_positions.items():
+        res = results[pos]
+        found = res.response if res.response is not None else res.failed
+        if found is None:
+            raise RuntimeError(f"shared request {key} ended with neither a response nor a failure")
+        keyed[key] = found
+        if res.response is not None:
+            hit_count += 1
+    owned_reqs = tuple(req for _, req in probe.owned_misses)
+    local_res = {idx: results[pos] for idx, (pos, _) in enumerate(probe.owned_misses)}
+    providers = probe.spec.providers
+    return RunOutcome(
+        responses={s: f for s, k in probe.slots.items() if isinstance(f := keyed[k], ProviderResponse)},
+        failed_units=tuple(f for k in probe.slots.values() if isinstance(f := keyed[k], FailedUnit)),
+        cache_hits=hit_count,
+        cache_misses=len(probe.owned_misses),
+        cache_corrupt=probe.corrupt,
+        cache_write_failures=sum(r.write_failures for r in local_res.values()),
+        usage=_usage(providers, owned_reqs, local_res),
+        models=tuple((p.model_id, p.model_family, p.provider_kind) for p in providers),
+    )
+
+
+def run_multi_requests(
+    passes: Sequence[PassRunSpec],
+    *,
+    memory_cache: MemoryCache,
+    file_cache: FileCache | None = None,
+    limits: RunLimits | None = None,
+    on_event: EventHook | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], object] | None = None,
+    rng: JitterSource | None = None,
+    nonce: Callable[[], str] = new_nonce,
+) -> dict[str, RunOutcome]:
+    """Execute multiple extraction passes over a single shared thread pool, rate-key slot map, and cache."""
+    checked_passes = _check_passes(passes)
+    if not isinstance(memory_cache, MemoryCache):
+        raise TypeError(f"memory_cache must be a MemoryCache, got {type(memory_cache).__name__}")
+    if file_cache is not None and not isinstance(file_cache, FileCache):
+        raise TypeError(f"file_cache must be a FileCache or None, got {type(file_cache).__name__}")
+    checked = _check_limits(limits)
+    hooks = _check_hooks(on_event, clock, sleep, rng, nonce)
+    deliver = _deliverer(hooks.on_event)
+    seen_hits: dict[str, ProviderResponse] = {}
+    miss_pos: dict[str, int] = {}
+    global_misses: list[_Request] = []
+    probes = [
+        _probe_one_pass(spec, checked, memory_cache, file_cache, deliver, seen_hits, miss_pos, global_misses)
+        for spec in checked_passes
+    ]
+    if len(global_misses) > checked.max_requests:
+        raise RationalizationError(
+            f"this run needs {len(global_misses)} requests (distinct cache misses), past max_requests "
+            f"{checked.max_requests}: raise max_requests, or send fewer units or models"
+        )
+    _open_unique_providers(checked_passes, global_misses)
+    all_snapshots = [snap for spec in checked_passes for snap in spec.providers]
+    prompt_hashes = {env.prompt: sha256_hex(env.prompt) for spec in checked_passes for _, env in spec.work}
+    first = checked_passes[0]
+    stores = _Stores(
+        memory_cache, file_cache, first.schema.model.__name__, first.schema_version, first.schema.sha256, prompt_hashes
+    )
+    results = _execute(_Run(checked, all_snapshots, hooks, stores), global_misses, deliver)
+    return {probe.spec.pass_name: _assemble_pass(probe, results) for probe in probes}
