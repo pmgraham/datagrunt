@@ -13,7 +13,8 @@ import polars as pl
 import pyarrow as pa
 import pytest
 from pdf_tests.documents import BOX
-from pydantic import AwareDatetime, BaseModel, NaiveDatetime
+from pydantic import AwareDatetime, BaseModel, ConfigDict, NaiveDatetime, field_serializer
+from pydantic import Field as PydanticField
 
 from datagrunt.rationalization import Key, RationalizationError
 from datagrunt.rationalization.consensus import QuarantinedItem
@@ -1171,3 +1172,485 @@ def test_to_jsonl_validation_and_atomic_replace_cleanup(tmp_path: Path, monkeypa
         result.to_jsonl(existing)
     assert existing.read_text(encoding="utf-8") == "KEEP_ME\n"
     assert [p.name for p in tmp_path.iterdir()] == ["existing.jsonl"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Per-model audit exports: nested _model_outputs on union/provenance rows + flat by_model=True views
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class StrictAliasPart(BaseModel):
+    model_config = ConfigDict(populate_by_name=False)
+
+    part_id: Annotated[str, Key] = PydanticField(alias="partId")
+    unit_cost: Decimal = PydanticField(alias="unitCost")
+    checked_at: AwareDatetime = PydanticField(alias="checkedAt")
+
+
+def _build_per_model_audit_fixture() -> RationalizedResult[Company]:
+    src_p1 = ElementSource(
+        doc_id="doc_1",
+        unit_id="doc_1:u1",
+        element_id="p0001_e001",
+        page_number=1,
+        bbox=BOX,
+        scope_path=("BOM",),
+    )
+    src_p2 = ElementSource(
+        doc_id="doc_2",
+        unit_id="doc_2:u1",
+        element_id="p0002_e004",
+        page_number=2,
+        bbox=BOX,
+        scope_path=("Schematics",),
+    )
+
+    c_consensus = Company(
+        company_id="AW504ET-089-A4C",
+        company_name="Tecumseh Compressor",
+        aliases=["AW504ET-089-A4C", "AW504ET - 089 - A4C"],
+        departments=[
+            Department(
+                dept_id="D-1",
+                dept_name="Assembly",
+                employees=[Employee(emp_id="E-1", name="Ada")],
+            )
+        ],
+    )
+    g_vote_consensus = {
+        "company_id": "AW504ET - 089 - A4C",
+        "company_name": "Tecumseh",
+        "hq": None,
+        "aliases": ["AW504ET - 089 - A4C"],
+        "departments": [
+            {
+                "dept_id": "D-1",
+                "dept_name": "Assembly",
+                "codes": [],
+                "employees": [{"emp_id": "E-1", "name": "Ada", "skills": ["cad"]}],
+            }
+        ],
+        "line_items": [],
+    }
+    a_vote_consensus = {
+        "company_id": "AW504ET-089-A4C",
+        "company_name": "Tecumseh Compressor",
+        "hq": {"label": "Plant-2", "weight": 4.5},
+        "aliases": ["AW504ET-089-A4C"],
+        "departments": [
+            {
+                "dept_id": "D-1",
+                "dept_name": "Assembly",
+                "codes": [],
+                "employees": [{"emp_id": "E-1", "name": "Ada", "skills": ["cam"]}],
+            }
+        ],
+        "line_items": [],
+    }
+    it_consensus = GroundedRecord(
+        doc_id="doc_1",
+        unit_ids=("doc_1:u1",),
+        status="consensus",
+        key=("AW504ET089A4C",),
+        record=c_consensus,
+        disputed_fields=(),
+        notes=(),
+        grounding_reasons=(),
+        sources=(src_p1,),
+        grounding_quotes=("AW504ET - 089 - A4C", "AW504ET-089-A4C"),
+        model_votes={G: (g_vote_consensus,), A: (a_vote_consensus,)},
+        quotes_by_model={G: ("AW504ET - 089 - A4C",), A: ("AW504ET-089-A4C",)},
+        element_ids_by_model={G: ("p0001_e001",), A: ("p0001_e001",)},
+        families={G: "google", A: "anthropic"},
+        source_name="compressor_bom.pdf",
+    )
+
+    c_single_catch = Company(company_id="SMBJ18A", company_name="TVS Diode")
+    g_vote_smbj = c_single_catch.model_dump(mode="json")
+    it_single_catch = GroundedRecord(
+        doc_id="doc_2",
+        unit_ids=("doc_2:u1",),
+        status="missing_in_some_models",
+        key=("SMBJ18A",),
+        record=c_single_catch,
+        disputed_fields=(),
+        notes=(),
+        grounding_reasons=(),
+        sources=(src_p2,),
+        grounding_quotes=("ZD601: SMBJ18A",),
+        model_votes={G: (g_vote_smbj,), A: ()},
+        quotes_by_model={G: ("ZD601: SMBJ18A",), A: ()},
+        element_ids_by_model={G: ("p0002_e004",), A: ()},
+        families={G: "google", A: "anthropic"},
+        source_name="pcb_schematic.pdf",
+    )
+
+    # Disputed tie with record=None + per-model grounding failure on A only
+    it_tie_conflict = GroundedRecord(
+        doc_id="doc_2",
+        unit_ids=("doc_2:u1",),
+        status="field_disagreement",
+        key=("TIE-9",),
+        record=None,
+        disputed_fields=("company_name",),
+        notes=(),
+        grounding_reasons=(GroundingReason(reason="no_quotes", model_id=A),),
+        sources=(src_p2,),
+        grounding_quotes=("TIE-9 Alpha",),
+        model_votes={
+            G: ({"company_id": "TIE-9", "company_name": "Alpha"},),
+            A: ({"company_id": "TIE-9", "company_name": "Beta"},),
+        },
+        quotes_by_model={G: ("TIE-9 Alpha",), A: ()},
+        element_ids_by_model={G: ("p0002_e004",), A: ("p0002_e004",)},
+        families={G: "google", A: "anthropic"},
+        source_name="pcb_schematic.pdf",
+    )
+
+    return RationalizedResult(
+        items=(it_consensus, it_single_catch, it_tie_conflict),
+        records=(c_consensus,),
+        needs_review=(it_single_catch, it_tie_conflict),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=COMPANY_SCHEMA,
+    )
+
+
+def test_grounded_union_exports_surface_nested_model_outputs_by_default_and_support_opt_out(tmp_path: Path) -> None:
+    result = _build_per_model_audit_fixture()
+
+    # 1. Union DataFrame includes _supporting_models and typed _model_outputs by default
+    df_union = result.to_dataframe(include_grounded_union=True)
+    assert df_union.height == 2
+    assert df_union["_supporting_models"].to_list() == [[G, A], [G]]
+    model_outs = df_union["_model_outputs"].to_list()
+    assert len(model_outs[0]) == 2
+    assert model_outs[0][0]["model_id"] == G
+    assert model_outs[0][0]["model_family"] == "google"
+    assert model_outs[0][0]["supported"] is True
+    assert model_outs[0][0]["is_grounded"] is True
+    assert model_outs[0][0]["votes"][0]["company_name"] == "Tecumseh"
+    assert model_outs[0][1]["model_id"] == A
+    assert model_outs[0][1]["votes"][0]["company_name"] == "Tecumseh Compressor"
+    assert model_outs[0][1]["votes"][0]["hq"] == {"label": "Plant-2", "weight": 4.5}
+
+    # Row 1 (SMBJ18A): G supported=True, A supported=False with votes=[]
+    assert model_outs[1][0]["model_id"] == G and model_outs[1][0]["supported"] is True
+    assert model_outs[1][0]["votes"][0]["company_id"] == "SMBJ18A"
+    assert model_outs[1][1]["model_id"] == A and model_outs[1][1]["supported"] is False
+    assert model_outs[1][1]["votes"] == []
+
+    # 2. Opt-out via include_model_outputs=False keeps only _status and _doc_id
+    df_union_bare = result.to_dataframe(include_grounded_union=True, include_model_outputs=False)
+    assert "_model_outputs" not in df_union_bare.columns
+    assert "_supporting_models" not in df_union_bare.columns
+    assert "_status" in df_union_bare.columns and "_doc_id" in df_union_bare.columns
+
+    # 3. Opt-in via include_model_outputs=True works on clean and include_disputed exports (+ flatten)
+    df_clean_mo = result.to_dataframe(include_model_outputs=True)
+    assert df_clean_mo.height == 1
+    assert df_clean_mo["_supporting_models"].to_list() == [[G, A]]
+    assert len(df_clean_mo["_model_outputs"].to_list()[0]) == 2
+
+    df_flat_mo = result.to_dataframe(flatten="departments.employees", include_grounded_union=True)
+    assert df_flat_mo["company_id"].to_list() == ["AW504ET-089-A4C", "SMBJ18A"]
+    assert df_flat_mo["_supporting_models"].to_list() == [[G, A], [G]]
+    assert len(df_flat_mo["_model_outputs"].to_list()[0]) == 2
+
+    # 4. to_dicts, to_arrow_table, and to_jsonl include _model_outputs
+    dicts_union = result.to_dicts(include_grounded_union=True)
+    assert dicts_union[0]["_supporting_models"] == [G, A]
+    assert dicts_union[0]["_model_outputs"][0]["votes"][0]["company_name"] == "Tecumseh"
+    assert dicts_union[1]["_supporting_models"] == [G]
+    assert dicts_union[1]["_model_outputs"][1]["supported"] is False
+
+    dicts_union_bare = result.to_dicts(include_grounded_union=True, include_model_outputs=False)
+    assert "_model_outputs" not in dicts_union_bare[0]
+
+    arrow_union = result.to_arrow_table(include_grounded_union=True)
+    assert arrow_union.equals(df_union.to_arrow())
+
+    jsonl_path = tmp_path / "union_prov.jsonl"
+    assert result.to_jsonl(jsonl_path, include_disputed=False, include_grounded_union=True) == 2
+    j_rows = [json.loads(ln) for ln in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    assert j_rows[0]["_model_outputs"][0]["votes"][0]["company_name"] == "Tecumseh"
+    assert j_rows[1]["_model_outputs"][1]["supported"] is False
+
+
+def test_by_model_flat_exports_across_tiers_disagreements_flatten_aliases_and_bounds(tmp_path: Path) -> None:
+    result = _build_per_model_audit_fixture()
+
+    # 1. Grounded-union by_model=True: 2 votes on AW504ET + 1 vote on SMBJ18A = 3 rows
+    df_bm_gu = result.to_dataframe(include_grounded_union=True, by_model=True)
+    assert df_bm_gu.height == 3
+    assert df_bm_gu["_model_id"].to_list() == [G, A, G]
+    assert df_bm_gu["_model_family"].to_list() == ["google", "anthropic", "google"]
+    assert df_bm_gu["_vote_index"].to_list() == [0, 0, 0]
+    assert df_bm_gu["company_id"].to_list() == ["AW504ET - 089 - A4C", "AW504ET-089-A4C", "SMBJ18A"]
+    assert df_bm_gu["company_name"].to_list() == ["Tecumseh", "Tecumseh Compressor", "TVS Diode"]
+    assert df_bm_gu["_status"].to_list() == ["consensus", "consensus", "missing_in_some_models"]
+    assert df_bm_gu["_doc_id"].to_list() == ["doc_1", "doc_1", "doc_2"]
+    assert df_bm_gu["_is_grounded"].to_list() == [True, True, True]
+    assert df_bm_gu["_grounding_quotes"].to_list() == [
+        ["AW504ET - 089 - A4C"],
+        ["AW504ET-089-A4C"],
+        ["ZD601: SMBJ18A"],
+    ]
+    assert df_bm_gu["_element_ids"].to_list() == [["p0001_e001"], ["p0001_e001"], ["p0002_e004"]]
+
+    # 2. include_disputed=True, by_model=True retains individual model votes even when merged item.record is None!
+    df_bm_disp = result.to_dataframe(include_disputed=True, by_model=True)
+    assert df_bm_disp.height == 5
+    assert df_bm_disp["company_id"].to_list()[3:] == ["TIE-9", "TIE-9"]
+    assert df_bm_disp["company_name"].to_list()[3:] == ["Alpha", "Beta"]
+    assert df_bm_disp["_model_id"].to_list()[3:] == [G, A]
+    assert df_bm_disp["_is_grounded"].to_list()[3:] == [True, False]
+
+    # 3. Flattened by_model=True left-outer explodes each model's vote nested list
+    df_bm_flat = result.to_dataframe(flatten="departments.employees", include_grounded_union=True, by_model=True)
+    assert df_bm_flat.height == 3
+    assert df_bm_flat["departments.employees.emp_id"].to_list() == ["E-1", "E-1", None]
+    assert df_bm_flat["departments.employees.skills"].to_list() == [["cad"], ["cam"], None]
+    assert df_bm_flat["_model_id"].to_list() == [G, A, G]
+
+    # 4. to_dicts, to_arrow_table, and to_jsonl with by_model=True
+    dicts_bm = result.to_dicts(include_disputed=True, by_model=True)
+    assert len(dicts_bm) == 5
+    assert [(r["_model_id"], r["company_name"], r["_is_grounded"]) for r in dicts_bm[3:]] == [
+        (G, "Alpha", True),
+        (A, "Beta", False),
+    ]
+    assert result.to_arrow_table(include_grounded_union=True, by_model=True).equals(df_bm_gu.to_arrow())
+
+    jsonl_bm = tmp_path / "by_model.jsonl"
+    assert result.to_jsonl(jsonl_bm, include_disputed=True, by_model=True) == 5
+    j_bm_rows = [json.loads(ln) for ln in jsonl_bm.read_text(encoding="utf-8").splitlines()]
+    assert [(r["_model_id"], r["company_name"], r["_is_grounded"]) for r in j_bm_rows[3:]] == [
+        (G, "Alpha", True),
+        (A, "Beta", False),
+    ]
+
+    # 5. StrictAliasPart (populate_by_name=False) + Decimal + AwareDatetime UTC conversion + bounds check
+    alias_schema = prepare(StrictAliasPart)
+    rec_alias = StrictAliasPart.model_validate(
+        {
+            "partId": "P-100",
+            "unitCost": "12.50",
+            "checkedAt": "2026-05-10T14:30:00+02:00",
+        }
+    )
+    it_alias = make_grounded(rec_alias, status="consensus", key=("P-100",))
+    res_alias = RationalizedResult(
+        items=(it_alias,),
+        records=(rec_alias,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=alias_schema,
+    )
+    df_alias_bm = res_alias.to_dataframe(by_model=True)
+    assert df_alias_bm.height == 2
+    assert df_alias_bm["part_id"].to_list() == ["P-100", "P-100"]
+    assert df_alias_bm["unit_cost"].to_list() == [Decimal("12.500000000"), Decimal("12.500000000")]
+    assert df_alias_bm["checked_at"].to_list() == [
+        datetime(2026, 5, 10, 12, 30, tzinfo=timezone.utc),
+        datetime(2026, 5, 10, 12, 30, tzinfo=timezone.utc),
+    ]
+
+    # Out-of-bounds Decimal inside model_votes raises RationalizationError naming field path
+    bad_vote_item = GroundedRecord(
+        doc_id="doc_1",
+        unit_ids=("doc_1:u1",),
+        status="field_disagreement",
+        key=("P-BAD",),
+        record=None,
+        disputed_fields=("unit_cost",),
+        notes=(),
+        grounding_reasons=(),
+        sources=(),
+        grounding_quotes=("P-BAD",),
+        model_votes={
+            G: ({"part_id": "P-BAD", "unit_cost": "1.0000000009", "checked_at": "2026-05-10T12:00:00Z"},),
+            A: (),
+        },
+        quotes_by_model={G: ("P-BAD",), A: ()},
+        element_ids_by_model={G: ("p0001_e001",), A: ()},
+        families={G: "google", A: "anthropic"},
+    )
+    res_bad = RationalizedResult(
+        items=(bad_vote_item,),
+        records=(),
+        needs_review=(bad_vote_item,),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=alias_schema,
+    )
+    with pytest.raises(RationalizationError, match=r"model\[gemini:gemini-3\]\[0\]\.unit_cost"):
+        res_bad.to_dataframe(include_disputed=True, by_model=True)
+
+    # Empty result preserves schema for both by_model=True and include_grounded_union=True
+    empty_res: RationalizedResult[Company] = RationalizedResult(
+        items=(),
+        records=(),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=COMPANY_SCHEMA,
+    )
+    empty_bm = empty_res.to_dataframe(by_model=True)
+    assert empty_bm.height == 0
+    assert "_model_id" in empty_bm.schema and "_is_grounded" in empty_bm.schema
+    empty_gu = empty_res.to_dataframe(include_grounded_union=True)
+    assert empty_gu.height == 0
+    assert "_model_outputs" in empty_gu.schema and "_supporting_models" in empty_gu.schema
+
+    # Strict bool validation on by_model and include_model_outputs
+    for bad_flag in (1, 0, "true"):
+        with pytest.raises(TypeError, match="by_model"):
+            result.to_dataframe(by_model=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="by_model"):
+            result.to_dicts(by_model=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="by_model"):
+            result.to_jsonl(tmp_path / "x.jsonl", by_model=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_model_outputs"):
+            result.to_dataframe(include_model_outputs=bad_flag)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="include_model_outputs"):
+            result.to_dicts(include_model_outputs=bad_flag)  # type: ignore[arg-type]
+
+    # by_model=True with explicit include_model_outputs=True attaches peer context too; to_jsonl bare by_model
+    df_bm_peer = result.to_dataframe(include_grounded_union=True, by_model=True, include_model_outputs=True)
+    assert "_model_outputs" in df_bm_peer.columns and "_supporting_models" in df_bm_peer.columns
+    dicts_bm_peer = result.to_dicts(include_grounded_union=True, by_model=True, include_model_outputs=True)
+    assert len(dicts_bm_peer[0]["_model_outputs"]) == 2
+    jsonl_bm_bare = tmp_path / "by_model_bare.jsonl"
+    assert result.to_jsonl(jsonl_bm_bare, include_provenance=False, include_disputed=False, by_model=True) == 2
+    bare_rows = [json.loads(ln) for ln in jsonl_bm_bare.read_text(encoding="utf-8").splitlines()]
+    assert all("_sources" not in r and "_model_id" in r for r in bare_rows)
+
+    # AllTypesRecord via by_model=True exercises Enum, date, NaiveDatetime, AwareDatetime, Decimal, int, float, bool
+    rec_all = sample_all_types("R-ALL")
+    it_all = make_grounded(rec_all, status="consensus", key=("R-ALL",))
+    res_all = RationalizedResult(
+        items=(it_all,),
+        records=(rec_all,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=ALL_TYPES_SCHEMA,
+    )
+    df_all_bm = res_all.to_dataframe(by_model=True)
+    assert df_all_bm.height == 2
+    assert df_all_bm["issued_on"].to_list() == [date(2026, 5, 10), date(2026, 5, 10)]
+    assert df_all_bm["local_time"].to_list() == [datetime(2026, 5, 10, 9, 15, 0), datetime(2026, 5, 10, 9, 15, 0)]
+    assert df_all_bm["status"].to_list() == ["active", "active"]
+    assert df_all_bm["priority"].to_list() == [2, 2]
+    assert df_all_bm["amount"].to_list() == [Decimal("1234.560000000"), Decimal("1234.560000000")]
+
+    # Out-of-bounds int inside _model_outputs raises RationalizationError with full _model_outputs path
+    bad_int_vote = dict(rec_all.model_dump(mode="json"))
+    bad_int_vote["count"] = INT64_MAX + 1
+    it_bad_int = GroundedRecord(
+        doc_id="doc_1",
+        unit_ids=("doc_1:u1",),
+        status="consensus",
+        key=("R-ALL",),
+        record=rec_all,
+        disputed_fields=(),
+        notes=(),
+        grounding_reasons=(),
+        sources=(),
+        grounding_quotes=("R-ALL",),
+        model_votes={G: (bad_int_vote,), A: (rec_all.model_dump(mode="json"),)},
+        quotes_by_model={G: ("R-ALL",), A: ("R-ALL",)},
+        element_ids_by_model={G: ("p0001_e001",), A: ("p0001_e001",)},
+        families={G: "google", A: "anthropic"},
+    )
+    res_bad_int = RationalizedResult(
+        items=(it_bad_int,),
+        records=(rec_all,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=ALL_TYPES_SCHEMA,
+    )
+    with pytest.raises(RationalizationError, match=r"_model_outputs\[0\]\.votes\[0\]\.count"):
+        res_bad_int.to_dataframe(include_model_outputs=True)
+
+    # Nested container mutation in to_dicts(include_grounded_union=True) must never mutate result.items
+    dicts_mut = result.to_dicts(include_grounded_union=True)
+    dicts_mut[0]["_model_outputs"][0]["votes"][0]["aliases"].append("INJECTED")
+    assert result.items[0].model_votes[G][0]["aliases"] == ["AW504ET - 089 - A4C"]
+    assert result.to_dataframe(include_grounded_union=True, by_model=True)["aliases"].to_list()[0] == [
+        "AW504ET - 089 - A4C"
+    ]
+
+    # Empty result to_jsonl(by_model=True) writes 0 rows
+    p_empty_bm = tmp_path / "empty_bm.jsonl"
+    assert empty_res.to_jsonl(p_empty_bm, by_model=True) == 0
+    assert p_empty_bm.read_text(encoding="utf-8") == ""
+
+    # Custom serializers / ser_json_temporal fail closed with RationalizationError (never AttributeError)
+    class EpochTemporalModel(BaseModel):
+        model_config = ConfigDict(ser_json_temporal="milliseconds")
+        pid: Annotated[str, Key]
+        at: AwareDatetime
+
+    rec_epoch = EpochTemporalModel(pid="E-1", at=datetime(2026, 5, 10, 12, 0, tzinfo=timezone.utc))
+    res_epoch = RationalizedResult(
+        items=(make_grounded(rec_epoch, status="consensus", key=("E-1",)),),
+        records=(rec_epoch,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=prepare(EpochTemporalModel),
+    )
+    with pytest.raises(RationalizationError, match="cannot serialize float vote value as Datetime"):
+        res_epoch.to_dataframe(include_grounded_union=True)
+    with pytest.raises(RationalizationError, match=r"model\[gemini:gemini-3\]\[0\]\.at"):
+        res_epoch.to_dataframe(by_model=True)
+    assert res_epoch.to_dataframe(include_grounded_union=True, include_model_outputs=False).height == 1
+
+    class CustomIntSerModel(BaseModel):
+        pid: Annotated[str, Key]
+        n: int
+
+        @field_serializer("n", mode="plain", when_used="json")
+        def _ser_n(self, v: int) -> str:
+            return f"#{v}"
+
+    rec_cint = CustomIntSerModel(pid="C-1", n=5)
+    res_cint = RationalizedResult(
+        items=(make_grounded(rec_cint, status="consensus", key=("C-1",)),),
+        records=(rec_cint,),
+        needs_review=(),
+        quarantined=(),
+        failed_units=(),
+        empty_units=(),
+        skipped_units=(),
+        telemetry=make_telemetry(),
+        schema=prepare(CustomIntSerModel),
+    )
+    with pytest.raises(RationalizationError, match="cannot serialize str vote value as Int64"):
+        res_cint.to_dataframe(include_model_outputs=True)

@@ -1268,23 +1268,35 @@ class TestDeadline:
         assert result.content == {"records": []}
 
     def test_the_token_is_fetched_after_the_deadline_is_set(self, monkeypatch):
+        real = time.monotonic
+        lag = {"s": 0.0}
+        events = []
         deadlines = []
+
+        def fake_monotonic():
+            events.append("clock")
+            return real() + lag["s"]
 
         def spy(self, url, *, headers, body, timeout_s, deadline):
             deadlines.append(deadline)
             return HttpReply(200, GEMINI_REPLY, json.dumps(GEMINI_REPLY), None)
 
         def slow_token():
-            time.sleep(0.05)
+            events.append("token")
+            lag["s"] += 20.0
             return TOKEN
 
         provider = cloud(token=slow_token)
+        request = request_for(provider, timeout_s=10.0)
+        monkeypatch.setattr(gemini_module.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(HttpClient, "post_json", spy)
 
-        before = time.monotonic()
-        provider.generate(request_for(provider, timeout_s=10.0))
+        before = real()
+        provider.generate(request)
 
-        assert deadlines[0] < before + 10.0 + 0.05
+        assert "token" in events
+        assert events.index("clock") < events.index("token")
+        assert deadlines[0] < before + 10.0 + 10.0
 
 
 # ---------------------------------------------------------------------------------------------------------------

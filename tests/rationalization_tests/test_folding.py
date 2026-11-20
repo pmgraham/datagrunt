@@ -29,7 +29,7 @@ from datagrunt.pdf.elements import (
     Table,
 )
 from datagrunt.pdf.render import RenderRefused
-from datagrunt.rationalization import Informational, Key, rationalize
+from datagrunt.rationalization import Informational, Key, ModelOutput, rationalize
 from datagrunt.rationalization.consensus import build_consensus
 from datagrunt.rationalization.envelope import Envelope, build_envelopes, build_envelopes_isolated, render_element
 from datagrunt.rationalization.folding import (
@@ -1664,3 +1664,101 @@ class TestGroundedRecordSourceName:
         assert [item.source_name for item in result.items] == ["alpha_drawing.pdf", "report.pdf"]
         for item in result.items:
             assert item.source_name not in repr(item)
+
+
+class TestModelOutputAndGroundedRecordAudit:
+    def test_model_output_validation_repr_confidentiality_and_defensive_to_dict(self) -> None:
+        assert "ModelOutput" in folding_module.__all__
+        reason = GroundingReason("quote_not_found", G, index=0, text="SECRET_QUOTE_99")
+        out = ModelOutput(
+            model_id=G,
+            model_family="google",
+            supported=True,
+            is_grounded=False,
+            votes=({"assembly_id": "SECRET_PART_99", "title": "SECRET_TITLE", "tags": ["orig"]},),
+            grounding_quotes=("SECRET_QUOTE_99",),
+            element_ids=(E_P1,),
+            grounding_reasons=(reason,),
+        )
+        text_repr = repr(out)
+        assert G in text_repr and "google" in text_repr
+        for canary in ("SECRET_PART_99", "SECRET_TITLE", "SECRET_QUOTE_99", E_P1):
+            assert canary not in text_repr
+
+        assert isinstance(out.votes[0], MappingProxyType)
+        with pytest.raises(TypeError):
+            out.votes[0]["assembly_id"] = "MUTATED"  # type: ignore[index]
+
+        as_dict = out.to_dict()
+        assert as_dict == {
+            "model_id": G,
+            "model_family": "google",
+            "supported": True,
+            "is_grounded": False,
+            "votes": [{"assembly_id": "SECRET_PART_99", "title": "SECRET_TITLE", "tags": ["orig"]}],
+            "grounding_quotes": ["SECRET_QUOTE_99"],
+            "element_ids": [E_P1],
+            "grounding_reasons": [
+                {"reason": "quote_not_found", "index": 0, "key_field": None, "text": "SECRET_QUOTE_99"}
+            ],
+        }
+        as_dict["votes"][0]["assembly_id"] = "CHANGED"
+        as_dict["votes"][0]["tags"].append("INJECTED")
+        as_dict["grounding_quotes"].clear()
+        assert out.to_dict()["votes"][0]["assembly_id"] == "SECRET_PART_99"
+        assert out.to_dict()["votes"][0]["tags"] == ["orig"]
+        assert out.to_dict()["grounding_quotes"] == ["SECRET_QUOTE_99"]
+
+        # Invariant rejections
+        with pytest.raises(ValueError, match="supported"):
+            ModelOutput(G, "google", False, False, ({"assembly_id": "A-1"},), (), (), ())
+        with pytest.raises(ValueError, match="supported"):
+            ModelOutput(G, "google", True, True, (), (), (), ())
+        with pytest.raises(ValueError, match="is_grounded"):
+            ModelOutput(G, "google", False, True, (), (), (), ())
+        with pytest.raises(ValueError, match="is_grounded"):
+            ModelOutput(G, "google", True, True, ({"assembly_id": "A-1"},), (), (), (reason,))
+        with pytest.raises(ValueError, match="model_id"):
+            ModelOutput(A, "anthropic", True, False, ({"assembly_id": "A-1"},), (), (), (reason,))
+        for bad_bool in (1, 0, "true", None):
+            with pytest.raises(TypeError):
+                ModelOutput(G, "google", bad_bool, True, ({"assembly_id": "A-1"},), (), (), ())  # type: ignore[arg-type]
+            with pytest.raises(TypeError):
+                ModelOutput(G, "google", True, bad_bool, ({"assembly_id": "A-1"},), (), (), ())  # type: ignore[arg-type]
+
+    def test_grounded_record_supporting_models_and_model_outputs_across_statuses(self) -> None:
+        rec = Assembly(assembly_id="SMBJ18A", title="TVS Diode")
+        item_partial = make_grounded_record(
+            status="missing_in_some_models",
+            key=("SMBJ18A",),
+            record=rec,
+            model_votes={G: (rec.model_dump(mode="json"),), A: ()},
+            quotes_by_model={G: ("ZD601 SMBJ18A",), A: ()},
+            element_ids_by_model={G: (E_P1,), A: ()},
+        )
+        assert item_partial.supporting_models == (G,)
+        outputs = item_partial.model_outputs
+        assert [m.model_id for m in outputs] == [G, A]
+        assert outputs[0].supported is True and outputs[0].is_grounded is True
+        assert outputs[0].votes[0]["assembly_id"] == "SMBJ18A"
+        assert outputs[1].supported is False and outputs[1].is_grounded is False
+        assert outputs[1].votes == ()
+
+        # Mixed grounding: G grounded, A ungrounded -> per-model is_grounded reflects each model independently
+        reason_a = GroundingReason("no_quotes", A)
+        item_mixed = make_grounded_record(
+            status="ungrounded_value",
+            key=("A-100",),
+            record=Assembly(assembly_id="A-100", title="Pump"),
+            grounding_reasons=(reason_a,),
+            model_votes={
+                G: ({"assembly_id": "A-100", "title": "Pump"},),
+                A: ({"assembly_id": "A-100", "title": "Pump"},),
+            },
+            quotes_by_model={G: ("Assembly A-100 Pump",), A: ()},
+            element_ids_by_model={G: (E_P1,), A: (E_P1,)},
+        )
+        assert item_mixed.supporting_models == (G, A)
+        m_g, m_a = item_mixed.model_outputs
+        assert m_g.is_grounded is True and m_g.grounding_reasons == ()
+        assert m_a.is_grounded is False and m_a.grounding_reasons == (reason_a,)
