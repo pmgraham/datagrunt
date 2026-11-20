@@ -36,6 +36,7 @@ __all__ = [
     "RationalizedResult",
     "GroundedRecord",
     "ElementSource",
+    "ModelOutput",
     "QuarantinedItem",
     "FailedUnit",
     "SkippedUnit",
@@ -61,7 +62,7 @@ if TYPE_CHECKING:
     from datagrunt.rationalization.api import PassSpec, rationalize, rationalize_many
     from datagrunt.rationalization.batch import BatchItem, BatchPlan, ingest_batch, prepare_batch
     from datagrunt.rationalization.consensus import QuarantinedItem
-    from datagrunt.rationalization.folding import ElementSource, GroundedRecord
+    from datagrunt.rationalization.folding import ElementSource, GroundedRecord, ModelOutput
     from datagrunt.rationalization.providers.anthropic import AnthropicProvider
     from datagrunt.rationalization.providers.base import (
         ModelProvider,

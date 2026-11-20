@@ -54,6 +54,7 @@ EXPECTED_RATIONALIZATION_ALL: tuple[str, ...] = (
     "RationalizedResult",
     "GroundedRecord",
     "ElementSource",
+    "ModelOutput",
     "QuarantinedItem",
     "FailedUnit",
     "SkippedUnit",
@@ -290,7 +291,7 @@ def _fake_render(source: Path, page_index: int, *, dpi: int, password: str | Non
 class TestPublicNamespaceAndLazyExports:
     def test_rationalization_all_has_exact_21_names(self) -> None:
         assert tuple(datagrunt.rationalization.__all__) == EXPECTED_RATIONALIZATION_ALL
-        assert len(datagrunt.rationalization.__all__) == 28
+        assert len(datagrunt.rationalization.__all__) == 29
 
     @pytest.mark.parametrize("name", EXPECTED_RATIONALIZATION_ALL)
     def test_every_exported_name_is_accessible_and_in_dir(self, name: str) -> None:

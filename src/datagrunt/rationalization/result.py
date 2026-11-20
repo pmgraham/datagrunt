@@ -28,13 +28,14 @@ model and its sibling modules: nothing from ``datagrunt.core``, and no import in
 """
 
 import contextlib
+import copy
 import json
 import os
 import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -48,7 +49,7 @@ from datagrunt.pdf.elements import HIDDEN_REASONS
 from datagrunt.rationalization.consensus import QuarantinedItem, _check_strings, _check_text, _check_tuple_of
 from datagrunt.rationalization.envelope import ESCAPE_CATEGORIES
 from datagrunt.rationalization.exceptions import RationalizationError
-from datagrunt.rationalization.folding import _CLEAN_STATUSES, GroundedRecord
+from datagrunt.rationalization.folding import _CLEAN_STATUSES, GroundedRecord, ModelOutput
 from datagrunt.rationalization.runner import FailedUnit, ModelUsage
 from datagrunt.rationalization.schema import MAX_DEPTH, FieldSpec, ModelSpec, PreparedSchema, ScalarSpec, describe
 from datagrunt.rationalization.units import SkippedUnit
@@ -422,6 +423,8 @@ class RationalizedResult(Generic[T]):
         *,
         include_disputed: bool = False,
         include_grounded_union: bool = False,
+        include_model_outputs: bool | None = None,
+        by_model: bool = False,
     ) -> pl.DataFrame:
         """Convert the result's records to a Polars ``DataFrame`` with deterministic dtypes (plan §4.10).
 
@@ -429,88 +432,109 @@ class RationalizedResult(Generic[T]):
             flatten: Optional dotted path of ``model_list`` or ``scalar_list`` fields to left-outer explode.
                 Sibling list fields at each exploded level are dropped to prevent Cartesian fan-out.
             include_disputed: When ``False`` (default), includes ``self.records`` (unless ``include_grounded_union``
-                is ``True``). When ``True``, includes every item in ``self.items`` with ``item.record is not None``
-                and appends ``_status`` and ``_doc_id`` string columns.
+                is ``True``). When ``True``, includes every item in ``self.items`` (requiring ``item.record`` unless
+                ``by_model=True``) and appends ``_status`` and ``_doc_id`` string columns.
             include_grounded_union: When ``True`` (and ``include_disputed`` is ``False``), includes
-                :attr:`grounded_items` and appends ``_status`` and ``_doc_id`` string columns.
+                :attr:`grounded_items`, appends ``_status`` and ``_doc_id``, and defaults ``include_model_outputs``
+                to ``True`` when ``by_model`` is ``False``.
+            include_model_outputs: When ``True`` (default when ``include_grounded_union=True`` and ``not by_model``),
+                appends ``_supporting_models`` and typed ``_model_outputs`` columns showing each model's votes,
+                quotes, cited element ids, and grounding status. Pass ``False`` to omit them.
+            by_model: When ``True``, explodes selected items into one typed row per ``(item, model_id, vote)`` with
+                ``_model_id``, ``_model_family``, ``_vote_index``, ``_status``, ``_doc_id``, ``_is_grounded``,
+                ``_grounding_quotes``, and ``_element_ids``.
 
         Returns:
             A :class:`polars.DataFrame`.
 
         Raises:
-            TypeError: If ``flatten`` is neither ``str`` nor ``None``, or ``include_disputed`` /
-                ``include_grounded_union`` is not a ``bool``.
+            TypeError: If ``flatten`` or any boolean option has the wrong type.
             RationalizationError: If ``flatten`` is not a valid list path, or any ``int`` or ``Decimal`` value
                 exceeds ``pl.Int64`` / ``pl.Decimal(38, 9)`` bounds.
         """
-        if not isinstance(include_disputed, bool):
-            raise TypeError(f"include_disputed must be a bool, got {type(include_disputed).__name__}")
-        if not isinstance(include_grounded_union, bool):
-            raise TypeError(f"include_grounded_union must be a bool, got {type(include_grounded_union).__name__}")
+        inc_disp, inc_gu, want_mo, flat_bm = _resolve_export_flags(
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+            include_model_outputs=include_model_outputs,
+            by_model=by_model,
+        )
         if flatten is not None and not isinstance(flatten, str):
             raise TypeError(f"flatten must be a str or None, got {type(flatten).__name__}")
 
         spec = self._require_spec()
         parts = _validate_flatten_path(spec, flatten) if flatten is not None else ()
-        with_meta = include_disputed or include_grounded_union
-        records, statuses, doc_ids = self._select_records(
-            include_disputed=include_disputed,
-            include_grounded_union=include_grounded_union,
-        )
-
         try:
-            if not parts:
-                return _unflattened_dataframe(spec, records, statuses, doc_ids, include_disputed=with_meta)
-            flat_schema = _flat_schema_for_level(spec, parts, "", 1)
-            if with_meta:
-                flat_schema["_status"] = pl.String()
-                flat_schema["_doc_id"] = pl.String()
-            flat_columns = _build_flattened_columns(
-                records,
-                statuses,
-                doc_ids,
+            if flat_bm:
+                selected = self._select_items(
+                    include_disputed=inc_disp,
+                    include_grounded_union=inc_gu,
+                    require_record=False,
+                )
+                return _build_by_model_dataframe(spec, selected, parts, include_model_outputs=want_mo)
+            selected = self._select_items(
+                include_disputed=inc_disp,
+                include_grounded_union=inc_gu,
+                require_record=True,
+            )
+            return _build_merged_dataframe(
                 spec,
+                selected,
                 parts,
-                flat_schema,
-                include_disputed=with_meta,
+                with_status_doc=inc_disp or inc_gu,
+                with_model_outputs=want_mo,
             )
         except _FieldBoundsError as err:
             raise err.to_error() from None
-        return pl.DataFrame(flat_columns, schema=flat_schema)
 
     def to_dicts(
         self,
         *,
         include_disputed: bool = False,
         include_grounded_union: bool = False,
+        include_model_outputs: bool | None = None,
+        by_model: bool = False,
     ) -> list[dict[str, Any]]:
-        """Convert the result's records to Python dicts via ``model_dump(mode="python")`` (plan §4.10).
+        """Convert the result's records to Python dicts (plan §4.10).
 
         Args:
-            include_disputed: When ``False`` (default), dumps ``self.records`` (unless ``include_grounded_union``
-                is ``True``). When ``True``, dumps every item in ``self.items`` with ``item.record is not None``
-                and appends ``_status`` and ``_doc_id``.
-            include_grounded_union: When ``True`` (and ``include_disputed`` is ``False``), dumps
-                :attr:`grounded_items` and appends ``_status`` and ``_doc_id``.
+            include_disputed: Include disputed/review items (requiring ``record`` unless ``by_model=True``).
+            include_grounded_union: Include :attr:`grounded_items` (defaults ``include_model_outputs=True`` when
+                ``not by_model``).
+            include_model_outputs: Append ``_supporting_models`` and ``_model_outputs`` dicts per row (each model's
+                ``votes`` are attribute-keyed JSON-mode dicts matching :attr:`GroundedRecord.model_votes`).
+            by_model: Emit one attribute-keyed JSON-mode dict per ``(item, supporting model_id, vote)`` with
+                ``_model_id``, ``_model_family``, ``_vote_index``, ``_status``, ``_doc_id``, ``_is_grounded``,
+                ``_grounding_quotes``, and ``_element_ids``. Merged rows (``by_model=False``) use
+                ``record.model_dump(mode="python")``.
 
         Returns:
             List of record dicts.
         """
-        if not isinstance(include_disputed, bool):
-            raise TypeError(f"include_disputed must be a bool, got {type(include_disputed).__name__}")
-        if not isinstance(include_grounded_union, bool):
-            raise TypeError(f"include_grounded_union must be a bool, got {type(include_grounded_union).__name__}")
-        if not include_disputed and not include_grounded_union:
+        inc_disp, inc_gu, want_mo, flat_bm = _resolve_export_flags(
+            include_disputed=include_disputed,
+            include_grounded_union=include_grounded_union,
+            include_model_outputs=include_model_outputs,
+            by_model=by_model,
+        )
+        if flat_bm:
+            selected = self._select_items(
+                include_disputed=inc_disp,
+                include_grounded_union=inc_gu,
+                require_record=False,
+            )
+            return _build_by_model_dicts(selected, include_model_outputs=want_mo)
+        if not inc_disp and not inc_gu and not want_mo:
             return [record.model_dump(mode="python") for record in self.records]
-        source_items = self.items if include_disputed else self.grounded_items
-        out: list[dict[str, Any]] = []
-        for item in source_items:
-            if item.record is not None:
-                row = item.record.model_dump(mode="python")
-                row["_status"] = item.status
-                row["_doc_id"] = item.doc_id
-                out.append(row)
-        return out
+        selected = self._select_items(
+            include_disputed=inc_disp,
+            include_grounded_union=inc_gu,
+            require_record=True,
+        )
+        return _build_merged_dicts(
+            selected,
+            with_status_doc=inc_disp or inc_gu,
+            with_model_outputs=want_mo,
+        )
 
     def to_arrow_table(
         self,
@@ -518,12 +542,16 @@ class RationalizedResult(Generic[T]):
         *,
         include_disputed: bool = False,
         include_grounded_union: bool = False,
+        include_model_outputs: bool | None = None,
+        by_model: bool = False,
     ) -> pa.Table:
         """Convert the result's records to a PyArrow ``Table`` via :meth:`to_dataframe` (plan §4.10)."""
         return self.to_dataframe(
             flatten=flatten,
             include_disputed=include_disputed,
             include_grounded_union=include_grounded_union,
+            include_model_outputs=include_model_outputs,
+            by_model=by_model,
         ).to_arrow()
 
     def to_jsonl(
@@ -533,6 +561,7 @@ class RationalizedResult(Generic[T]):
         include_provenance: bool = True,
         include_disputed: bool = True,
         include_grounded_union: bool = False,
+        by_model: bool = False,
     ) -> int:
         """Write selected items as atomic UTF-8 JSONL (provenance-by-default) and return the row count."""
         target_path = _checked_jsonl_options(
@@ -540,7 +569,16 @@ class RationalizedResult(Generic[T]):
             include_provenance=include_provenance,
             include_disputed=include_disputed,
             include_grounded_union=include_grounded_union,
+            by_model=by_model,
         )
+        if by_model:
+            selected_bm = self._select_items(
+                include_disputed=include_disputed,
+                include_grounded_union=include_grounded_union,
+                require_record=False,
+            )
+            encoded = _encode_by_model_jsonl(selected_bm, include_provenance=include_provenance)
+            return _write_jsonl_atomic(target_path, encoded)
         selected = self._select_jsonl_items(
             include_provenance=include_provenance,
             include_disputed=include_disputed,
@@ -568,30 +606,105 @@ class RationalizedResult(Generic[T]):
             return tuple(item for item in self.grounded_items if item.record is not None)
         return tuple(item for item in self.items if item.status in _CLEAN_STATUSES and item.record is not None)
 
-    def _select_records(
+    def _select_items(
         self,
         *,
         include_disputed: bool,
-        include_grounded_union: bool = False,
-    ) -> tuple[Sequence[T], list[str], list[str]]:
-        """Return selected records plus ``(_status, _doc_id)`` column lists when metadata is requested."""
-        if not include_disputed and not include_grounded_union:
-            return self.records, [], []
-        source_items = self.items if include_disputed else self.grounded_items
-        records: list[T] = []
-        statuses: list[str] = []
-        doc_ids: list[str] = []
-        for item in source_items:
-            if item.record is not None:
-                records.append(item.record)
-                statuses.append(item.status)
-                doc_ids.append(item.doc_id)
-        return records, statuses, doc_ids
+        include_grounded_union: bool,
+        require_record: bool,
+    ) -> tuple[GroundedRecord[T], ...]:
+        """Select :class:`GroundedRecord` items matching tier flags and ``require_record``."""
+        if include_disputed:
+            source: Sequence[GroundedRecord[T]] = self.items
+        elif include_grounded_union:
+            source = self.grounded_items
+        else:
+            source = tuple(item for item in self.items if item.status in _CLEAN_STATUSES)
+        if not require_record:
+            return tuple(source)
+        return tuple(item for item in source if item.record is not None)
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# JSONL provenance export helpers
+# Export flag validation, dicts, and JSONL provenance helpers
 # ---------------------------------------------------------------------------------------------------------------
+
+
+def _require_strict_bool(name: str, value: object) -> bool:
+    """Require an exact ``bool`` value."""
+    if type(value) is not bool:
+        raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
+    return value
+
+
+def _resolve_export_flags(
+    *,
+    include_disputed: object,
+    include_grounded_union: object,
+    include_model_outputs: object,
+    by_model: object,
+) -> tuple[bool, bool, bool, bool]:
+    """Validate and resolve tier and per-model export flags."""
+    inc_disp = _require_strict_bool("include_disputed", include_disputed)
+    inc_gu = _require_strict_bool("include_grounded_union", include_grounded_union)
+    flat_bm = _require_strict_bool("by_model", by_model)
+    if include_model_outputs is not None and type(include_model_outputs) is not bool:
+        raise TypeError(f"include_model_outputs must be a bool or None, got {type(include_model_outputs).__name__}")
+    if flat_bm:
+        want_mo = bool(include_model_outputs)
+    else:
+        want_mo = inc_gu if include_model_outputs is None else bool(include_model_outputs)
+    return inc_disp, inc_gu, want_mo, flat_bm
+
+
+def _build_merged_dicts(
+    items: Sequence[GroundedRecord[Any]],
+    *,
+    with_status_doc: bool,
+    with_model_outputs: bool,
+) -> list[dict[str, Any]]:
+    """Convert selected ``GroundedRecord`` items with non-None ``record`` into Python dicts."""
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if item.record is None:
+            continue
+        row = item.record.model_dump(mode="python")
+        if with_status_doc:
+            row["_status"] = item.status
+            row["_doc_id"] = item.doc_id
+        if with_model_outputs:
+            row["_supporting_models"] = list(item.supporting_models)
+            row["_model_outputs"] = [mo.to_dict() for mo in item.model_outputs]
+        out.append(row)
+    return out
+
+
+def _build_by_model_dicts(
+    items: Sequence[GroundedRecord[Any]],
+    *,
+    include_model_outputs: bool,
+) -> list[dict[str, Any]]:
+    """Explode selected items into one defensive dict per ``(item, supporting model_id, vote)``."""
+    out: list[dict[str, Any]] = []
+    for item in items:
+        all_outputs = [mo.to_dict() for mo in item.model_outputs] if include_model_outputs else None
+        supporting = list(item.supporting_models) if include_model_outputs else None
+        for mo in item.model_outputs:
+            for vote_idx, vote in enumerate(mo.votes):
+                row: dict[str, Any] = {k: copy.deepcopy(v) for k, v in vote.items()}
+                row["_model_id"] = mo.model_id
+                row["_model_family"] = mo.model_family
+                row["_vote_index"] = vote_idx
+                row["_status"] = item.status
+                row["_doc_id"] = item.doc_id
+                row["_is_grounded"] = mo.is_grounded
+                row["_grounding_quotes"] = list(mo.grounding_quotes)
+                row["_element_ids"] = list(mo.element_ids)
+                if all_outputs is not None and supporting is not None:
+                    row["_supporting_models"] = list(supporting)
+                    row["_model_outputs"] = copy.deepcopy(all_outputs)
+                out.append(row)
+    return out
 
 
 def _checked_jsonl_options(
@@ -600,15 +713,16 @@ def _checked_jsonl_options(
     include_provenance: object,
     include_disputed: object,
     include_grounded_union: object,
+    by_model: object = False,
 ) -> Path:
     """Validate :meth:`RationalizedResult.to_jsonl` path and strict boolean flags."""
     for flag_name, flag_val in (
         ("include_provenance", include_provenance),
         ("include_disputed", include_disputed),
         ("include_grounded_union", include_grounded_union),
+        ("by_model", by_model),
     ):
-        if not isinstance(flag_val, bool):
-            raise TypeError(f"{flag_name} must be a bool, got {type(flag_val).__name__}")
+        _require_strict_bool(flag_name, flag_val)
     if not isinstance(path, (str, os.PathLike)):
         raise TypeError(f"path must be a str or PathLike[str], got {type(path).__name__}")
     raw_path = os.fspath(path)
@@ -617,6 +731,21 @@ def _checked_jsonl_options(
     if not raw_path or not raw_path.strip() or "\x00" in raw_path:
         raise ValueError("path must be a non-empty path without NUL bytes")
     return Path(raw_path)
+
+
+def _sources_dicts(item: GroundedRecord[Any]) -> list[dict[str, Any]]:
+    """Serialize resolved :class:`ElementSource` provenance entries on ``item``."""
+    return [
+        {
+            "doc_id": s.doc_id,
+            "unit_id": s.unit_id,
+            "element_id": s.element_id,
+            "page_number": s.page_number,
+            "bbox": {"x0": s.bbox.x0, "y0": s.bbox.y0, "x1": s.bbox.x1, "y1": s.bbox.y1},
+            "scope_path": list(s.scope_path),
+        }
+        for s in item.sources
+    ]
 
 
 def _provenance_fields(item: GroundedRecord[Any]) -> dict[str, Any]:
@@ -630,7 +759,8 @@ def _provenance_fields(item: GroundedRecord[Any]) -> dict[str, Any]:
         "_is_grounded": item.is_grounded,
         "_is_grounded_union": item.is_grounded_union,
         "_unit_ids": list(item.unit_ids),
-        "_supporting_models": [model_id for model_id, votes in item.model_votes.items() if votes],
+        "_supporting_models": list(item.supporting_models),
+        "_model_outputs": [mo.to_dict() for mo in item.model_outputs],
         "_grounding_quotes": list(item.grounding_quotes),
         "_disputed_fields": list(item.disputed_fields),
         "_notes": list(item.notes),
@@ -644,18 +774,16 @@ def _provenance_fields(item: GroundedRecord[Any]) -> dict[str, Any]:
             }
             for r in item.grounding_reasons
         ],
-        "_sources": [
-            {
-                "doc_id": s.doc_id,
-                "unit_id": s.unit_id,
-                "element_id": s.element_id,
-                "page_number": s.page_number,
-                "bbox": {"x0": s.bbox.x0, "y0": s.bbox.y0, "x1": s.bbox.x1, "y1": s.bbox.y1},
-                "scope_path": list(s.scope_path),
-            }
-            for s in item.sources
-        ],
+        "_sources": _sources_dicts(item),
     }
+
+
+def _encode_jsonl_row(row: Mapping[str, Any]) -> bytes:
+    """Encode ``row`` as a strict UTF-8 JSONL line ending in ``\\n``."""
+    try:
+        return (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise RationalizationError(f"JSONL row cannot be serialized as strict UTF-8 JSON: {exc}") from exc
 
 
 def _serialize_jsonl_item(
@@ -675,10 +803,54 @@ def _serialize_jsonl_item(
     elif with_meta:
         row["_status"] = item.status
         row["_doc_id"] = item.doc_id
-    try:
-        return (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise RationalizationError(f"JSONL row cannot be serialized as strict UTF-8 JSON: {exc}") from exc
+    return _encode_jsonl_row(row)
+
+
+def _by_model_jsonl_row(
+    item: GroundedRecord[Any],
+    mo: ModelOutput,
+    vote_idx: int,
+    vote: Mapping[str, Any],
+    *,
+    include_provenance: bool,
+) -> dict[str, Any]:
+    """Assemble one JSONL row dict for a single ``(item, model_id, vote)`` entry."""
+    row: dict[str, Any] = dict(vote)
+    row["_model_id"] = mo.model_id
+    row["_model_family"] = mo.model_family
+    row["_vote_index"] = vote_idx
+    row["_status"] = item.status
+    row["_doc_id"] = item.doc_id
+    row["_is_grounded"] = mo.is_grounded
+    row["_grounding_quotes"] = list(mo.grounding_quotes)
+    row["_element_ids"] = list(mo.element_ids)
+    if include_provenance:
+        row["_source_name"] = item.source_name
+        row["_is_grounded_union"] = item.is_grounded_union
+        row["_unit_ids"] = list(item.unit_ids)
+        row["_disputed_fields"] = list(item.disputed_fields)
+        row["_notes"] = list(item.notes)
+        row["_grounding_reasons"] = [
+            {"reason": r.reason, "model_id": r.model_id, "index": r.index, "key_field": r.key_field, "text": r.text}
+            for r in mo.grounding_reasons
+        ]
+        row["_sources"] = _sources_dicts(item)
+    return row
+
+
+def _encode_by_model_jsonl(
+    items: Sequence[GroundedRecord[Any]],
+    *,
+    include_provenance: bool,
+) -> list[bytes]:
+    """Encode selected items as per-model JSONL lines in item -> provider -> vote order."""
+    encoded: list[bytes] = []
+    for item in items:
+        for mo in item.model_outputs:
+            for vote_idx, vote in enumerate(mo.votes):
+                row = _by_model_jsonl_row(item, mo, vote_idx, vote, include_provenance=include_provenance)
+                encoded.append(_encode_jsonl_row(row))
+    return encoded
 
 
 def _unlink_quietly(path: Path) -> None:
@@ -783,26 +955,104 @@ def _serialize_scalar(value: Any, scalar: ScalarSpec) -> Any:
     return raw
 
 
-def _serialize_scalar_list(items: Sequence[Any], scalar: ScalarSpec) -> list[Any]:
+def _serialize_vote_temporal(raw: Any, scalar: ScalarSpec) -> Any:
+    """Convert a JSON-mode ``date`` or ``datetime`` vote value into a typed Python temporal object."""
+    if scalar.base is date:
+        if isinstance(raw, date) and not isinstance(raw, datetime):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return date.fromisoformat(raw)
+            except ValueError:
+                raise _FieldBoundsError("vote value is not an ISO-8601 date string") from None
+        raise _FieldBoundsError(
+            f"cannot serialize {type(raw).__name__} vote value as Date (custom serializer or non-ISO JSON format)"
+        )
+    if isinstance(raw, datetime):
+        dt_val = raw
+    elif isinstance(raw, str):
+        try:
+            dt_val = datetime.fromisoformat(raw)
+        except ValueError:
+            raise _FieldBoundsError("vote value is not an ISO-8601 datetime string") from None
+    else:
+        raise _FieldBoundsError(
+            f"cannot serialize {type(raw).__name__} vote value as Datetime (custom serializer or non-ISO JSON format)"
+        )
+    if scalar.tz == "aware":
+        if dt_val.tzinfo is None:
+            raise _FieldBoundsError("aware Datetime vote value is missing timezone offset")
+        return dt_val.astimezone(timezone.utc)
+    return dt_val
+
+
+def _serialize_vote_scalar(value: Any, scalar: ScalarSpec) -> Any:
+    """Convert one JSON-mode vote scalar into its deterministic Polars value with bounds and type checks."""
+    if value is None:
+        return None
+    raw = value.value if scalar.enum is not None and isinstance(value, Enum) else value
+    base = scalar.base
+    if base is str:
+        if not isinstance(raw, str):
+            raise _FieldBoundsError(f"cannot serialize {type(raw).__name__} vote value as String")
+        return raw
+    if base is bool:
+        if type(raw) is not bool:
+            raise _FieldBoundsError(f"cannot serialize {type(raw).__name__} vote value as Boolean")
+        return raw
+    if base is int:
+        if type(raw) is not int:
+            raise _FieldBoundsError(f"cannot serialize {type(raw).__name__} vote value as Int64")
+        if not INT64_MIN <= raw <= INT64_MAX:
+            raise _FieldBoundsError(f"int value is outside Int64 range [{INT64_MIN}, {INT64_MAX}]")
+        return raw
+    if base is float:
+        if type(raw) is int:
+            return float(raw)
+        if type(raw) is float:
+            return raw
+        raise _FieldBoundsError(f"cannot serialize {type(raw).__name__} vote value as Float64")
+    if base is Decimal:
+        if isinstance(raw, Decimal):
+            dec = raw
+        elif isinstance(raw, (str, int, float)) and type(raw) is not bool:
+            try:
+                dec = Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                raise _FieldBoundsError("vote value cannot be parsed as Decimal") from None
+        else:
+            raise _FieldBoundsError(f"cannot serialize {type(raw).__name__} vote value as Decimal")
+        return _check_decimal_bounds(dec)
+    if base is date or base is datetime:
+        return _serialize_vote_temporal(raw, scalar)
+    raise RationalizationError(f"unsupported scalar base {base!r}")
+
+
+def _serialize_scalar_list(items: Sequence[Any], scalar: ScalarSpec, *, from_vote: bool = False) -> list[Any]:
     """Serialize a ``scalar_list`` sequence, recording the failing element index only if bounds fail."""
-    if _is_passthrough_scalar(scalar):
+    if not from_vote and _is_passthrough_scalar(scalar):
         return list(items)
+    conv = _serialize_vote_scalar if from_vote else _serialize_scalar
     out: list[Any] = []
     for idx, item in enumerate(items):
         try:
-            out.append(_serialize_scalar(item, scalar))
+            out.append(conv(item, scalar))
         except _FieldBoundsError as err:
             err.add_index(idx)
             raise
     return out
 
 
-def _serialize_model_list(items: Sequence[BaseModel], child_spec: ModelSpec, depth: int) -> list[dict[str, Any]]:
+def _serialize_model_list(
+    items: Sequence[BaseModel | Mapping[str, Any]],
+    child_spec: ModelSpec,
+    depth: int,
+) -> list[dict[str, Any]]:
     """Serialize a ``model_list`` sequence into Polars Struct dicts, recording the index only on error."""
     out: list[dict[str, Any]] = []
     for idx, item in enumerate(items):
         try:
-            out.append(_serialize_model(item, child_spec, depth))
+            out.append(_serialize_source(item, child_spec, depth))
         except _FieldBoundsError as err:
             err.add_index(idx)
             raise
@@ -811,18 +1061,34 @@ def _serialize_model_list(items: Sequence[BaseModel], child_spec: ModelSpec, dep
 
 def _serialize_field(instance: BaseModel, field_spec: FieldSpec, depth: int) -> Any:
     """Serialize one field of ``instance`` for Polars frame construction without eager path formatting."""
+    return _serialize_source_field(instance, field_spec, depth)
+
+
+def _serialize_source_field(
+    source: BaseModel | Mapping[str, Any],
+    field_spec: FieldSpec,
+    depth: int,
+) -> Any:
+    """Serialize one field from either a validated ``BaseModel`` or an attribute-keyed ``model_votes`` dict."""
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{field_spec.name}: nesting is deeper than {MAX_DEPTH} levels")
-    value = getattr(instance, field_spec.name)
+    if isinstance(source, Mapping):
+        from_vote = True
+        value = source.get(field_spec.name)
+    else:
+        from_vote = False
+        value = getattr(source, field_spec.name)
     if value is None:
         return None
     try:
         if field_spec.kind == "scalar" and field_spec.scalar is not None:
+            if from_vote:
+                return _serialize_vote_scalar(value, field_spec.scalar)
             return value if _is_passthrough_scalar(field_spec.scalar) else _serialize_scalar(value, field_spec.scalar)
         if field_spec.kind == "scalar_list" and field_spec.scalar is not None:
-            return _serialize_scalar_list(value, field_spec.scalar)
+            return _serialize_scalar_list(value, field_spec.scalar, from_vote=from_vote)
         if field_spec.kind == "model" and field_spec.child is not None:
-            return _serialize_model(value, field_spec.child, depth + 1)
+            return _serialize_source(value, field_spec.child, depth + 1)
         if field_spec.kind == "model_list" and field_spec.child is not None:
             return _serialize_model_list(value, field_spec.child, depth + 1)
     except _FieldBoundsError as err:
@@ -831,11 +1097,65 @@ def _serialize_field(instance: BaseModel, field_spec: FieldSpec, depth: int) -> 
     raise RationalizationError(f"invalid FieldSpec {field_spec.name!r}")
 
 
-def _serialize_model(instance: BaseModel, spec: ModelSpec, depth: int) -> dict[str, Any]:
-    """Serialize ``instance`` of ``spec`` into a Python Struct dict matching :func:`polars_schema`."""
+def _serialize_source(
+    source: BaseModel | Mapping[str, Any],
+    spec: ModelSpec,
+    depth: int,
+) -> dict[str, Any]:
+    """Serialize ``source`` (``BaseModel`` or JSON-mode vote dict) into a Python Struct dict."""
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
-    return {field_spec.name: _serialize_field(instance, field_spec, depth) for field_spec in spec.fields}
+    return {field_spec.name: _serialize_source_field(source, field_spec, depth) for field_spec in spec.fields}
+
+
+def _serialize_model(instance: BaseModel, spec: ModelSpec, depth: int) -> dict[str, Any]:
+    """Serialize ``instance`` of ``spec`` into a Python Struct dict matching :func:`polars_schema`."""
+    return _serialize_source(instance, spec, depth)
+
+
+def _model_output_dtype(spec: ModelSpec) -> pl.DataType:
+    """Return the deterministic Polars ``List(Struct(...))`` dtype for ``_model_outputs``."""
+    return pl.List(
+        pl.Struct(
+            {
+                "model_id": pl.String(),
+                "model_family": pl.String(),
+                "supported": pl.Boolean(),
+                "is_grounded": pl.Boolean(),
+                "votes": pl.List(_struct_dtype(spec, 1)),
+                "grounding_quotes": pl.List(pl.String()),
+                "element_ids": pl.List(pl.String()),
+            }
+        )
+    )
+
+
+def _serialize_item_model_outputs(item: GroundedRecord[Any], spec: ModelSpec) -> list[dict[str, Any]]:
+    """Serialize ``item.model_outputs`` into Polars-typed Struct dicts with bounds validation."""
+    out: list[dict[str, Any]] = []
+    for mo_idx, mo in enumerate(item.model_outputs):
+        typed_votes: list[dict[str, Any]] = []
+        for vote_idx, vote in enumerate(mo.votes):
+            try:
+                typed_votes.append(_serialize_source(vote, spec, 1))
+            except _FieldBoundsError as err:
+                err.add_index(vote_idx)
+                err.add_field("votes")
+                err.add_index(mo_idx)
+                err.add_field("_model_outputs")
+                raise
+        out.append(
+            {
+                "model_id": mo.model_id,
+                "model_family": mo.model_family,
+                "supported": mo.supported,
+                "is_grounded": mo.is_grounded,
+                "votes": typed_votes,
+                "grounding_quotes": list(mo.grounding_quotes),
+                "element_ids": list(mo.element_ids),
+            }
+        )
+    return out
 
 
 def _serialize_column(records: Sequence[BaseModel], field_spec: FieldSpec) -> list[Any]:
@@ -862,22 +1182,138 @@ def _build_unflattened_columns(records: Sequence[BaseModel], spec: ModelSpec) ->
     return {field_spec.name: _serialize_column(records, field_spec) for field_spec in spec.fields}
 
 
-def _unflattened_dataframe(
+def _append_merged_meta_schema(
+    schema: dict[str, pl.DataType],
     spec: ModelSpec,
-    records: Sequence[BaseModel],
-    statuses: list[str],
-    doc_ids: list[str],
     *,
-    include_disputed: bool,
-) -> pl.DataFrame:
-    """Construct an unflattened Polars ``DataFrame`` directly from columnar field buffers."""
-    schema = polars_schema(spec)
-    columns = _build_unflattened_columns(records, spec)
-    if include_disputed:
+    with_status_doc: bool,
+    with_model_outputs: bool,
+) -> None:
+    """Append optional ``_status``, ``_doc_id``, ``_supporting_models``, and ``_model_outputs`` dtypes."""
+    if with_status_doc:
         schema["_status"] = pl.String()
         schema["_doc_id"] = pl.String()
-        columns["_status"] = statuses
-        columns["_doc_id"] = doc_ids
+    if with_model_outputs:
+        schema["_supporting_models"] = pl.List(pl.String())
+        schema["_model_outputs"] = _model_output_dtype(spec)
+
+
+def _build_merged_dataframe(
+    spec: ModelSpec,
+    items: Sequence[GroundedRecord[Any]],
+    parts: tuple[str, ...],
+    *,
+    with_status_doc: bool,
+    with_model_outputs: bool,
+) -> pl.DataFrame:
+    """Build an unflattened or flattened merged-record ``DataFrame`` with optional metadata columns."""
+    records = [item.record for item in items if item.record is not None]
+    if not parts:
+        schema = polars_schema(spec)
+        _append_merged_meta_schema(schema, spec, with_status_doc=with_status_doc, with_model_outputs=with_model_outputs)
+        columns = _build_unflattened_columns(records, spec)
+        if with_status_doc:
+            columns["_status"] = [item.status for item in items]
+            columns["_doc_id"] = [item.doc_id for item in items]
+        if with_model_outputs:
+            columns["_supporting_models"] = [list(item.supporting_models) for item in items]
+            columns["_model_outputs"] = [_serialize_item_model_outputs(item, spec) for item in items]
+        return pl.DataFrame(columns, schema=schema)
+
+    flat_schema = _flat_schema_for_level(spec, parts, "", 1)
+    _append_merged_meta_schema(
+        flat_schema, spec, with_status_doc=with_status_doc, with_model_outputs=with_model_outputs
+    )
+    flat_columns: dict[str, list[Any]] = {name: [] for name in flat_schema}
+    for item in items:
+        emitted = _append_flat_level(item.record, spec, parts, "", 1, flat_columns)
+        if with_status_doc:
+            flat_columns["_status"].extend([item.status] * emitted)
+            flat_columns["_doc_id"].extend([item.doc_id] * emitted)
+        if with_model_outputs:
+            flat_columns["_supporting_models"].extend([list(item.supporting_models)] * emitted)
+            flat_columns["_model_outputs"].extend([_serialize_item_model_outputs(item, spec)] * emitted)
+    return pl.DataFrame(flat_columns, schema=flat_schema)
+
+
+def _by_model_meta_schema(spec: ModelSpec, *, include_model_outputs: bool) -> dict[str, pl.DataType]:
+    """Return the per-model audit metadata column schema appended when ``by_model=True``."""
+    meta: dict[str, pl.DataType] = {
+        "_model_id": pl.String(),
+        "_model_family": pl.String(),
+        "_vote_index": pl.Int64(),
+        "_status": pl.String(),
+        "_doc_id": pl.String(),
+        "_is_grounded": pl.Boolean(),
+        "_grounding_quotes": pl.List(pl.String()),
+        "_element_ids": pl.List(pl.String()),
+    }
+    if include_model_outputs:
+        meta["_supporting_models"] = pl.List(pl.String())
+        meta["_model_outputs"] = _model_output_dtype(spec)
+    return meta
+
+
+def _extend_by_model_meta(
+    columns: dict[str, list[Any]],
+    item: GroundedRecord[Any],
+    mo: ModelOutput,
+    vote_idx: int,
+    emitted: int,
+    *,
+    supporting: list[str] | None,
+    serialized_mo: list[dict[str, Any]] | None,
+) -> None:
+    """Append ``emitted`` copies of per-model audit metadata columns into ``columns``."""
+    columns["_model_id"].extend([mo.model_id] * emitted)
+    columns["_model_family"].extend([mo.model_family] * emitted)
+    columns["_vote_index"].extend([vote_idx] * emitted)
+    columns["_status"].extend([item.status] * emitted)
+    columns["_doc_id"].extend([item.doc_id] * emitted)
+    columns["_is_grounded"].extend([mo.is_grounded] * emitted)
+    columns["_grounding_quotes"].extend([list(mo.grounding_quotes)] * emitted)
+    columns["_element_ids"].extend([list(mo.element_ids)] * emitted)
+    if supporting is not None and serialized_mo is not None:
+        columns["_supporting_models"].extend([supporting] * emitted)
+        columns["_model_outputs"].extend([serialized_mo] * emitted)
+
+
+def _build_by_model_dataframe(
+    spec: ModelSpec,
+    items: Sequence[GroundedRecord[Any]],
+    parts: tuple[str, ...],
+    *,
+    include_model_outputs: bool,
+) -> pl.DataFrame:
+    """Build a flat per-model ``DataFrame`` (one or more rows per ``(item, supporting model_id, vote)``)."""
+    base_schema = _flat_schema_for_level(spec, parts, "", 1) if parts else polars_schema(spec)
+    schema = {**base_schema, **_by_model_meta_schema(spec, include_model_outputs=include_model_outputs)}
+    columns: dict[str, list[Any]] = {name: [] for name in schema}
+    for item in items:
+        supporting = list(item.supporting_models) if include_model_outputs else None
+        serialized_mo = _serialize_item_model_outputs(item, spec) if include_model_outputs else None
+        for mo in item.model_outputs:
+            for vote_idx, vote in enumerate(mo.votes):
+                try:
+                    if parts:
+                        emitted = _append_flat_level(vote, spec, parts, "", 1, columns)
+                    else:
+                        for field_spec in spec.fields:
+                            columns[field_spec.name].append(_serialize_source_field(vote, field_spec, 1))
+                        emitted = 1
+                except _FieldBoundsError as err:
+                    err.add_index(vote_idx)
+                    err.add_field(f"model[{mo.model_id}]")
+                    raise
+                _extend_by_model_meta(
+                    columns,
+                    item,
+                    mo,
+                    vote_idx,
+                    emitted,
+                    supporting=supporting,
+                    serialized_mo=serialized_mo,
+                )
     return pl.DataFrame(columns, schema=schema)
 
 
@@ -942,7 +1378,7 @@ def _flat_schema_for_level(spec: ModelSpec, parts: tuple[str, ...], prefix: str,
 
 
 def _append_child_model_fields(
-    elem: BaseModel,
+    elem: BaseModel | Mapping[str, Any],
     child_spec: ModelSpec,
     col_prefix: str,
     depth: int,
@@ -950,11 +1386,11 @@ def _append_child_model_fields(
 ) -> None:
     """Serialize and append each field of one terminal child model ``elem`` into ``columns``."""
     for child_field in child_spec.fields:
-        columns[f"{col_prefix}.{child_field.name}"].append(_serialize_field(elem, child_field, depth))
+        columns[f"{col_prefix}.{child_field.name}"].append(_serialize_source_field(elem, child_field, depth))
 
 
 def _append_flat_terminal_models(
-    raw_items: Sequence[BaseModel],
+    raw_items: Sequence[BaseModel | Mapping[str, Any]],
     child_spec: ModelSpec,
     target_name: str,
     col_prefix: str,
@@ -979,7 +1415,7 @@ def _append_flat_terminal_models(
 
 
 def _append_flat_intermediate(
-    raw_items: Sequence[BaseModel],
+    raw_items: Sequence[BaseModel | Mapping[str, Any]],
     child_spec: ModelSpec,
     target_name: str,
     rest: tuple[str, ...],
@@ -1002,15 +1438,23 @@ def _append_flat_intermediate(
 
 
 def _append_flat_target(
-    instance: BaseModel | None,
+    source: BaseModel | Mapping[str, Any] | None,
     target_spec: FieldSpec,
     rest: tuple[str, ...],
     col_prefix: str,
     depth: int,
     columns: dict[str, list[Any]],
 ) -> int:
-    """Explode ``target_spec`` on ``instance`` into ``columns`` and return the number of emitted rows."""
-    raw_items: Sequence[Any] = () if instance is None else (getattr(instance, target_spec.name) or ())
+    """Explode ``target_spec`` on ``source`` into ``columns`` and return the number of emitted rows."""
+    if source is None:
+        from_vote = False
+        raw_items: Sequence[Any] = ()
+    elif isinstance(source, Mapping):
+        from_vote = True
+        raw_items = source.get(target_spec.name) or ()
+    else:
+        from_vote = False
+        raw_items = getattr(source, target_spec.name) or ()
     if rest:
         if target_spec.child is None:
             raise RationalizationError(f"missing child spec on {col_prefix}")
@@ -1028,7 +1472,7 @@ def _append_flat_target(
             columns[col_prefix].append(None)
             return 1
         try:
-            serialized = _serialize_scalar_list(raw_items, target_spec.scalar)
+            serialized = _serialize_scalar_list(raw_items, target_spec.scalar, from_vote=from_vote)
         except _FieldBoundsError as err:
             err.add_field(target_spec.name)
             raise
@@ -1047,14 +1491,14 @@ def _append_flat_target(
 
 
 def _append_flat_level(
-    instance: BaseModel | None,
+    source: BaseModel | Mapping[str, Any] | None,
     spec: ModelSpec,
     parts: tuple[str, ...],
     prefix: str,
     depth: int,
     columns: dict[str, list[Any]],
 ) -> int:
-    """Left-outer explode ``instance`` along ``parts`` into ``columns``, skipping sibling list fields."""
+    """Left-outer explode ``source`` along ``parts`` into ``columns``, skipping sibling list fields."""
     if depth > MAX_DEPTH:
         raise RationalizationError(f"{prefix or spec.model.__name__}: nesting is deeper than {MAX_DEPTH} levels")
     target = parts[0]
@@ -1064,32 +1508,12 @@ def _append_flat_level(
     kept: list[tuple[str, Any]] = []
     for field_spec in spec.fields:
         if field_spec.name != target and field_spec.kind not in ("scalar_list", "model_list"):
-            val = None if instance is None else _serialize_field(instance, field_spec, depth)
+            val = None if source is None else _serialize_source_field(source, field_spec, depth)
             kept.append((f"{prefix}{field_spec.name}", val))
-    count = _append_flat_target(instance, target_spec, parts[1:], f"{prefix}{target}", depth, columns)
+    count = _append_flat_target(source, target_spec, parts[1:], f"{prefix}{target}", depth, columns)
     for col_name, val in kept:
         if count == 1:
             columns[col_name].append(val)
         else:
             columns[col_name].extend([val] * count)
     return count
-
-
-def _build_flattened_columns(
-    records: Sequence[BaseModel],
-    statuses: Sequence[str],
-    doc_ids: Sequence[str],
-    spec: ModelSpec,
-    parts: tuple[str, ...],
-    flat_schema: Mapping[str, pl.DataType],
-    *,
-    include_disputed: bool,
-) -> dict[str, list[Any]]:
-    """Build columnar ``dict[str, list[Any]]`` buffers directly for ``flatten=...`` :meth:`to_dataframe`."""
-    columns: dict[str, list[Any]] = {name: [] for name in flat_schema}
-    for idx, record in enumerate(records):
-        emitted = _append_flat_level(record, spec, parts, "", 1, columns)
-        if include_disputed:
-            columns["_status"].extend([statuses[idx]] * emitted)
-            columns["_doc_id"].extend([doc_ids[idx]] * emitted)
-    return columns

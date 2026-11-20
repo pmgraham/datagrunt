@@ -36,6 +36,7 @@ LAZY_CLASSES = MappingProxyType(
         "RationalizeTelemetry": "datagrunt.rationalization.result",
         "GroundedRecord": "datagrunt.rationalization.folding",
         "ElementSource": "datagrunt.rationalization.folding",
+        "ModelOutput": "datagrunt.rationalization.folding",
         "QuarantinedItem": "datagrunt.rationalization.consensus",
         "FailedUnit": "datagrunt.rationalization.runner",
         "TelemetryEvent": "datagrunt.rationalization.runner",

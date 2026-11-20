@@ -47,6 +47,7 @@ records, child items and cited element ids. The module imports only the standard
 model and its sibling modules: nothing from ``datagrunt.core``, and no import inside a function (invariant 9).
 """
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -110,6 +111,7 @@ __all__ = [
     "ElementSource",
     "FoldingResult",
     "GroundedRecord",
+    "ModelOutput",
     "RecordStatus",
     "fold_documents",
 ]
@@ -168,6 +170,111 @@ class ElementSource:
             raise TypeError(f"scope_path must be a tuple of str, got {type(self.scope_path).__name__}")
         for entry in self.scope_path:
             _check_text("scope_path entry", entry)
+
+
+def _freeze_vote_mappings(name: str, value: object) -> tuple[Mapping[str, Any], ...]:
+    """Validate ``value`` as a tuple of ``str``-keyed mappings and wrap each in ``MappingProxyType``."""
+    checked = _check_votes(name, value)
+    frozen: list[Mapping[str, Any]] = []
+    for idx, vote in enumerate(checked):
+        if not all(isinstance(key, str) for key in vote):
+            raise TypeError(f"{name}[{idx}] keys must be str")
+        frozen.append(vote if isinstance(vote, MappingProxyType) else MappingProxyType(dict(vote)))
+    return tuple(frozen)
+
+
+@dataclass(frozen=True, slots=True)
+class ModelOutput:
+    """One requested model's rationalization votes and grounding audit state for a :class:`GroundedRecord`.
+
+    Every field holding document or model-chosen text is omitted from ``repr`` (invariant 7).
+
+    Args:
+        model_id: The provider's canonical model identifier.
+        model_family: The model family (e.g. ``"google"``, ``"anthropic"``, ``"openai"``, ``"unknown"``).
+        supported: ``True`` iff this model contributed at least one validated vote for the entity.
+        is_grounded: ``True`` iff this model incurred zero :class:`GroundingReason` failures on the entity.
+        votes: Validated JSON-mode record dicts returned by this model across contributing units.
+        grounding_quotes: Grounding quotes cited by this model across contributing units.
+        element_ids: Source element ids cited by this model across contributing units.
+        grounding_reasons: Grounding failures attributed specifically to ``model_id``, or ``()``.
+    """
+
+    model_id: str
+    model_family: str
+    supported: bool
+    is_grounded: bool
+    votes: tuple[Mapping[str, Any], ...] = field(repr=False)
+    grounding_quotes: tuple[str, ...] = field(repr=False)
+    element_ids: tuple[str, ...] = field(repr=False)
+    grounding_reasons: tuple[GroundingReason, ...] = field(default=(), repr=False)
+
+    def __post_init__(self) -> None:
+        _check_text("model_id", self.model_id)
+        _check_family("model_family", self.model_family)
+        if type(self.supported) is not bool:
+            raise TypeError(f"supported must be a bool, got {type(self.supported).__name__}")
+        if type(self.is_grounded) is not bool:
+            raise TypeError(f"is_grounded must be a bool, got {type(self.is_grounded).__name__}")
+        frozen_votes = _freeze_vote_mappings("votes", self.votes)
+        object.__setattr__(self, "votes", frozen_votes)
+        _check_strings("grounding_quotes", self.grounding_quotes)
+        _check_strings("element_ids", self.element_ids)
+        _check_tuple_of("grounding_reasons", self.grounding_reasons, GroundingReason)
+        if self.supported != bool(frozen_votes):
+            raise ValueError("supported must equal bool(votes)")
+        if self.is_grounded != (self.supported and not self.grounding_reasons):
+            raise ValueError("is_grounded must equal (supported and not grounding_reasons)")
+        if any(reason.model_id != self.model_id for reason in self.grounding_reasons):
+            raise ValueError("every GroundingReason in ModelOutput must match model_id")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a pure JSON-serializable defensive deep copy of this model's output and grounding state."""
+        return {
+            "model_id": self.model_id,
+            "model_family": self.model_family,
+            "supported": self.supported,
+            "is_grounded": self.is_grounded,
+            "votes": [{k: copy.deepcopy(v) for k, v in vote.items()} for vote in self.votes],
+            "grounding_quotes": list(self.grounding_quotes),
+            "element_ids": list(self.element_ids),
+            "grounding_reasons": [
+                {
+                    "reason": r.reason,
+                    "index": r.index,
+                    "key_field": r.key_field,
+                    "text": r.text,
+                }
+                for r in self.grounding_reasons
+            ],
+        }
+
+    @classmethod
+    def _trusted(
+        cls,
+        *,
+        model_id: str,
+        model_family: str,
+        votes: tuple[Mapping[str, Any], ...],
+        grounding_quotes: tuple[str, ...],
+        element_ids: tuple[str, ...],
+        grounding_reasons: tuple[GroundingReason, ...],
+    ) -> "ModelOutput":
+        """Construct an internal :class:`ModelOutput` from verified :class:`GroundedRecord` mappings."""
+        if not model_id or not isinstance(votes, tuple):
+            raise ValueError("ModelOutput._trusted requires non-empty model_id and tuple votes")
+        frozen = tuple(v if isinstance(v, MappingProxyType) else MappingProxyType(dict(v)) for v in votes)
+        supported = bool(frozen)
+        self = object.__new__(cls)
+        object.__setattr__(self, "model_id", model_id)
+        object.__setattr__(self, "model_family", model_family)
+        object.__setattr__(self, "supported", supported)
+        object.__setattr__(self, "is_grounded", supported and not grounding_reasons)
+        object.__setattr__(self, "votes", frozen)
+        object.__setattr__(self, "grounding_quotes", grounding_quotes)
+        object.__setattr__(self, "element_ids", element_ids)
+        object.__setattr__(self, "grounding_reasons", grounding_reasons)
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,6 +389,29 @@ class GroundedRecord(Generic[T]):
             and not self.grounding_reasons
             and not self.disputed_fields
             and not self.notes
+        )
+
+    @property
+    def supporting_models(self) -> tuple[str, ...]:
+        """Model ids in provider order that contributed at least one validated vote for this entity."""
+        return tuple(model_id for model_id, votes in self.model_votes.items() if votes)
+
+    @property
+    def model_outputs(self) -> tuple[ModelOutput, ...]:
+        """Per-model :class:`ModelOutput` entries in provider order across all requested models."""
+        reasons_by_model: dict[str, list[GroundingReason]] = {}
+        for reason in self.grounding_reasons:
+            reasons_by_model.setdefault(reason.model_id, []).append(reason)
+        return tuple(
+            ModelOutput._trusted(
+                model_id=model_id,
+                model_family=self.families[model_id],
+                votes=votes,
+                grounding_quotes=self.quotes_by_model[model_id],
+                element_ids=self.element_ids_by_model[model_id],
+                grounding_reasons=tuple(reasons_by_model.get(model_id, ())),
+            )
+            for model_id, votes in self.model_votes.items()
         )
 
     @classmethod
