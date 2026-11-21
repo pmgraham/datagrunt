@@ -15,8 +15,109 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    # Fail-closed path filter (#504): skip heavy Rust/pytest/wheel CI only when
+    # every changed file is a non-packaged repo doc/meta file. README.md,
+    # LICENSE, THIRD_PARTY_NOTICES.txt, Auto Document Updater scripts, workflows,
+    # and any new/unknown paths always run full CI.
+    name: detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.filter.outputs.run_ci }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          SKIP_EXACT = frozenset(
+              {
+                  "CLAUDE.md",
+                  "GEMINI.md",
+                  "CHANGELOG.md",
+                  "CONTRIBUTING.md",
+                  "CODE_OF_CONDUCT.md",
+                  "SECURITY.md",
+                  ".gitignore",
+                  ".github/CODEOWNERS",
+                  ".github/PULL_REQUEST_TEMPLATE.md",
+              }
+          )
+          SKIP_PREFIXES = (
+              ".github/ISSUE_TEMPLATE/",
+              ".github/PULL_REQUEST_TEMPLATE/",
+              "docs/",
+          )
+
+          def emit(run_ci: bool, reason: str) -> None:
+              val = "true" if run_ci else "false"
+              print(f"run_ci={val} ({reason})")
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+                  fh.write(f"run_ci={val}\n")
+
+          def is_skip_only(path: str) -> bool:
+              return path in SKIP_EXACT or path.startswith(SKIP_PREFIXES)
+
+          event = os.environ.get("EVENT_NAME", "")
+          if event == "workflow_dispatch":
+              emit(True, "manual workflow_dispatch always runs full CI")
+              sys.exit(0)
+
+          if event == "pull_request":
+              # actions/checkout checks out refs/pull/N/merge whose parents are
+              # base (HEAD^1) and PR head (HEAD^2). Fail closed if not a merge.
+              check = subprocess.run(["git", "rev-parse", "--verify", "-q", "HEAD^2"], capture_output=True)
+              if check.returncode != 0:
+                  emit(True, "HEAD is not a PR merge commit; failing closed")
+                  sys.exit(0)
+              diff_cmd = ["git", "diff", "--name-only", "-z", "HEAD^1", "HEAD"]
+          elif event == "push":
+              before = os.environ.get("PUSH_BEFORE", "")
+              head = os.environ.get("HEAD_SHA", "")
+              if not before or set(before) == {"0"}:
+                  emit(True, "no prior push SHA; failing closed")
+                  sys.exit(0)
+              check = subprocess.run(["git", "cat-file", "-e", f"{before}^{{commit}}"], capture_output=True)
+              if check.returncode != 0:
+                  emit(True, "prior push SHA unavailable; failing closed")
+                  sys.exit(0)
+              diff_cmd = ["git", "diff", "--name-only", "-z", before, head]
+          else:
+              emit(True, f"unhandled event {event!r}; failing closed")
+              sys.exit(0)
+
+          res = subprocess.run(diff_cmd, capture_output=True)
+          if res.returncode != 0:
+              emit(True, f"git diff exited {res.returncode}; failing closed")
+              sys.exit(0)
+
+          paths = [p.decode("utf-8", errors="surrogateescape") for p in res.stdout.split(b"\0") if p]
+          if not paths:
+              emit(True, "no changed files detected; failing closed")
+              sys.exit(0)
+
+          triggering = [p for p in paths if not is_skip_only(p)]
+          if triggering:
+              emit(True, f"CI-relevant files changed: {', '.join(triggering[:10])}")
+          else:
+              emit(False, f"only non-CI docs/meta files changed: {', '.join(paths)}")
+          PY
+
   test:
     name: cargo + pytest (both backends)
+    needs: [changes]
+    if: needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     env:
       # PEP 669 low-overhead line monitoring on Python 3.12+.
@@ -133,7 +234,8 @@ jobs:
     # Skipped on post-merge push to main: ruleset requires PRs for main, where
     # this matrix already ran.
     name: python compat
-    if: github.event_name != 'push'
+    needs: [changes]
+    if: github.event_name != 'push' && needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -213,12 +315,14 @@ jobs:
     # sdist as required checks, and Publish to PyPI builds release artifacts
     # after Bump Version completes.
     name: wheel matrix
-    if: github.event_name != 'push'
+    needs: [changes]
+    if: github.event_name != 'push' && needs.changes.outputs.run_ci == 'true'
     uses: ./.github/workflows/build.yml
 
   audit:
     name: dependency audit (advisory)
-    if: github.event_name != 'push'
+    needs: [changes]
+    if: github.event_name != 'push' && needs.changes.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     # Advisory, NOT blocking: a newly published advisory in a transitive
     # dependency (duckdb, polars, pyarrow, pypdfium2, …) must not break CI or the
@@ -265,3 +369,40 @@ jobs:
           uv venv --clear
           uv pip install --reinstall-package datagrunt -e . pip-audit pip
           .venv/bin/pip-audit
+
+  ci-gate:
+    # Single always-run status check for branch rulesets (#504). Passes
+    # immediately when `changes` skips heavy jobs for non-packaged docs/meta
+    # edits; otherwise requires `test` and (on non-push) `build` to succeed.
+    name: CI gate
+    if: always()
+    needs: [changes, test, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify required CI jobs
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RUN_CI: ${{ needs.changes.outputs.run_ci }}
+          TEST_RESULT: ${{ needs.test.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+          echo "event=$EVENT_NAME changes=$CHANGES_RESULT run_ci=$RUN_CI test=$TEST_RESULT build=$BUILD_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::detect changed paths job did not succeed ($CHANGES_RESULT)"
+            exit 1
+          fi
+          if [ "$RUN_CI" != "true" ]; then
+            echo "Heavy CI jobs skipped for non-code / non-README docs-only change."
+            exit 0
+          fi
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "::error::cargo + pytest (both backends) did not succeed ($TEST_RESULT)"
+            exit 1
+          fi
+          if [ "$EVENT_NAME" != "push" ] && [ "$BUILD_RESULT" != "success" ]; then
+            echo "::error::wheel matrix did not succeed ($BUILD_RESULT)"
+            exit 1
+          fi
+          echo "All required CI jobs succeeded."
