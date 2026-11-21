@@ -294,6 +294,37 @@ def test_auto_publish_site_fetches_full_history_and_verifies_live_deploy() -> No
     assert "--pyproject datagrunt/pyproject.toml" in verify_cmd
 
 
+def test_auto_publish_site_extracts_version_once_and_passes_via_env() -> None:
+    wf = _load_workflow("auto-publish-site.yml")
+    steps = _job_steps(wf, "update-docs")
+
+    extract_indices = [idx for idx, step in enumerate(steps) if "current_version" in str(step.get("run", ""))]
+    assert len(extract_indices) == 1, "current_version must be extracted in exactly one step"
+    extract_idx = extract_indices[0]
+    extract_step = steps[extract_idx]
+    step_id = extract_step.get("id")
+    assert step_id == "meta"
+    extract_run = str(extract_step.get("run", ""))
+    assert 'echo "version=$VERSION" >> "$GITHUB_OUTPUT"' in extract_run
+
+    expected_expr = f"${{{{ steps.{step_id}.outputs.version }}}}"
+    consumer_names = (
+        "Check whether this version is already posted",
+        "Run Antigravity Workflow",
+        "Commit and Push Docs Update",
+    )
+    for name in consumer_names:
+        matching = [(idx, s) for idx, s in enumerate(steps) if s.get("name") == name]
+        assert len(matching) == 1, f"Expected exactly one step named {name!r}"
+        consumer_idx, consumer = matching[0]
+        assert consumer_idx > extract_idx, f"{name!r} must run after version extraction"
+        assert consumer.get("env", {}).get("VERSION") == expected_expr
+        run_cmd = str(consumer.get("run", ""))
+        assert "current_version" not in run_cmd
+        assert expected_expr not in run_cmd, f"{name!r} must read $VERSION from env, not inline expression"
+        assert "$VERSION" in run_cmd
+
+
 def test_verify_site_deploy_resolves_post_url_and_validates_boundaries(tmp_path: Path) -> None:
     mod = _load_verify_site_deploy_module()
 

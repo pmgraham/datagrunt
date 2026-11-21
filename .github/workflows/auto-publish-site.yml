@@ -73,6 +73,16 @@ jobs:
           path: datagrunt-site
           fetch-depth: 0
 
+      - name: Extract version
+        id: meta
+        run: |
+          VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract current_version from datagrunt/pyproject.toml"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       # A re-trigger for an already-documented version (a late-approved stale
       # publish, or the loser of a race) has nothing real to do — the AI
       # generator is content-idempotent but re-stamps the post date, which is
@@ -83,8 +93,9 @@ jobs:
       # its file in datagrunt-site first (or let a new version supersede it).
       - name: Check whether this version is already posted
         id: postcheck
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
           V_SLUG=$(echo "$VERSION" | tr . -)
           if find datagrunt-site/content/blog -type f -name "datagrunt-${V_SLUG}-*.md" -print -quit | grep -q .; then
             echo "Release post for $VERSION already exists; skipping regeneration."
@@ -116,12 +127,12 @@ jobs:
         if: steps.postcheck.outputs.exists != 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          VERSION: ${{ steps.meta.outputs.version }}
         # Diff against the previous release tag so the post covers the whole
         # release, not just the commit before HEAD. Tags for the version being
         # released are excluded so a backfill run (HEAD already tagged) still
         # finds the prior release; with no prior tag, fall back to HEAD~1.
         run: |
-          VERSION=$(grep -m1 '^current_version = ' datagrunt/pyproject.toml | cut -d'"' -f2)
           PREV_TAG=$(git -C datagrunt describe --tags --abbrev=0 \
             --exclude="$VERSION" --exclude="v$VERSION" HEAD 2>/dev/null || echo "HEAD~1")
           echo "Documenting version $VERSION (diff base: $PREV_TAG)"
@@ -130,10 +141,9 @@ jobs:
       - name: Commit and Push Docs Update
         if: steps.postcheck.outputs.exists != 'true'
         working-directory: datagrunt-site
-        # Read the version from the datagrunt checkout — this step runs inside
-        # datagrunt-site, where `git log` would return the site's own history.
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          VERSION=$(grep -m1 '^current_version = ' "$GITHUB_WORKSPACE/datagrunt/pyproject.toml" | cut -d'"' -f2)
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add content/
