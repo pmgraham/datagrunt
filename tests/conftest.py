@@ -106,6 +106,24 @@ def sample_xlsx(tmp_path):
 
 
 @pytest.fixture
+def preamble_xlsx(tmp_path):
+    """Create a workbook with 3 preamble rows, headers on row index 3, and 3 data rows."""
+    import xlsxwriter
+
+    path = tmp_path / "preamble.xlsx"
+    with xlsxwriter.Workbook(str(path)) as wb:
+        ws = wb.add_worksheet("Report")
+        ws.write_row(0, 0, ["Quarterly Report"])
+        ws.write_row(1, 0, ["Generated: 2026-01-01"])
+        ws.write_row(2, 0, [])
+        ws.write_row(3, 0, ["name", "age", "city"])
+        ws.write_row(4, 0, ["Alice", 30, "New York"])
+        ws.write_row(5, 0, ["Bob", 25, "Boston"])
+        ws.write_row(6, 0, ["Cara", 40, "Chicago"])
+    return str(path)
+
+
+@pytest.fixture
 def empty_xlsx(tmp_path):
     """Create a 0-byte .xlsx file."""
     path = tmp_path / "empty.xlsx"

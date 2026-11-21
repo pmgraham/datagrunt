@@ -1,5 +1,7 @@
 """Tests for ExcelReaderEngine."""
 
+import warnings
+
 import polars as pl
 import pyarrow as pa
 import pytest
@@ -72,7 +74,10 @@ def test_db_table_is_sheet_independent(sample_xlsx):
 
 
 def test_read_options_per_call_n_rows(sample_xlsx):
-    df = ExcelReaderEngine(sample_xlsx).to_dataframe(read_options={"n_rows": 1})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        df = ExcelReaderEngine(sample_xlsx).to_dataframe(read_options={"n_rows": 1})
+    assert caught == []
     assert df.height == 1
 
 
@@ -83,7 +88,10 @@ def test_read_options_has_header_false(sample_xlsx):
 
 
 def test_read_options_constructor_default(sample_xlsx):
-    df = ExcelReaderEngine(sample_xlsx, read_options={"n_rows": 1}).to_dataframe()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        df = ExcelReaderEngine(sample_xlsx, read_options={"n_rows": 1}).to_dataframe()
+    assert caught == []
     assert df.height == 1
 
 
@@ -93,10 +101,25 @@ def test_reserved_read_option_raises(sample_xlsx):
 
 
 def test_per_call_read_option_overrides_constructor(sample_xlsx):
-    """A per-call read_options dict wins over the constructor default."""
-    engine = ExcelReaderEngine(sample_xlsx, read_options={"n_rows": 5})
-    df = engine.to_dataframe(read_options={"n_rows": 1})
+    """A per-call read_options dict wins over the constructor default without warnings."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        engine = ExcelReaderEngine(sample_xlsx, read_options={"n_rows": 5})
+        df = engine.to_dataframe(read_options={"n_rows": 1})
+    assert caught == []
     assert df.height == 1
+
+
+def test_constructor_and_per_call_read_options_merge_without_warnings(preamble_xlsx):
+    """Constructor read_options dict merges cleanly with per-call top-level Polars options."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        engine = ExcelReaderEngine(preamble_xlsx, read_options={"header_row": 3})
+        df = engine.to_dataframe(columns=["name", "city"])
+    assert caught == []
+    assert df.columns == ["name", "city"]
+    assert df.height == 3
+    assert df["name"].to_list() == ["Alice", "Bob", "Cara"]
 
 
 def test_close_is_idempotent(sample_xlsx):

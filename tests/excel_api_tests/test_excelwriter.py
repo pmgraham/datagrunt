@@ -1,4 +1,5 @@
 import os
+import warnings
 
 import polars as pl
 import pytest
@@ -59,8 +60,55 @@ def test_conflicting_args_raise(sample_xlsx, tmp_path):
 
 def test_read_options_passthrough(sample_xlsx, tmp_path):
     out = str(tmp_path / "o.csv")
-    ExcelWriter(sample_xlsx).write_csv(out, read_options={"n_rows": 1})
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        ExcelWriter(sample_xlsx).write_csv(out, read_options={"n_rows": 1})
+    assert caught == []
     assert pl.read_csv(out).height == 1
+
+
+def test_writer_per_call_read_options_no_deprecation_warning(preamble_xlsx, tmp_path):
+    """Per-call read_options dict works on write_parquet and write_csv with zero DeprecationWarnings."""
+    pq_out = str(tmp_path / "preamble.parquet")
+    csv_out = str(tmp_path / "preamble.csv")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        writer = ExcelWriter(preamble_xlsx)
+        writer.write_parquet(pq_out, read_options={"header_row": 3, "n_rows": 2})
+        writer.write_csv(csv_out, read_options={"header_row": 3, "n_rows": 2})
+
+    assert caught == []
+    pq_df = pl.read_parquet(pq_out)
+    assert pq_df.columns == ["name", "age", "city"]
+    assert pq_df.height == 2
+    assert pq_df["name"].to_list() == ["Alice", "Bob"]
+
+    csv_df = pl.read_csv(csv_out)
+    assert csv_df.columns == ["name", "age", "city"]
+    assert csv_df.height == 2
+    assert csv_df["name"].to_list() == ["Alice", "Bob"]
+
+
+def test_writer_constructor_read_options_and_merge_no_deprecation_warning(preamble_xlsx, tmp_path):
+    """Constructor read_options and per-call option merging emit zero DeprecationWarnings."""
+    pq_out = str(tmp_path / "ctor.parquet")
+    csv_out = str(tmp_path / "merged.csv")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        writer = ExcelWriter(preamble_xlsx, read_options={"header_row": 3})
+        writer.write_parquet(pq_out)
+        writer.write_csv(csv_out, columns=["name", "city"])
+
+    assert caught == []
+    pq_df = pl.read_parquet(pq_out)
+    assert pq_df.columns == ["name", "age", "city"]
+    assert pq_df.height == 3
+
+    csv_df = pl.read_csv(csv_out)
+    assert csv_df.columns == ["name", "city"]
+    assert csv_df.height == 3
 
 
 def test_empty_source_writes_empty_file(empty_xlsx, tmp_path):
