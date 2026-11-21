@@ -22,6 +22,7 @@ from pathlib import Path
 from datagrunt.pdf.codec import document_to_json
 from datagrunt.pdf.elements import PDFDocument
 
+CORPUS_MANIFEST = "corpus_manifest.json"
 MANIFEST = "manifest.json"
 DOCUMENT_JSON = "json/document.json"
 ELEMENTS_JSONL = "json/elements.jsonl"
@@ -41,6 +42,23 @@ def as_version_1(data: dict) -> dict:
 def version_1_bytes(document: PDFDocument) -> bytes:
     """``document``'s JSON as datagrunt 5.2.2's ``document_to_json_bytes`` wrote it."""
     return _codec_bytes(as_version_1(document_to_json(document)))
+
+
+def as_corpus_5_2(out: Path, *, downgrade_bundles: bool = False) -> None:
+    """Rewrite the corpus manifest at ``out`` (format 5.3) in place as datagrunt 5.2 to 5.4.1 wrote it (format 5.2).
+
+    Each entry loses ``image_only_pages`` and ``corpus_format_version`` becomes
+    ``"5.2"``. With ``downgrade_bundles=True``, every bundle under ``out`` is
+    also rewritten to format 5.0 (as datagrunt 5.2 wrote it).
+    """
+    path = out / CORPUS_MANIFEST
+    manifest = json.loads(path.read_bytes())
+    manifest["corpus_format_version"] = "5.2"
+    for entry in manifest["entries"]:
+        del entry["image_only_pages"]
+        if downgrade_bundles:
+            as_bundle_5_0(out / entry["bundle_relpath"])
+    path.write_bytes(json.dumps(manifest, ensure_ascii=True, allow_nan=False, indent=2).encode("ascii"))
 
 
 def as_bundle_5_0(out: Path) -> None:

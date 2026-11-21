@@ -17,12 +17,13 @@ import sys
 import threading
 import uuid
 import warnings
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
+from types import MappingProxyType
 from typing import IO, Final, NamedTuple, TypeAlias, TypeVar, cast
 
 import datagrunt
@@ -40,6 +41,7 @@ from datagrunt.pdf._bundle_load import (
     _Manifest,
     _opened,
     _page_markdown,
+    _page_numbers,
     _read_fd,
     _read_manifest,
     _regular,
@@ -111,7 +113,10 @@ __all__ = [
     "load_corpus_documents",
 ]
 
-CORPUS_FORMAT_VERSION: Final[str] = "5.2"
+# The corpus format written: "5.3" (#474) adds each entry's image_only_pages after degraded_pages.
+CORPUS_FORMAT_VERSION: Final[str] = "5.3"
+# The format datagrunt 5.2 to 5.4.1 wrote (no entry image_only_pages key), which still loads.
+_CORPUS_FORMAT_5_2: Final[str] = "5.2"
 CORPUS_MANIFEST: Final[str] = "corpus_manifest.json"
 _MAX_CORPUS_WORKERS: Final[int] = 64
 _MAX_LOAD_WORKERS: Final[int] = 16
@@ -120,7 +125,7 @@ _BundleStamp: TypeAlias = tuple[_FileStat, ...]
 _T = TypeVar("_T")
 _R = TypeVar("_R")
 _MANIFEST_KEYS: Final[tuple[str, ...]] = ("corpus_format_version", "entries", "failures")
-_ENTRY_KEYS: Final[tuple[str, ...]] = (
+_ENTRY_KEYS_5_2: Final[tuple[str, ...]] = (
     "doc_id",
     "source_name",
     "source_sha256",
@@ -129,6 +134,20 @@ _ENTRY_KEYS: Final[tuple[str, ...]] = (
     "integrity_verified",
     "degraded_pages",
     "reused",
+)
+_ENTRY_KEYS: Final[tuple[str, ...]] = (
+    "doc_id",
+    "source_name",
+    "source_sha256",
+    "bundle_relpath",
+    "page_count",
+    "integrity_verified",
+    "degraded_pages",
+    "image_only_pages",
+    "reused",
+)
+_CORPUS_FORMATS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
+    {_CORPUS_FORMAT_5_2: _ENTRY_KEYS_5_2, CORPUS_FORMAT_VERSION: _ENTRY_KEYS}
 )
 _FAILURE_KEYS: Final[tuple[str, ...]] = ("source_path", "error_type", "message")
 
@@ -143,9 +162,31 @@ class _SourceItem(NamedTuple):
     identity: SourceIdentity | None = None
 
 
+def _checked_page_tuple(name: str, value: object, page_count: int, *, allow_none: bool = False) -> None:
+    """Validate a tuple of strictly increasing 1-based page numbers within ``1..page_count``."""
+    if value is None and allow_none:
+        return
+    if not isinstance(value, tuple):
+        expected = "a tuple or None" if allow_none else "a tuple"
+        raise TypeError(f"{name} must be {expected}, got {type(value).__name__}")
+    prev = 0
+    for index, page in enumerate(value):
+        checked = int_at_least(f"{name}[{index}]", page, 1)
+        if checked > page_count:
+            raise ValueError(f"{name}[{index}] ({checked}) must be <= page_count ({page_count})")
+        if checked <= prev:
+            raise ValueError(f"{name} must be strictly increasing, got {value!r}")
+        prev = checked
+
+
 @dataclass(frozen=True, slots=True)
 class CorpusEntry:
-    """One extracted or reused document bundle in a corpus manifest."""
+    """One extracted or reused document bundle in a corpus manifest.
+
+    ``image_only_pages`` lists 1-based pages whose content lives only in their
+    page image (``PDFDocument.image_only_pages``), or ``None`` when loaded from
+    an older format 5.2 corpus manifest that did not record them.
+    """
 
     doc_id: str
     source_name: str
@@ -154,6 +195,7 @@ class CorpusEntry:
     page_count: int
     integrity_verified: bool
     degraded_pages: tuple[int, ...] = ()
+    image_only_pages: tuple[int, ...] | None = ()
     reused: bool = False
 
     def __post_init__(self) -> None:
@@ -163,10 +205,8 @@ class CorpusEntry:
         non_blank_str("bundle_relpath", self.bundle_relpath)
         int_at_least("page_count", self.page_count, 1)
         strict_bool("integrity_verified", self.integrity_verified)
-        if not isinstance(self.degraded_pages, tuple):
-            raise TypeError(f"degraded_pages must be a tuple, got {type(self.degraded_pages).__name__}")
-        for index, page in enumerate(self.degraded_pages):
-            int_at_least(f"degraded_pages[{index}]", page, 1)
+        _checked_page_tuple("degraded_pages", self.degraded_pages, self.page_count)
+        _checked_page_tuple("image_only_pages", self.image_only_pages, self.page_count, allow_none=True)
         strict_bool("reused", self.reused)
 
 
@@ -198,14 +238,21 @@ class CorpusManifest:
     def __post_init__(self) -> None:
         if not isinstance(self.corpus_format_version, str):
             raise TypeError(f"corpus_format_version must be a str, got {type(self.corpus_format_version).__name__}")
-        if self.corpus_format_version != CORPUS_FORMAT_VERSION:
+        if self.corpus_format_version not in _CORPUS_FORMATS:
+            known = ", ".join(repr(name) for name in _CORPUS_FORMATS)
             raise ValueError(
-                f"corpus_format_version {self.corpus_format_version!r} is not supported: "
-                f"expected {CORPUS_FORMAT_VERSION!r}"
+                f"corpus_format_version {self.corpus_format_version!r} is not supported: this datagrunt reads {known}"
             )
         if not isinstance(self.output_dir, Path):
             raise TypeError(f"output_dir must be a Path, got {type(self.output_dir).__name__}")
         typed_tuple("entries", self.entries, CorpusEntry)
+        if self.corpus_format_version == CORPUS_FORMAT_VERSION:
+            for index, entry in enumerate(self.entries):
+                if entry.image_only_pages is None:
+                    raise ValueError(
+                        f"entries[{index}].image_only_pages must not be None for corpus_format_version "
+                        f"{CORPUS_FORMAT_VERSION!r}"
+                    )
         typed_tuple("failures", self.failures, CorpusFailure)
         if self._documents is not None:
             typed_tuple("_documents", self._documents, PDFDocument)
@@ -537,8 +584,21 @@ class _CorpusProcPool:
         self.close()
 
 
-def _entry_dict(entry: CorpusEntry) -> dict[str, object]:
-    """Serialize ``entry`` to a JSON-compatible dictionary."""
+def _entry_dict(entry: CorpusEntry, *, version: str = CORPUS_FORMAT_VERSION) -> dict[str, object]:
+    """Serialize ``entry`` to a JSON-compatible dictionary for ``version``."""
+    if version == _CORPUS_FORMAT_5_2:
+        return {
+            "doc_id": entry.doc_id,
+            "source_name": entry.source_name,
+            "source_sha256": entry.source_sha256,
+            "bundle_relpath": entry.bundle_relpath,
+            "page_count": entry.page_count,
+            "integrity_verified": entry.integrity_verified,
+            "degraded_pages": list(entry.degraded_pages),
+            "reused": entry.reused,
+        }
+    if entry.image_only_pages is None:
+        raise ValueError(f"corpus_format_version {version!r} entry {entry.doc_id!r} requires image_only_pages")
     return {
         "doc_id": entry.doc_id,
         "source_name": entry.source_name,
@@ -547,6 +607,7 @@ def _entry_dict(entry: CorpusEntry) -> dict[str, object]:
         "page_count": entry.page_count,
         "integrity_verified": entry.integrity_verified,
         "degraded_pages": list(entry.degraded_pages),
+        "image_only_pages": list(entry.image_only_pages),
         "reused": entry.reused,
     }
 
@@ -1056,6 +1117,7 @@ def _process_item(
         page_count=written.metadata.page_count,
         integrity_verified=written.integrity_verified,
         degraded_pages=written.degraded_pages,
+        image_only_pages=written.image_only_pages,
         reused=False,
     )
 
@@ -1084,6 +1146,7 @@ def _reused_entry(
         if (
             manifest.datagrunt_version != datagrunt.__version__
             or manifest.bundle_format_version != BUNDLE_FORMAT_VERSION
+            or manifest.image_only_pages is None
             or manifest.source_sha256 != item.sha256
             or not _same_output_params(manifest.extraction_params, expected_params)
         ):
@@ -1093,35 +1156,36 @@ def _reused_entry(
         _check_format(doc_top, _FORMATS[manifest.bundle_format_version].codec_version)
         meta = _metadata("metadata", doc_top["metadata"])
         raw_pages = _array("pages", doc_top["pages"])
+        expected_md = {_page_markdown(p) for p in range(1, meta.page_count + 1)}
+        present_md = {e.path for e in manifest.artifacts if e.path.startswith(_PAGE_MARKDOWN_DIR)}
+        if (
+            meta.doc_id != item.doc_id
+            or meta.source_name != item.source_name
+            or meta.sha256 != manifest.source_sha256
+            or len(raw_pages) != meta.page_count
+            or present_md != expected_md
+        ):
+            return None
+        return CorpusEntry(
+            doc_id=meta.doc_id,
+            source_name=meta.source_name,
+            source_sha256=meta.sha256,
+            bundle_relpath=bundle_relpath,
+            page_count=meta.page_count,
+            integrity_verified=manifest.integrity_verified,
+            degraded_pages=manifest.degraded_pages,
+            image_only_pages=manifest.image_only_pages,
+            reused=True,
+        )
     except (BundleCorruptError, OSError, ValueError, TypeError):
         return None
-    expected_md = {_page_markdown(p) for p in range(1, meta.page_count + 1)}
-    present_md = {e.path for e in manifest.artifacts if e.path.startswith(_PAGE_MARKDOWN_DIR)}
-    if (
-        meta.doc_id != item.doc_id
-        or meta.source_name != item.source_name
-        or meta.sha256 != manifest.source_sha256
-        or len(raw_pages) != meta.page_count
-        or present_md != expected_md
-    ):
-        return None
-    return CorpusEntry(
-        doc_id=meta.doc_id,
-        source_name=meta.source_name,
-        source_sha256=meta.sha256,
-        bundle_relpath=bundle_relpath,
-        page_count=meta.page_count,
-        integrity_verified=manifest.integrity_verified,
-        degraded_pages=manifest.degraded_pages,
-        reused=True,
-    )
 
 
 def _write_corpus_manifest(target: Path, manifest: CorpusManifest) -> None:
     """Atomically write ``corpus_manifest.json`` into ``target``."""
     payload = {
         "corpus_format_version": manifest.corpus_format_version,
-        "entries": [_entry_dict(e) for e in manifest.entries],
+        "entries": [_entry_dict(e, version=manifest.corpus_format_version) for e in manifest.entries],
         "failures": [_failure_dict(f) for f in manifest.failures],
     }
     raw = json.dumps(payload, ensure_ascii=True, allow_nan=False, indent=2).encode("ascii")
@@ -1169,9 +1233,13 @@ def _corpus_manifest_of(data: object, root: Path) -> CorpusManifest:
     """Validate and build a :class:`CorpusManifest` from parsed JSON ``data``."""
     top = _object("corpus_manifest", data, _MANIFEST_KEYS)
     version = top["corpus_format_version"]
-    if not isinstance(version, str) or version != CORPUS_FORMAT_VERSION:
-        raise ValueError(f"corpus_format_version {version!r} is not supported: expected {CORPUS_FORMAT_VERSION!r}")
-    entries = tuple(_entry_of(f"entries[{i}]", item, root) for i, item in enumerate(_array("entries", top["entries"])))
+    if not isinstance(version, str) or version not in _CORPUS_FORMATS:
+        known = ", ".join(repr(name) for name in _CORPUS_FORMATS)
+        raise ValueError(f"corpus_format_version {version!r} is not supported: this datagrunt reads {known}")
+    entries = tuple(
+        _entry_of(f"entries[{i}]", item, root, version=version)
+        for i, item in enumerate(_array("entries", top["entries"]))
+    )
     failures = tuple(_failure_of(f"failures[{i}]", item) for i, item in enumerate(_array("failures", top["failures"])))
     return CorpusManifest(
         corpus_format_version=version,
@@ -1181,13 +1249,13 @@ def _corpus_manifest_of(data: object, root: Path) -> CorpusManifest:
     )
 
 
-def _entry_of(name: str, value: object, root: Path) -> CorpusEntry:
-    """Validate one JSON entry object in ``corpus_manifest.json``."""
-    data = _object(name, value, _ENTRY_KEYS)
+def _entry_of(name: str, value: object, root: Path, *, version: str = CORPUS_FORMAT_VERSION) -> CorpusEntry:
+    """Validate one JSON entry object in ``corpus_manifest.json`` (or a corpus worker reply)."""
+    data = _object(name, value, _CORPUS_FORMATS[version])
     contained_path(f"{name}.bundle_relpath", data["bundle_relpath"], root)
-    pages = tuple(
-        int_at_least(f"{name}.degraded_pages[{i}]", p, 1)
-        for i, p in enumerate(_array(f"{name}.degraded_pages", data["degraded_pages"]))
+    degraded = _page_numbers(f"{name}.degraded_pages", data["degraded_pages"])
+    image_only: tuple[int, ...] | None = (
+        None if version == _CORPUS_FORMAT_5_2 else _page_numbers(f"{name}.image_only_pages", data["image_only_pages"])
     )
     return CorpusEntry(
         doc_id=non_blank_str(f"{name}.doc_id", data["doc_id"]),
@@ -1196,7 +1264,8 @@ def _entry_of(name: str, value: object, root: Path) -> CorpusEntry:
         bundle_relpath=non_blank_str(f"{name}.bundle_relpath", data["bundle_relpath"]),
         page_count=int_at_least(f"{name}.page_count", data["page_count"], 1),
         integrity_verified=strict_bool(f"{name}.integrity_verified", data["integrity_verified"]),
-        degraded_pages=pages,
+        degraded_pages=degraded,
+        image_only_pages=image_only,
         reused=strict_bool(f"{name}.reused", data["reused"]),
     )
 
@@ -1349,4 +1418,14 @@ def _verified_entry_document(root: Path, entry: CorpusEntry) -> PDFDocument:
         )
     if doc.metadata.page_count != entry.page_count or doc.integrity_verified != entry.integrity_verified:
         raise BundleCorruptError(f"{CORPUS_MANIFEST}: entry {entry.doc_id!r} page/integrity facts disagree with bundle")
+    if doc.degraded_pages != entry.degraded_pages:
+        raise BundleCorruptError(
+            f"{CORPUS_MANIFEST}: entry {entry.doc_id!r} degraded_pages {list(entry.degraded_pages)} "
+            f"disagree with bundle {list(doc.degraded_pages)}"
+        )
+    if entry.image_only_pages is not None and doc.image_only_pages != entry.image_only_pages:
+        raise BundleCorruptError(
+            f"{CORPUS_MANIFEST}: entry {entry.doc_id!r} image_only_pages {list(entry.image_only_pages)} "
+            f"disagree with bundle {list(doc.image_only_pages)}"
+        )
     return doc

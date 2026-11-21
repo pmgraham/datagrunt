@@ -25,8 +25,8 @@ from datagrunt.pdf.corpus import (
     load_corpus_documents,
 )
 from datagrunt.pdf.exceptions import BundleCorruptError, PDFCorruptError
-from pdf_tests.builders import PageSpec, TextRun, build_pdf
-from pdf_tests.old_formats import as_bundle_5_0
+from pdf_tests.builders import PageSpec, Rect, TextRun, break_page, build_pdf
+from pdf_tests.old_formats import as_bundle_5_0, as_corpus_5_2
 
 
 def _sha256(path: Path) -> str:
@@ -48,7 +48,7 @@ def sample_pdfs(tmp_path_factory) -> tuple[Path, Path]:
 
 
 def test_corpus_constants_and_reexports():
-    assert CORPUS_FORMAT_VERSION == "5.2"
+    assert CORPUS_FORMAT_VERSION == "5.3"
     assert CORPUS_MANIFEST == "corpus_manifest.json"
     assert datagrunt.pdf.extract_corpus is extract_corpus
     assert datagrunt.pdf.load_corpus is load_corpus
@@ -73,6 +73,7 @@ class TestModelValidation:
             reused=False,
         )
         assert entry.page_count == 1
+        assert entry.image_only_pages == ()
         with pytest.raises(ValueError, match="doc_id"):
             CorpusEntry(
                 doc_id="   ",
@@ -106,6 +107,80 @@ class TestModelValidation:
                 degraded_pages=(),
                 reused=1,  # type: ignore[arg-type]
             )
+
+    @pytest.mark.parametrize(
+        ("field_name", "bad_value", "error", "pattern"),
+        [
+            ("image_only_pages", [1], TypeError, "image_only_pages must be a tuple or None"),
+            ("image_only_pages", "1", TypeError, "image_only_pages must be a tuple or None"),
+            ("image_only_pages", 1, TypeError, "image_only_pages must be a tuple or None"),
+            ("image_only_pages", (True,), TypeError, r"image_only_pages\[0\] must be an int"),
+            ("image_only_pages", ("1",), TypeError, r"image_only_pages\[0\] must be an int"),
+            ("image_only_pages", (0,), ValueError, r"image_only_pages\[0\] must be >= 1"),
+            ("image_only_pages", (-1,), ValueError, r"image_only_pages\[0\] must be >= 1"),
+            ("image_only_pages", (4,), ValueError, r"image_only_pages\[0\].*page_count"),
+            ("image_only_pages", (2, 2), ValueError, "image_only_pages must be strictly increasing"),
+            ("image_only_pages", (3, 1), ValueError, "image_only_pages must be strictly increasing"),
+            ("degraded_pages", (4,), ValueError, r"degraded_pages\[0\].*page_count"),
+            ("degraded_pages", (2, 1), ValueError, "degraded_pages must be strictly increasing"),
+        ],
+    )
+    def test_corpus_entry_validates_image_only_and_degraded_pages(self, field_name, bad_value, error, pattern):
+        sha = "a" * 64
+        valid = CorpusEntry(
+            doc_id="alpha",
+            source_name="alpha.pdf",
+            source_sha256=sha,
+            bundle_relpath="alpha",
+            page_count=3,
+            integrity_verified=True,
+            degraded_pages=(3,),
+            image_only_pages=(1, 3),
+            reused=False,
+        )
+        assert valid.image_only_pages == (1, 3)
+        unrecorded = CorpusEntry(
+            doc_id="alpha",
+            source_name="alpha.pdf",
+            source_sha256=sha,
+            bundle_relpath="alpha",
+            page_count=3,
+            integrity_verified=True,
+            degraded_pages=(),
+            image_only_pages=None,
+            reused=False,
+        )
+        assert unrecorded.image_only_pages is None
+        kwargs = {
+            "doc_id": "alpha",
+            "source_name": "alpha.pdf",
+            "source_sha256": sha,
+            "bundle_relpath": "alpha",
+            "page_count": 3,
+            "integrity_verified": True,
+            "degraded_pages": (),
+            "image_only_pages": (),
+            "reused": False,
+            field_name: bad_value,
+        }
+        with pytest.raises(error, match=pattern):
+            CorpusEntry(**kwargs)  # type: ignore[arg-type]
+
+    def test_corpus_manifest_validates_format_versions_and_image_only_none(self, tmp_path):
+        sha = "a" * 64
+        entry_none = CorpusEntry(
+            doc_id="alpha",
+            source_name="alpha.pdf",
+            source_sha256=sha,
+            bundle_relpath="alpha",
+            page_count=1,
+            integrity_verified=True,
+            image_only_pages=None,
+        )
+        m52 = CorpusManifest(corpus_format_version="5.2", output_dir=tmp_path, entries=(entry_none,))
+        assert m52.corpus_format_version == "5.2"
+        with pytest.raises(ValueError, match="image_only_pages"):
+            CorpusManifest(corpus_format_version="5.3", output_dir=tmp_path, entries=(entry_none,))
 
     def test_corpus_failure_validates_fields(self):
         failure = CorpusFailure(source_path="broken.pdf", error_type="PDFCorruptError", message="bad pdf")
@@ -692,3 +767,160 @@ class TestWave2Rank6ManifestFirstAndParallelReuse:
         second = extract_corpus(pdfs, out, max_workers=4, dpi=72, vision_dpi=72, render_pages=False, overwrite=False)
         assert peak_reuse >= 2
         assert all(e.reused for e in second.entries)
+
+
+@pytest.fixture(scope="module")
+def mixed_pdfs(tmp_path_factory) -> tuple[Path, Path]:
+    root = tmp_path_factory.mktemp("corpus_image_only")
+    grey_box = Rect(400.0, 600.0, 60.0, 40.0, fill_rgb=(0.5, 0.5, 0.5), stroke=False)
+    short = PageSpec(items=(TextRun("Too short", 72.0, 100.0), grey_box))
+    digital = PageSpec(items=(TextRun("Digital page with ordinary readable body text.", 72.0, 100.0),))
+    pdf_a = build_pdf(root / "a_mixed.pdf", [digital, short])
+    pdf_b = build_pdf(root / "b_mixed.pdf", [short, digital, digital])
+    break_page(pdf_b, 3)
+    return pdf_a, pdf_b
+
+
+class TestImageOnlyPages:
+    """Corpus index carries ``image_only_pages`` alongside ``degraded_pages`` with 5.2 back-compat (#474)."""
+
+    def test_single_worker_extract_reuse_and_round_trip(self, tmp_path, mixed_pdfs):
+        pdf_a, pdf_b = mixed_pdfs
+        out = tmp_path / "corpus_single"
+        first = extract_corpus([pdf_a, pdf_b], out, max_workers=1, dpi=72, vision_dpi=72, ocr="never")
+
+        assert first.corpus_format_version == "5.3"
+        assert [(e.degraded_pages, e.image_only_pages, e.reused) for e in first.entries] == [
+            ((), (2,), False),
+            ((3,), (1, 3), False),
+        ]
+
+        raw = json.loads((out / CORPUS_MANIFEST).read_text(encoding="ascii"))
+        assert raw["corpus_format_version"] == "5.3"
+        assert list(raw["entries"][0]) == [
+            "doc_id",
+            "source_name",
+            "source_sha256",
+            "bundle_relpath",
+            "page_count",
+            "integrity_verified",
+            "degraded_pages",
+            "image_only_pages",
+            "reused",
+        ]
+        assert [e["image_only_pages"] for e in raw["entries"]] == [[2], [1, 3]]
+
+        reloaded, docs = load_corpus_documents(out)
+        assert reloaded == first
+        assert load_corpus(out) == first
+        assert [d.image_only_pages for d in docs] == [(2,), (1, 3)]
+
+        reused = extract_corpus([pdf_a, pdf_b], out, max_workers=1, dpi=72, vision_dpi=72, ocr="never", overwrite=False)
+        assert [(e.degraded_pages, e.image_only_pages, e.reused) for e in reused.entries] == [
+            ((), (2,), True),
+            ((3,), (1, 3), True),
+        ]
+        assert load_corpus(out) == reused
+
+    def test_multi_worker_spawn_pool_and_reuse_carry_image_only_pages(self, tmp_path, mixed_pdfs, monkeypatch):
+        pdf_a, pdf_b = mixed_pdfs
+        out = tmp_path / "corpus_spawn"
+        spawn_pids: list[int] = []
+        real_run_in_worker = corpus_module._run_in_corpus_worker
+
+        def spy_worker(*args, **kwargs):
+            pid, outcome = real_run_in_worker(*args, **kwargs)
+            spawn_pids.append(pid)
+            return pid, outcome
+
+        monkeypatch.setattr(corpus_module, "_run_in_corpus_worker", spy_worker)
+        first = extract_corpus([pdf_a, pdf_b], out, max_workers=2, dpi=72, vision_dpi=72, ocr="never")
+
+        assert len(spawn_pids) == 2
+        assert all(pid != os.getpid() for pid in spawn_pids)
+        assert [(e.degraded_pages, e.image_only_pages, e.reused) for e in first.entries] == [
+            ((), (2,), False),
+            ((3,), (1, 3), False),
+        ]
+        raw = json.loads((out / CORPUS_MANIFEST).read_text(encoding="ascii"))
+        assert [e["image_only_pages"] for e in raw["entries"]] == [[2], [1, 3]]
+        assert load_corpus(out) == first
+
+        reused = extract_corpus([pdf_a, pdf_b], out, max_workers=2, dpi=72, vision_dpi=72, ocr="never", overwrite=False)
+        assert [(e.degraded_pages, e.image_only_pages, e.reused) for e in reused.entries] == [
+            ((), (2,), True),
+            ((3,), (1, 3), True),
+        ]
+        assert load_corpus(out) == reused
+
+    def test_reused_entry_rejects_bundle_with_invalid_image_only_pages_in_manifest(self, tmp_path, mixed_pdfs):
+        pdf_a, _ = mixed_pdfs
+        out = tmp_path / "corpus_tampered_bundle"
+        first = extract_corpus([pdf_a], out, dpi=72, vision_dpi=72, ocr="never")
+        bundle_manifest = out / first.entries[0].bundle_relpath / "manifest.json"
+        data = json.loads(bundle_manifest.read_text(encoding="ascii"))
+        data["image_only_pages"] = [99]
+        bundle_manifest.write_text(json.dumps(data), encoding="ascii")
+
+        rebuilt = extract_corpus([pdf_a], out, dpi=72, vision_dpi=72, ocr="never", overwrite=False)
+        assert rebuilt.entries[0].reused is False
+        assert rebuilt.entries[0].image_only_pages == (2,)
+
+    @pytest.mark.parametrize("downgrade_bundles", [False, True])
+    def test_older_5_2_corpus_manifest_loads_without_image_only_pages(self, tmp_path, mixed_pdfs, downgrade_bundles):
+        pdf_a, pdf_b = mixed_pdfs
+        out = tmp_path / f"corpus_5_2_{downgrade_bundles}"
+        extract_corpus([pdf_a, pdf_b], out, dpi=72, vision_dpi=72, ocr="never")
+        as_corpus_5_2(out, downgrade_bundles=downgrade_bundles)
+
+        raw = json.loads((out / CORPUS_MANIFEST).read_text(encoding="ascii"))
+        assert raw["corpus_format_version"] == "5.2"
+        assert all("image_only_pages" not in entry for entry in raw["entries"])
+
+        loaded, docs = load_corpus_documents(out)
+        assert loaded.corpus_format_version == "5.2"
+        assert [e.image_only_pages for e in loaded.entries] == [None, None]
+        assert [e.degraded_pages for e in loaded.entries] == [(), (3,)]
+        expected_doc_pages = [(), ()] if downgrade_bundles else [(2,), (1, 3)]
+        assert [d.image_only_pages for d in docs] == expected_doc_pages
+        assert loaded.load_documents() == docs
+
+    @pytest.mark.parametrize(
+        ("mutate", "pattern"),
+        [
+            (lambda e: e.pop("image_only_pages"), r"missing key\(s\) \['image_only_pages'\]"),
+            (lambda e: e.update(image_only_pages=None), "image_only_pages must be a JSON array"),
+            (lambda e: e.update(image_only_pages="2"), "image_only_pages must be a JSON array"),
+            (lambda e: e.update(image_only_pages=[0]), r"image_only_pages\[0\] must be >= 1"),
+            (lambda e: e.update(image_only_pages=[True]), r"image_only_pages\[0\] must be an int"),
+            (lambda e: e.update(image_only_pages=[99]), r"image_only_pages\[0\].*page_count"),
+            (lambda e: e.update(image_only_pages=[2, 1]), "image_only_pages must be strictly increasing"),
+            (lambda e: e.update(image_only_pages=[1, 1]), "image_only_pages must be strictly increasing"),
+            (lambda e: e.update(image_only_pages=[]), r"image_only_pages \[\] disagree with bundle \[2\]"),
+            (lambda e: e.update(image_only_pages=[1]), r"image_only_pages \[1\] disagree with bundle \[2\]"),
+        ],
+    )
+    def test_corrupt_image_only_pages_in_5_3_manifest_is_rejected(self, tmp_path, mixed_pdfs, mutate, pattern):
+        pdf_a, _ = mixed_pdfs
+        out = tmp_path / "corpus_bad_manifest"
+        extract_corpus([pdf_a], out, dpi=72, vision_dpi=72, ocr="never")
+        manifest_path = out / CORPUS_MANIFEST
+        raw = json.loads(manifest_path.read_text(encoding="ascii"))
+        mutate(raw["entries"][0])
+        manifest_path.write_text(json.dumps(raw), encoding="ascii")
+
+        with pytest.raises(BundleCorruptError, match=pattern):
+            load_corpus(out)
+
+    def test_5_2_corpus_manifest_rejects_unknown_image_only_pages_key(self, tmp_path, mixed_pdfs):
+        pdf_a, _ = mixed_pdfs
+        out = tmp_path / "corpus_5_2_extra_key"
+        extract_corpus([pdf_a], out, dpi=72, vision_dpi=72, ocr="never")
+        as_corpus_5_2(out)
+        manifest_path = out / CORPUS_MANIFEST
+        raw = json.loads(manifest_path.read_text(encoding="ascii"))
+        raw["entries"][0]["image_only_pages"] = [2]
+        manifest_path.write_text(json.dumps(raw), encoding="ascii")
+
+        with pytest.raises(BundleCorruptError, match=r"unknown key\(s\) \['image_only_pages'\]"):
+            load_corpus(out)
