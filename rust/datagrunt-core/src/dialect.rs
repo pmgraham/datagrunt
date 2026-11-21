@@ -19,8 +19,12 @@
 //!   * CPython's `delims` map persists across chunk iterations, but its sweep
 //!     only runs while `delims` is empty, so stopping at the first chunk that
 //!     finds a delimiter (as the oracle does) gives the same answer.
-//!   * fancy-regex can stop a search with a runtime error where CPython's `re`
-//!     cannot; see `COMPILED_QUOTE_PATTERNS` for what that yields.
+//!   * Pattern 1 (`delim space? quote body quote delim`) and the doubled-quote
+//!     check (`has_doubled_quote`) run as direct O(n) scanners; patterns 2-4
+//!     expand the two quote characters into a backreference-free alternation so
+//!     `fancy-regex` delegates them to `regex-automata`. None of the five paths
+//!     uses backtracking, so none can hit a backtrack or stack limit on long
+//!     lines (#381).
 //!
 //! Only the four data-driven fields live here. `lineterminator` ("\r\n"),
 //! `quoting` (QUOTE_MINIMAL) and the absence of `escapechar` are constants the
@@ -97,70 +101,84 @@ struct QuoteGuess {
 /// `²` and combining marks have been assigned for decades.
 const PY_WORD: &str = r"\p{L}\p{N}_";
 
-/// Any run of characters other than the quote: half of the quoted-field body.
-///
-/// The body is `other(?:quote{2}other)*` (gh-98820): it ends at the first quote
-/// that is not doubled, as it does for a reader. This is CPython v3.10.22's
-/// unrolled spelling, which the Python oracle uses; 3.11+ writes the same body
-/// as a possessive `(?:quote{2}|(?!quote).)*+`. The pre-fix lazy `.*?` let a
-/// match slide across doubled quotes and field boundaries, and rescanned to the
-/// end of the sample from every opening quote.
-const QUOTE_OTHER: &str = r"(?:(?!\k<quote>).)*";
+/// Single-character check matching CPython's `[^\w\n"']` for non-ASCII chars.
+/// Plain regex with no fancy features, so fancy-regex wraps `regex-automata`.
+static NON_ASCII_DELIM_CHAR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r#"^(?s)[^{PY_WORD}\n"']$"#))
+        .expect("static non-ASCII delimiter pattern is valid")
+});
 
-/// The four DOTALL|MULTILINE patterns, in the order Python tries them, built and
-/// compiled once to avoid a per-call `Regex::new`.
+/// True iff `ch` matches CPython's delimiter class `[^\w\n"']`.
+fn is_delim_char(ch: char) -> bool {
+    if ch.is_ascii() {
+        return !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '\n' | '"' | '\''));
+    }
+    let mut buf = [0u8; 4];
+    NON_ASCII_DELIM_CHAR
+        .is_match(ch.encode_utf8(&mut buf))
+        .unwrap_or(false)
+}
+
+/// Scan from right after an opening quote at `q_pos` for the first undoubled
+/// closing quote `q`, skipping any `qq` pairs inside the body (gh-98820).
+/// Returns `Some((close_pos, saw_doubled))` or `None` if unterminated.
 ///
-/// The bool records whether the pattern carries `delim`/`space` groups (the 4th
-/// does not — Python hits `KeyError` and `continue`s, so it never records delims
-/// or spaces for that pattern). Python `(?P=quote)` backreferences become
-/// fancy-regex `\k<quote>`.
+/// Valid on UTF-8 byte slices because `q` is ASCII (`"` or `'`), which can
+/// never appear inside a multibyte UTF-8 sequence.
+fn find_closing_quote(bytes: &[u8], q_pos: usize, q: u8) -> Option<(usize, bool)> {
+    let mut i = q_pos + 1;
+    let mut saw_doubled = false;
+    while i < bytes.len() {
+        let rel = bytes[i..].iter().position(|&b| b == q)?;
+        let pos = i + rel;
+        if bytes.get(pos + 1) == Some(&q) {
+            saw_doubled = true;
+            i = pos + 2;
+        } else {
+            return Some((pos, saw_doubled));
+        }
+    }
+    None
+}
+
+/// Quote-specific field body without backreferences (gh-98820): matches `"..."`
+/// (group `dq`) or `'...'` (group `sq`), stopping at the first undoubled quote.
+///
+/// Expanding the two quote characters removes `\k<quote>` and `(?!\k<quote>)`,
+/// leaving pure regular expressions with no lookaround or backreferences so
+/// fancy-regex delegates patterns 2-4 straight to `regex-automata` (linear
+/// time, no backtrack or stack limits; #381). The two branches start with
+/// disjoint characters (`"` vs `'`), so leftmost-first matching is identical to
+/// CPython's `(?P<quote>["'])body(?P=quote)`.
+const QUOTED_FIELD: &str = r#"(?:(?P<dq>"[^"]*(?:""[^"]*)*")|(?P<sq>'[^']*(?:''[^']*)*'))"#;
+
+/// Patterns 2, 3 and 4 (DOTALL|MULTILINE), in the order Python tries them after
+/// pattern 1, compiled once to avoid a per-call `Regex::new`.
+///
+/// Pattern 1 (`delim space? quote body quote delim`) carries `\k<delim>` and is
+/// matched by `tally_pattern_1` instead so none of the four patterns uses
+/// backtracking (#381). The bool records whether the pattern carries
+/// `delim`/`space` groups (the 4th does not — Python hits `KeyError` and
+/// `continue`s, so it never records delims or spaces for that pattern).
 ///
 /// The word class is interpolated from `PY_WORD` rather than written as `\w`, so
 /// there is exactly one place to look when asking what "word character" means
 /// here — see that constant for why the distinction matters.
-///
-/// Runtime errors — the one place Rust cannot mirror Python. A fancy-regex
-/// search returns `Err` once it exceeds its backtrack limit (1,000,000 by
-/// default) or its fixed 1,000,000-entry backtrack stack; CPython's `re` has
-/// neither limit. Even a linear scan costs fancy-regex about 2-4 backtracks per
-/// character it tries (measured on these patterns), so one search that crosses
-/// roughly 250k-500k characters without a match, or a single quoted body of
-/// roughly 1M characters, errs whatever the pattern. The sniffer never panics on
-/// such an `Err` (a panic would cross the FFI boundary); it treats it as the end
-/// of that scan. The quote patterns keep the matches found before it, and with
-/// none the next pattern runs, then the frequency guess, exactly as for an empty
-/// match set; the doubled-quote search answers `false` unless it already found a
-/// doubled quote. CPython keeps scanning, so on a sample with such a stretch the
-/// two backends can disagree. `adversarial_lines_stay_within_fancy_regex_runtime_limits`
-/// pins that the fixed patterns stay inside both limits on 128k-char adversarial
-/// lines; the pre-fix patterns did not.
-static COMPILED_QUOTE_PATTERNS: LazyLock<[(Regex, bool); 4]> = LazyLock::new(|| {
-    let body = format!(r"{QUOTE_OTHER}(?:\k<quote>{{2}}{QUOTE_OTHER})*");
-    let patterns: [(String, bool); 4] = [
-        (
-            // ,"...",
-            format!(
-                r#"(?sm)(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)(?P<quote>["']){body}\k<quote>\k<delim>"#
-            ),
-            true,
-        ),
+static COMPILED_QUOTE_PATTERNS_2_TO_4: LazyLock<[(Regex, bool); 3]> = LazyLock::new(|| {
+    let patterns: [(String, bool); 3] = [
         (
             //  "...",
-            format!(
-                r#"(?sm)(?:^|\n)(?P<quote>["']){body}\k<quote>(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)"#
-            ),
+            format!(r#"(?sm)(?:^|\n){QUOTED_FIELD}(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)"#),
             true,
         ),
         (
             // ,"..."
-            format!(
-                r#"(?sm)(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?)(?P<quote>["']){body}\k<quote>(?:$|\n)"#
-            ),
+            format!(r#"(?sm)(?P<delim>[^{PY_WORD}\n"'])(?P<space> ?){QUOTED_FIELD}(?:$|\n)"#),
             true,
         ),
         (
             //  "..." (no delim, no space)
-            format!(r#"(?sm)(?:^|\n)(?P<quote>["']){body}\k<quote>(?:$|\n)"#),
+            format!(r#"(?sm)(?:^|\n){QUOTED_FIELD}(?:$|\n)"#),
             false,
         ),
     ];
@@ -183,7 +201,88 @@ struct QuoteTally {
     spaces: usize,
 }
 
-/// Tally every non-overlapping match of one quote pattern (`regexp.findall`).
+/// Direct O(n) leftmost-first non-overlapping matcher for CPython's quote
+/// pattern 1: `(?P<delim>[^\w\n"'])(?P<space> ?)(?P<quote>["']){body}\k<quote>\k<delim>`.
+///
+/// Because `delim` excludes both quote characters, backtracking into a doubled
+/// quote inside `{body}` can never match `\k<delim>`, so the first undoubled
+/// quote is the unique possible closing quote. Every candidate opening quote is
+/// preceded by `delim` or `' '` (never by the quote itself), so each is the
+/// start of a maximal quote run; runs of even length are skipped by an outer
+/// scan while closing immediately if opened themselves, keeping total body
+/// scanning strictly O(n) across the input (#381).
+fn tally_pattern_1(data: &str, delimiters: Option<&str>) -> QuoteTally {
+    let mut tally = QuoteTally::default();
+    let bytes = data.as_bytes();
+    let mut pos = 0;
+    // A `delim` followed by `' '` and a quote can probe the same `q_pos` twice
+    // (first with `delim` + space, then with `' '` as `delim` and no space).
+    let mut last_quote_scan: Option<(usize, Option<usize>)> = None;
+
+    while pos < bytes.len() {
+        let (d, d_len) = if bytes[pos] < 0x80 {
+            (bytes[pos] as char, 1)
+        } else {
+            let Some(ch) = data[pos..].chars().next() else {
+                break;
+            };
+            (ch, ch.len_utf8())
+        };
+
+        if !is_delim_char(d) {
+            pos += d_len;
+            continue;
+        }
+
+        let after_d = pos + d_len;
+        let (has_space, q_pos) = match bytes.get(after_d) {
+            Some(b'"' | b'\'') => (false, after_d),
+            Some(b' ') if matches!(bytes.get(after_d + 1), Some(b'"' | b'\'')) => {
+                (true, after_d + 1)
+            }
+            _ => {
+                pos = after_d;
+                continue;
+            }
+        };
+
+        let q = bytes[q_pos];
+        let close_pos = match last_quote_scan {
+            Some((cached_q_pos, cached_close)) if cached_q_pos == q_pos => cached_close,
+            _ => {
+                let found = find_closing_quote(bytes, q_pos, q).map(|(p, _)| p);
+                last_quote_scan = Some((q_pos, found));
+                found
+            }
+        };
+
+        let Some(close_pos) = close_pos else {
+            pos = after_d;
+            continue;
+        };
+
+        let d_bytes = &bytes[pos..after_d];
+        let after_close = close_pos + 1;
+        if bytes[after_close..].starts_with(d_bytes) {
+            tally.matches += 1;
+            let quote = if q == b'"' { "\"" } else { "'" };
+            bump(&mut tally.quotes, quote);
+            let delim = &data[pos..after_d];
+            if delimiters.is_none_or(|allowed| allowed.contains(delim)) {
+                bump(&mut tally.delims, delim);
+            }
+            if has_space {
+                tally.spaces += 1;
+            }
+            pos = after_close + d_len;
+        } else {
+            pos = after_d;
+        }
+    }
+    tally
+}
+
+/// Tally every non-overlapping match of one compiled quote pattern (`regexp.findall`).
 ///
 /// The quote and delim groups each match exactly one character, so CPython's
 /// emptiness checks on them never fire; they are kept for the mirror. Without
@@ -198,11 +297,18 @@ fn tally_quote_pattern(
 ) -> QuoteTally {
     let mut tally = QuoteTally::default();
     for caps in regexp.captures_iter(data) {
-        // A runtime error ends this scan; see `COMPILED_QUOTE_PATTERNS`.
+        // Patterns 2-4 delegate to `regex-automata` (cannot error), but handle
+        // `Err` gracefully rather than unwrapping across the FFI boundary.
         let Ok(caps) = caps else { break };
         let group = |name: &str| caps.name(name).map_or("", |m| m.as_str());
         tally.matches += 1;
-        let quote = group("quote");
+        let quote = if caps.name("dq").is_some() {
+            "\""
+        } else if caps.name("sq").is_some() {
+            "'"
+        } else {
+            ""
+        };
         if !quote.is_empty() {
             bump(&mut tally.quotes, quote);
         }
@@ -222,7 +328,11 @@ fn tally_quote_pattern(
 
 /// The tally of the first quote pattern that matches at all (CPython's order).
 fn first_quote_tally(data: &str, delimiters: Option<&str>) -> QuoteTally {
-    for (regexp, has_groups) in COMPILED_QUOTE_PATTERNS.iter() {
+    let tally = tally_pattern_1(data, delimiters);
+    if tally.matches > 0 {
+        return tally;
+    }
+    for (regexp, has_groups) in COMPILED_QUOTE_PATTERNS_2_TO_4.iter() {
         let tally = tally_quote_pattern(regexp, *has_groups, data, delimiters);
         if tally.matches > 0 {
             return tally;
@@ -231,42 +341,78 @@ fn first_quote_tally(data: &str, delimiters: Option<&str>) -> QuoteTally {
     QuoteTally::default()
 }
 
-/// The whole-field doubled-quote pattern (gh-109638), CPython v3.10.22's
-/// spelling: a field opens just after the delimiter (lookbehind) or at a line
-/// start, skipping spaces unless the delimiter is itself a space; its body
-/// (group 1) is the unrolled loop `[^q]*(?:qq[^q]*)*`; it closes before the
-/// delimiter or a line end. Matching whole fields stops a match sliding across
-/// field boundaries. MULTILINE only. The quotechar is only ever `"` or `'`,
-/// which need no escaping (CPython does not escape it either); the delimiter
-/// goes through `fancy_regex::escape`, as CPython's goes through `re.escape`.
-fn doubled_quote_regex(quotechar: &str, delim: &str) -> Result<Regex, fancy_regex::Error> {
-    let d = fancy_regex::escape(delim);
-    let q = quotechar;
-    // Skipping spaces after a space rescans them.
-    let space = if delim == " " { "" } else { " *" };
-    Regex::new(&format!(
-        r"(?m)(?:(?<={d})|^){space}{q}([^{q}]*(?:{q}{q}[^{q}]*)*){q}(?:{d}|$)"
-    ))
-}
-
-/// `any(quotechar * 2 in m[1] for m in dq_regexp.finditer(data))`.
+/// `any(quotechar * 2 in m[1] for m in dq_regexp.finditer(data))` (gh-109638).
 ///
-/// Like `any`, it stops at the first doubled quote. A runtime error ends the
-/// scan as "none found" (see `COMPILED_QUOTE_PATTERNS`), as does a failed
-/// compile (defensive: the pattern is built from a one-char quotechar and an
-/// escaped one-char delimiter), rather than panicking across the FFI boundary.
+/// Direct O(n) implementation of CPython v3.10.22's whole-field doubled-quote
+/// pattern: `(?m)(?:(?<=delim)|^)space quote([^quote]*(?:quote{2}[^quote]*)*)quote(?:delim|$)`
+/// where `space` is `" *"` unless `delim == " "` (then `""`).
+///
+/// Matching whole fields stops a match sliding across field boundaries, and
+/// advancing past each matched field reproduces `finditer`'s non-overlapping
+/// semantics (including lookbehind matching right after a consumed `delim`).
+/// Because `delim` never equals `quotechar` (quote patterns exclude quotes from
+/// `delim`) and `' '` never equals `quotechar`, every candidate opening quote
+/// starts a maximal quote run, so total scanning is strictly O(n) with no
+/// regex compilation and no backtrack/stack limits (#381).
 fn has_doubled_quote(data: &str, quotechar: &str, delim: &str) -> bool {
-    let Ok(regexp) = doubled_quote_regex(quotechar, delim) else {
+    let &[q] = quotechar.as_bytes() else {
         return false;
     };
-    let doubled = quotechar.repeat(2);
-    for caps in regexp.captures_iter(data) {
-        let Ok(caps) = caps else { return false };
-        if caps
-            .get(1)
-            .is_some_and(|body| body.as_str().contains(&doubled))
-        {
-            return true;
+    let delim_bytes = delim.as_bytes();
+    if delim_bytes.is_empty() {
+        return false;
+    }
+    // Skipping spaces after a space rescans them.
+    let skip_spaces = delim != " ";
+    let bytes = data.as_bytes();
+    let mut pos = 0;
+
+    while pos < bytes.len() {
+        let is_anchor = pos == 0 || bytes[pos - 1] == b'\n' || bytes[..pos].ends_with(delim_bytes);
+        if !is_anchor {
+            pos += 1;
+            continue;
+        }
+
+        let mut q_pos = pos;
+        if skip_spaces {
+            while bytes.get(q_pos) == Some(&b' ') {
+                q_pos += 1;
+            }
+        }
+
+        if bytes.get(q_pos) != Some(&q) {
+            // When `skip_spaces` is true, `delim != " "`, so none of the
+            // skipped space bytes can end an anchor; advancing to `q_pos`
+            // avoids rescanning long space runs.
+            pos = if q_pos > pos { q_pos } else { pos + 1 };
+            continue;
+        }
+
+        let Some((close_pos, saw_doubled)) = find_closing_quote(bytes, q_pos, q) else {
+            pos = if q_pos > pos { q_pos } else { pos + 1 };
+            continue;
+        };
+
+        let after_close = close_pos + 1;
+        let match_end = if bytes[after_close..].starts_with(delim_bytes) {
+            Some(after_close + delim_bytes.len())
+        } else if after_close == bytes.len() || bytes[after_close] == b'\n' {
+            Some(after_close)
+        } else {
+            None
+        };
+
+        if let Some(end) = match_end {
+            if saw_doubled {
+                return true;
+            }
+            // Non-overlapping `finditer`: skip the entire matched field. `end`
+            // is strictly > `pos`, and `end` itself may be a valid anchor
+            // (e.g. right after a consumed `delim`).
+            pos = end;
+        } else {
+            pos = if q_pos > pos { q_pos } else { pos + 1 };
         }
     }
     false
@@ -628,16 +774,15 @@ mod tests {
     #[test]
     fn adversarial_long_line_does_not_panic() {
         // One ~1.8 MB newline-free line of alternating quotes and delimiters
-        // drives fancy_regex past its backtrack limit. Before the graceful-Err
-        // fix this PANICKED (BacktrackLimitExceeded) and crossed the FFI
-        // boundary. Now the limit still ends the scans (1.8M matchless chars
-        // after the first field), but only after the first quote pattern's
-        // `,'a',` match, which alone yields the Python oracle's answer.
+        // used to drive fancy_regex past its backtrack limit (initially
+        // panicking across the FFI boundary, then cutting the scan short). With
+        // linear-time matching (#381) the scan completes cleanly and yields the
+        // Python oracle's answer.
         let mut sample = String::from(",'a'");
         for _ in 0..600_000 {
             sample.push_str(",a'");
         }
-        let d = sniff(&sample, None).expect("a cut-short scan still yields a dialect");
+        let d = sniff(&sample, None).expect("long-line scan yields a dialect");
         let oracle = SniffedDialect {
             delimiter: ",".to_string(),
             quotechar: "'".to_string(),
@@ -895,30 +1040,143 @@ mod tests {
 
     #[test]
     fn adversarial_lines_stay_within_fancy_regex_runtime_limits() {
-        // The Python oracle has no backtrack limit, so any runtime Err here is
-        // a place the Rust result may diverge from it (see the note on
-        // `COMPILED_QUOTE_PATTERNS`). The fixed patterns were measured at <= ~4
-        // backtracks per char on these shapes, so a 128k-char line keeps every
-        // scan at about half the 1M default limit and well inside the 1M-entry
-        // stack.
-        const LINE_CHARS: usize = 128 * 1024;
+        // #381: Patterns 2-4 delegate to `regex-automata` (no backtracking),
+        // and Pattern 1 + `has_doubled_quote` are direct O(n) scanners, so even
+        // 1.2M-char adversarial lines (past fancy-regex's old 1M limit/stack)
+        // complete with zero errors.
+        const LINE_CHARS: usize = 1_200_000;
         let mut failures = Vec::new();
         for (name, line) in adversarial_lines(LINE_CHARS) {
-            for (idx, (regexp, _)) in COMPILED_QUOTE_PATTERNS.iter().enumerate() {
+            let _ = tally_pattern_1(&line, None);
+            for (idx, (regexp, _)) in COMPILED_QUOTE_PATTERNS_2_TO_4.iter().enumerate() {
                 if let Some(err) = regexp.captures_iter(&line).find_map(Result::err) {
-                    failures.push(format!("{name}: quote pattern {}: {err}", idx + 1));
+                    failures.push(format!("{name}: quote pattern {}: {err}", idx + 2));
                 }
             }
             for quote in ["\"", "'"] {
                 for delim in [",", " "] {
-                    let regexp = doubled_quote_regex(quote, delim).expect("pattern compiles");
-                    if let Some(err) = regexp.captures_iter(&line).find_map(Result::err) {
-                        failures.push(format!("{name}: doubled-quote {quote}/{delim:?}: {err}"));
-                    }
+                    let _ = has_doubled_quote(&line, quote, delim);
                 }
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    #[test]
+    fn compiled_patterns_do_not_use_backtracking_engine() {
+        // Recompiling with backtrack_limit(1) proves every regex in this module
+        // runs on fancy-regex's `regex-automata` Wrap path (which ignores the
+        // backtrack limit completely).
+        let probe = format!("a,b\n1,\"{}\n", "a".repeat(10_000));
+        for (idx, (regexp, _)) in COMPILED_QUOTE_PATTERNS_2_TO_4.iter().enumerate() {
+            let strict = fancy_regex::RegexBuilder::new(regexp.as_str())
+                .backtrack_limit(1)
+                .build()
+                .expect("pattern compiles");
+            let err = strict.captures_iter(&probe).find_map(Result::err);
+            assert!(
+                err.is_none(),
+                "pattern {} unexpectedly backtracked: {err:?}",
+                idx + 2
+            );
+        }
+    }
+
+    #[test]
+    fn is_delim_char_matches_regex_class_for_ascii_and_unicode() {
+        for byte in 0u8..128 {
+            let ch = char::from(byte);
+            let s = ch.to_string();
+            let regex_match = NON_ASCII_DELIM_CHAR.is_match(&s).expect("regex matches");
+            assert_eq!(
+                is_delim_char(ch),
+                regex_match,
+                "ASCII mismatch for {ch:?} ({byte})"
+            );
+        }
+        // Unicode edge cases (#318): No/Nl are word chars to CPython; Mn marks
+        // and symbols are delimiters.
+        assert!(!is_delim_char('²')); // U+00B2 (No)
+        assert!(!is_delim_char('é')); // U+00E9 (Ll)
+        assert!(!is_delim_char('٣')); // U+0663 (Nd)
+        assert!(is_delim_char('\u{0301}')); // combining acute accent (Mn)
+        assert!(is_delim_char('§')); // U+00A7 (Po)
+        assert!(is_delim_char('€')); // U+20AC (Sc)
+    }
+
+    #[test]
+    fn pattern_1_handles_space_fallback_and_multibyte_delimiters() {
+        // At index 0: ',' + ' ' + "a" fails because closing char is ' ' != ','.
+        // At index 1: ' ' + "" + "a" + ' ' matches.
+        let tally = tally_pattern_1(", \"a\" ; \"b\" ;", None);
+        assert_eq!(tally.matches, 2);
+        assert_eq!(tally.delims, vec![(" ".to_string(), 2)]);
+        assert_eq!(tally.spaces, 0);
+
+        // Space as delimiter WITH skipinitialspace (`  "a" `).
+        let tally = tally_pattern_1("  \"a\" ", None);
+        assert_eq!(tally.matches, 1);
+        assert_eq!(tally.delims, vec![(" ".to_string(), 1)]);
+        assert_eq!(tally.spaces, 1);
+
+        // Multi-byte UTF-8 delimiter (§).
+        let tally = tally_pattern_1("a§\"x\"\"y\"§b", None);
+        assert_eq!(tally.matches, 1);
+        assert_eq!(tally.delims, vec![("§".to_string(), 1)]);
+        assert_eq!(tally.quotes, vec![("\"".to_string(), 1)]);
+    }
+
+    #[test]
+    fn has_doubled_quote_matches_whole_field_non_overlapping_semantics() {
+        // Adjacent quoted fields: lookbehind after consumed `,` finds the second field.
+        assert!(has_doubled_quote("\"a\",\"b\"\"c\"", "\"", ","));
+        // Non-overlapping: `"a",` is consumed as Match 1, so the `"` at index 3
+        // cannot reopen a match across `,b""c",`.
+        assert!(!has_doubled_quote("\"a,\",b\"\"c\",", "\"", ","));
+        // Failed Match 1 at index 0 (`"a,"b""c"` not closed by `,`/`\n`/`$`)
+        // does not consume `,`, so Match 2 starts after `,` and finds `""`.
+        assert!(has_doubled_quote("\"a,\"b\"\"c\"", "\"", ","));
+        // Empty quoted field `""` has an empty body (no doubled quote inside).
+        assert!(!has_doubled_quote("\"\"", "\"", ","));
+        // Four quotes `""""` has body `""` (one doubled quote).
+        assert!(has_doubled_quote("\"\"\"\"", "\"", ","));
+        // Unterminated `"""` is not a whole field.
+        assert!(!has_doubled_quote("\"\"\"", "\"", ","));
+        // Multiple spaces after non-space delimiter; space delimiter skips none.
+        assert!(has_doubled_quote("a,   \"b\"\"c\",d", "\"", ","));
+        assert!(has_doubled_quote(" \"a\"\"b\" ", "\"", " "));
+        // Multi-byte UTF-8 delimiter and regex metacharacter delimiter.
+        assert!(has_doubled_quote("a§\"b\"\"c\"§d", "\"", "§"));
+        assert!(has_doubled_quote("a|\"b\"\"c\"|d", "\"", "|"));
+        // Long line past old fancy-regex limits.
+        let long = format!("a,b\n\"x\",{},\"say \"\"hi\"\"\"\n", "a".repeat(600_000));
+        assert!(has_doubled_quote(&long, "\"", ","));
+    }
+
+    #[test]
+    fn sniff_handles_long_lines_past_old_backtrack_limits() {
+        // Pattern 1: 1.2M-char quoted body + doubled quote at end.
+        let body = "a".repeat(1_200_000);
+        let p1 = format!("a,b\n1,\"{body}\"\"\",2\n");
+        let d1 = sniff(&p1, None).expect("pattern 1 long body");
+        assert_eq!(d1.delimiter, ",");
+        assert_eq!(d1.quotechar, "\"");
+        assert!(d1.doublequote);
+
+        // Pattern 2, 3, 4: 1.2M-char single-quoted bodies.
+        let p2 = format!("a;b\n'{body}',1\n");
+        let d2 = sniff(&p2, None).expect("pattern 2 long body");
+        assert_eq!(d2.delimiter, ",");
+        assert_eq!(d2.quotechar, "'");
+
+        let p3 = format!("a;b\n1,'{body}'\n");
+        let d3 = sniff(&p3, None).expect("pattern 3 long body");
+        assert_eq!(d3.delimiter, ",");
+        assert_eq!(d3.quotechar, "'");
+
+        let p4 = format!("'{body}'\n");
+        let d4 = sniff(&p4, None).expect("pattern 4 long body");
+        assert_eq!(d4.quotechar, "'");
     }
 
     // ---- guess_delimiter contracts (#383) -------------------------------
