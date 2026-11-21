@@ -223,28 +223,28 @@ class TestEngines:
             writer.write_excel(excel_norm_path, normalize_columns=True)
             assert Path(excel_norm_path).exists()
 
-    def test_writer_default_filenames_all_engines(self, sample_csv):
+    def test_writer_default_filenames_all_engines(self, sample_csv, tmp_path, monkeypatch):
         """Test writer using default filenames for all engines."""
         for engine in ALL_ENGINES:
+            engine_dir = tmp_path / engine
+            engine_dir.mkdir()
+            monkeypatch.chdir(engine_dir)
+
             factory = CSVEngineFactory(sample_csv, engine)
             writer = factory.create_writer()
 
             # Test write operations with default filenames
             writer.write_csv()  # Should create output.csv
-            assert Path("output.csv").exists()
-            Path("output.csv").unlink()  # Clean up
+            assert (engine_dir / "output.csv").exists()
 
             writer.write_json()  # Should create output.json
-            assert Path("output.json").exists()
-            Path("output.json").unlink()  # Clean up
+            assert (engine_dir / "output.json").exists()
 
             writer.write_json_newline_delimited()  # Should create output.jsonl
-            assert Path("output.jsonl").exists()
-            Path("output.jsonl").unlink()  # Clean up
+            assert (engine_dir / "output.jsonl").exists()
 
             writer.write_parquet()  # Should create output.parquet
-            assert Path("output.parquet").exists()
-            Path("output.parquet").unlink()  # Clean up
+            assert (engine_dir / "output.parquet").exists()
 
     def test_normalized_columns_all_engines(self, sample_csv):
         """Test column normalization functionality for all engines."""
