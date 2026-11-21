@@ -1,13 +1,16 @@
 """GitHub Actions workflow invariants: deduplication, release guards, allowlist + SHA pinning, and multi-core CI."""
 
+import asyncio
 import importlib.util
 import re
 import subprocess
+import sys
 import threading
 import tomllib
+from collections.abc import AsyncIterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import yaml
@@ -437,3 +440,91 @@ def test_verify_site_deploy_retriggers_empty_commit_on_dropped_webhook_and_fails
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def _load_antigravity_workflow_module() -> ModuleType:
+    script_path = ROOT / "scripts" / "antigravity_workflow.py"
+    if not script_path.is_file():
+        raise FileNotFoundError(f"Missing antigravity workflow script: {script_path}")
+    spec = importlib.util.spec_from_file_location("antigravity_workflow", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module spec from {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_auto_publish_site_pins_antigravity_sdk_for_gemini_4_hydrogen() -> None:
+    wf = _load_workflow("auto-publish-site.yml")
+    steps = _job_steps(wf, "update-docs")
+
+    install_steps = [s for s in steps if s.get("name") == "Install dependencies"]
+    assert len(install_steps) == 1
+    install_cmd = str(install_steps[0].get("run", ""))
+    assert "google-antigravity==0.1.24" in install_cmd
+    assert "google-antigravity==0.1.7" not in install_cmd
+    assert "python-dotenv==1.2.4" in install_cmd
+    assert "python-dotenv==1.2.2" not in install_cmd
+
+
+def test_antigravity_workflow_uses_gemini_4_hydrogen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+    allow_all_sentinel = object()
+
+    def _local_agent_config(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return dict(kwargs)
+
+    class _StubAgent:
+        conversation_id = "conv-test-123"
+
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def __aenter__(self) -> "_StubAgent":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def chat(self, prompt: str) -> AsyncIterator[str]:
+            async def _tokens() -> AsyncIterator[str]:
+                yield "ok"
+
+            return _tokens()
+
+    google_mod = ModuleType("google")
+    antigravity_mod = ModuleType("google.antigravity")
+    hooks_mod = ModuleType("google.antigravity.hooks")
+    setattr(hooks_mod, "policy", SimpleNamespace(allow_all=lambda: allow_all_sentinel))
+    setattr(antigravity_mod, "Agent", _StubAgent)
+    setattr(antigravity_mod, "LocalAgentConfig", _local_agent_config)
+    setattr(antigravity_mod, "hooks", hooks_mod)
+    setattr(google_mod, "antigravity", antigravity_mod)
+
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.antigravity", antigravity_mod)
+    monkeypatch.setitem(sys.modules, "google.antigravity.hooks", hooks_mod)
+
+    mod = _load_antigravity_workflow_module()
+
+    monkeypatch.delenv("USE_VERTEX", raising=False)
+    monkeypatch.setenv("DATAGRUNT_SITE_DIR", str(tmp_path / "datagrunt-site"))
+    repo_dir = tmp_path / "datagrunt"
+    repo_dir.mkdir()
+
+    asyncio.run(
+        mod.run_agent(
+            version="5.4.1",
+            commit_log="abc feat",
+            file_stat="1 file",
+            git_diff="diff",
+            repo_dir=repo_dir,
+        )
+    )
+
+    assert captured["model"] == "gemini-4-hydrogen"
+    assert Path(captured["app_data_dir"]).is_absolute()
+    assert Path(captured["save_dir"]).is_absolute()
+    assert captured["policies"] == [allow_all_sentinel]
+    assert (repo_dir / ".antigravity_latest_session").read_text(encoding="utf-8") == "conv-test-123"

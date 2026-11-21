@@ -107,9 +107,10 @@ jobs:
       - name: Install dependencies
         if: steps.postcheck.outputs.exists != 'true'
         # Pinned: these feed an AI agent that commits to datagrunt-site, so an
-        # unpinned install is a supply-chain soft spot. Dependabot bumps them.
+        # unpinned install is a supply-chain soft spot. Inline `uv pip install`
+        # pins are not tracked by Dependabot and must be bumped manually.
         run: |
-          uv pip install google-antigravity==0.1.7 python-dotenv==1.2.2
+          uv pip install google-antigravity==0.1.24 python-dotenv==1.2.4
 
       - name: Run Antigravity Workflow
         if: steps.postcheck.outputs.exists != 'true'

@@ -100,7 +100,7 @@ async def run_agent(version, commit_log, file_stat, git_diff, repo_dir):
     gcp_location = os.getenv("GCP_LOCATION", "us-central1")
 
     config_kwargs = {
-        "model": "gemini-3.5-flash",
+        "model": "gemini-4-hydrogen",
         "system_instructions": system_instructions,
         "app_data_dir": app_data_dir,
         "save_dir": save_dir,
