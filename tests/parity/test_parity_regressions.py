@@ -79,3 +79,32 @@ def test_redos_shapes_agree_in_bounded_time(tmp_path, shape):
         elapsed = time.perf_counter() - start
         assert elapsed < REDOS_MAX_SECONDS, f"{name} took {elapsed:.2f}s on {shape}"
     assert results["rust"] == results["python"], shape
+
+
+# #381: fancy-regex aborted searches at its 1M backtrack limit or 1M-entry stack
+# on very long lines (250k-1.2M+ chars), making Rust diverge from the Python
+# oracle on real files whose header probe can reach 5 lines x 2 MiB.
+LONG_LINE_PARITY_CASES = {
+    "late_quoted_field_1200k": lambda: "a;b\n" + "x" * 1_200_000 + ',"hi",1\n',
+    "late_doubled_quote_500k": lambda: 'a,b\n"x",' + "a" * 500_000 + ',"say ""hi"""\n',
+    "pattern1_long_body_1200k": lambda: 'a,b\n1,"' + "a" * 1_200_000 + '",2\n',
+    "pattern1_long_body_doubled_1200k": lambda: 'a,b\n1,"' + "a" * 1_200_000 + '""",2\n',
+    "pattern2_long_body_1200k": lambda: "a;b\n'" + "a" * 1_200_000 + "',1\n",
+    "pattern3_long_body_1200k": lambda: "a;b\n1,'" + "a" * 1_200_000 + "'\n",
+    "pattern4_long_body_1200k": lambda: "'" + "a" * 1_200_000 + "'\n",
+    "unterminated_500k_then_valid": lambda: 'id,note\n1,"' + "a" * 500_000 + '\n2,"ok",3\n',
+    "doubled_unterminated_500k_then_valid": lambda: 'a,"' + '""' * 250_000 + '\n1,"x",2\n',
+    "comma_quote_openers_500k": lambda: REDOS_SHAPES["comma_quote_openers"](500_000),
+    "mixed_quote_openers_500k": lambda: REDOS_SHAPES["mixed_quote_openers"](500_000),
+    "quote_run_500k": lambda: REDOS_SHAPES["quote_run"](500_000),
+}
+
+
+@pytest.mark.parametrize("case", sorted(LONG_LINE_PARITY_CASES))
+def test_long_line_sniff_and_probe_parity(tmp_path, case):
+    """#381: Rust and Python oracle must agree on very long lines (500k-1.2M chars)."""
+    path = tmp_path / f"{case}.csv"
+    path.write_text(LONG_LINE_PARITY_CASES[case]())
+
+    assert datagrunt_rs.probe_csv_header(str(path)) == py.probe_csv_header(str(path)), case
+    assert datagrunt_rs.sniff_dialect(str(path)) == py.sniff_dialect(str(path)), case
