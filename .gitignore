@@ -202,7 +202,6 @@ examples/
 # Other AI assistant & editor tool artifacts — local only, never public
 .vscode/
 .gemini/
-GEMINI.md
 .aider*
 .windsurf/
 .codeium/
