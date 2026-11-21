@@ -1,3 +1,5 @@
+import warnings
+
 import polars as pl
 import pyarrow as pa
 import pytest
@@ -40,7 +42,11 @@ def test_query_data(sample_xlsx):
 
 
 def test_read_options_passthrough(sample_xlsx):
-    assert ExcelReader(sample_xlsx).to_dataframe(read_options={"n_rows": 1}).height == 1
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        df = ExcelReader(sample_xlsx).to_dataframe(read_options={"n_rows": 1})
+    assert caught == []
+    assert df.height == 1
 
 
 def test_reserved_read_option_raises(sample_xlsx):
@@ -101,13 +107,75 @@ def test_excelreader_to_dataframe_flat_kwargs(sample_xlsx):
     assert df.row(0) == ("name", "age", "city")
 
 
-def test_excelreader_to_dataframe_read_options_deprecation(sample_xlsx):
-    """Verify that passing read_options as a dict raises a DeprecationWarning."""
-    reader = ExcelReader(sample_xlsx)
-    with pytest.warns(DeprecationWarning, match="Passing 'read_options' as a dictionary is deprecated"):
-        df = reader.to_dataframe(read_options={"n_rows": 1})
+def test_constructor_read_options_preamble_no_deprecation_warning(preamble_xlsx):
+    """ExcelReader(..., read_options={'header_row': 3}) emits zero DeprecationWarnings across all read methods."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        with ExcelReader(preamble_xlsx, read_options={"header_row": 3}) as reader:
+            sample = reader.get_sample()
+            sample_capped = reader.get_sample(n_rows=2)
+            df = reader.to_dataframe()
+            table = reader.to_arrow_table()
+            rows = reader.to_dicts()
+            count = reader.query_data(f"SELECT count(*) FROM {reader.db_table}").fetchall()[0][0]
+            names = [r[0] for r in reader.query_data(f"SELECT name FROM {reader.db_table}").fetchall()]
 
-    assert df.height == 1
+    assert caught == []
+    assert sample.columns == ["name", "age", "city"]
+    assert sample.height == 3
+    assert sample_capped.height == 2
+    assert df.columns == ["name", "age", "city"]
+    assert df.height == 3
+    assert df["name"].to_list() == ["Alice", "Bob", "Cara"]
+    assert table.column_names == ["name", "age", "city"]
+    assert table.num_rows == 3
+    assert len(rows) == 3
+    assert rows[0] == {"name": "Alice", "age": 30, "city": "New York"}
+    assert count == 3
+    assert names == ["Alice", "Bob", "Cara"]
+
+
+def test_per_call_read_options_preamble_no_deprecation_warning(preamble_xlsx):
+    """Per-call read_options={'header_row': 3, 'n_rows': 2} emits zero DeprecationWarnings across all read methods."""
+    opts = {"header_row": 3, "n_rows": 2}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        with ExcelReader(preamble_xlsx) as reader:
+            sample = reader.get_sample(read_options=opts)
+            df = reader.to_dataframe(read_options=opts)
+            table = reader.to_arrow_table(read_options=opts)
+            rows = reader.to_dicts(read_options=opts)
+            count = reader.query_data(f"SELECT count(*) FROM {reader.db_table}", read_options=opts).fetchall()[0][0]
+
+    assert caught == []
+    assert sample.columns == ["name", "age", "city"]
+    assert sample.height == 2
+    assert df.columns == ["name", "age", "city"]
+    assert df.height == 2
+    assert df["name"].to_list() == ["Alice", "Bob"]
+    assert table.column_names == ["name", "age", "city"]
+    assert table.num_rows == 2
+    assert len(rows) == 2
+    assert rows[0]["name"] == "Alice"
+    assert count == 2
+
+
+def test_read_options_constructor_and_per_call_merge(preamble_xlsx):
+    """Constructor and per-call options merge cleanly without DeprecationWarnings."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("error", DeprecationWarning)
+        reader = ExcelReader(preamble_xlsx, read_options={"header_row": 3})
+        # Merge constructor read_options with a per-call top-level Polars kwarg.
+        df_subset_cols = reader.to_dataframe(columns=["name", "city"])
+        # Per-call read_options overrides constructor read_options.
+        df_limited = reader.to_dataframe(read_options={"header_row": 3, "n_rows": 1})
+
+    assert caught == []
+    assert df_subset_cols.columns == ["name", "city"]
+    assert df_subset_cols.height == 3
+    assert df_limited.columns == ["name", "age", "city"]
+    assert df_limited.height == 1
+    assert df_limited["name"].to_list() == ["Alice"]
 
 
 def test_get_sample_n_rows(tmp_path):
