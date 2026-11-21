@@ -144,18 +144,17 @@ class TestCSVWriter:
                 assert out_file.exists()
                 assert out_file.stat().st_size == 0
 
-    def test_default_filenames(self, sample_csv):
+    def test_default_filenames(self, sample_csv, tmp_path, monkeypatch):
         """Test writing with default filenames."""
+        monkeypatch.chdir(tmp_path)
         writer = CSVWriter(sample_csv)
 
         # Test that default filenames are used when no filename is provided
         writer.write_csv()
-        assert Path("output.csv").exists()
-        Path("output.csv").unlink()  # Cleanup
+        assert (tmp_path / "output.csv").exists()
 
         writer.write_parquet()
-        assert Path("output.parquet").exists()
-        Path("output.parquet").unlink()  # Cleanup
+        assert (tmp_path / "output.parquet").exists()
 
     def test_write_parquet_lenient_ragged_csv(self, tmp_path):
         """Ragged CSV with lenient=True must round-trip to parquet, matching write_csv.
