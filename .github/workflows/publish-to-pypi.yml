@@ -61,3 +61,53 @@ jobs:
       - name: Publish to PyPI
         if: ${{ github.event.inputs.target != 'testpypi' }}
         uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1 (v1.14.0)
+
+  release:
+    # Create the GitHub Release only after a real PyPI publish succeeds (never
+    # for TestPyPI smoke publishes). Scopes contents:write strictly to this job.
+    name: Create GitHub Release
+    needs: [publish]
+    runs-on: ubuntu-latest
+    if: >-
+      ${{ github.event.inputs.target != 'testpypi' &&
+          (github.event_name == 'workflow_dispatch' ||
+           github.event.workflow_run.conclusion == 'success') }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Create GitHub Release for current tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 '^current_version = ' pyproject.toml | cut -d'"' -f2)
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract current_version from pyproject.toml"
+            exit 1
+          fi
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "GitHub Release $VERSION already exists; skipping."
+            exit 0
+          fi
+          PREV_TAG=$(git describe --tags --abbrev=0 \
+            --exclude="$VERSION" --exclude="v$VERSION" "${VERSION}^" 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            echo "Creating GitHub Release $VERSION (notes since $PREV_TAG)"
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --generate-notes \
+              --notes-start-tag "$PREV_TAG" \
+              --latest \
+              --verify-tag
+          else
+            echo "Creating GitHub Release $VERSION"
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --generate-notes \
+              --latest \
+              --verify-tag
+          fi
