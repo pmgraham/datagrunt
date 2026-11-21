@@ -17,7 +17,6 @@ from datagrunt.core.csv_io.engines import (
     CSVWriterPolarsEngine,
     CSVWriterPyArrowEngine,
 )
-from datagrunt.core.databases import DuckDBQueries
 
 
 class CSVEngineFactory:
@@ -77,6 +76,8 @@ class CSVEngineFactory:
     @property
     def db_table(self):
         """Return the database table name."""
+        from datagrunt.core.databases import DuckDBQueries
+
         return DuckDBQueries(self.filepath, lenient=self.lenient).database_table_name
 
     def create_reader(self):

@@ -36,7 +36,6 @@ from datagrunt.core.csv_io.protocol import (
 from datagrunt.core.csv_io.protocol import (
     resolve_sample_rows as _resolve_sample_rows,
 )
-from datagrunt.core.databases import DuckDBQueries
 
 
 def _has_midfile_comments(filepath):
@@ -144,6 +143,8 @@ class _DuckDBBackedEngine(ABC):
     """
 
     def __init__(self, filepath, lenient=False, normalize_columns=False):
+        from datagrunt.core.databases import DuckDBQueries
+
         self.filepath = Path(filepath)
         self.lenient = lenient
         self.normalize_columns = normalize_columns
