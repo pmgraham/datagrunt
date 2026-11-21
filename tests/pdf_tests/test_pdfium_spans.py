@@ -1203,6 +1203,135 @@ class TestTextpageNormalisation:
         assert [item.text for item in spans_of(cid_font_page(tmp_path, content, NORMALISED_TO_UNICODE))] == [text]
 
 
+# CID font map for line-end hyphen tests (#478): m, a, r, k, e, s, "-", soft hyphen U+00AD, and mapped U+0002.
+HYPHEN_TO_UNICODE = bfchar_cmap(
+    {
+        b"0001": b"006D",
+        b"0002": b"0061",
+        b"0003": b"0072",
+        b"0004": b"006B",
+        b"0005": b"0065",
+        b"0006": b"0073",
+        b"0007": b"002D",
+        b"0008": b"00AD",
+        b"0009": b"0002",
+    }
+)
+
+
+def _text_object_text(text_object: pdfium_c.FPDF_PAGEOBJECT, textpage: pdfium_c.FPDF_TEXTPAGE) -> str:
+    """Read ``FPDFTextObj_GetText`` as UTF-16LE without its trailing NUL."""
+    size = pdfium_c.FPDFTextObj_GetText(text_object, textpage, None, 0)
+    buffer = ctypes.create_string_buffer(size)
+    pdfium_c.FPDFTextObj_GetText(text_object, textpage, ctypes.cast(buffer, ctypes.POINTER(pdfium_c.FPDF_WCHAR)), size)
+    return buffer.raw[: max(size - 2, 0)].decode("utf-16-le")
+
+
+class TestLineEndHyphen:
+    """pdfium replaces a line-end hyphen with sentinel U+0002; restore "-" without mutating real U+0002 (#478)."""
+
+    def test_drawn_ascii_hyphen_at_line_end_is_restored(self, tmp_path):
+        path = one_page(
+            tmp_path,
+            TextRun("item mark-", x=72.0, y=100.0, size=12.0),
+            TextRun("ers shown", x=72.0, y=114.0, size=12.0),
+        )
+        # Observed pdfium behaviour: both FPDFText_GetUnicode and FPDFTextObj_GetText report sentinel 0x2.
+        raw_doc = pdfium.PdfDocument(path)
+        raw_tp = raw_doc[0].get_textpage()
+        try:
+            assert pdfium_c.FPDFText_GetUnicode(raw_tp.raw, 9) == 0x0002
+            assert pdfium_c.FPDFText_IsHyphen(raw_tp.raw, 9) == 1
+            assert pdfium_c.FPDFText_HasUnicodeMapError(raw_tp.raw, 9) == 0
+            owner = pdfium_c.FPDFText_GetTextObject(raw_tp.raw, 9)
+            assert _text_object_text(owner, raw_tp.raw) == "item mark\x02"
+        finally:
+            raw_tp.close()
+            raw_doc.close()
+
+        result = page_text(open_document(path), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [
+            ("item mark-", ()),
+            ("ers shown", ()),
+        ]
+        assert result.stats.unicode_map_error_count == 0
+        assert result.stats.char_count == len("item mark-") + len("ers shown")
+
+    def test_soft_hyphen_at_line_end_is_restored_to_hyphen(self, tmp_path):
+        # CID font mapping 0008 -> U+00AD at line end: pdfium replaces U+00AD with the same 0x2 sentinel
+        # in both FPDFText_GetUnicode and FPDFTextObj_GetText, so "-" is restored.
+        content = b"BT /F1 12 Tf 72 200 Td <00010002000300040008> Tj 0 -14 Td <000500030006> Tj ET"
+        path = cid_font_page(tmp_path, content, HYPHEN_TO_UNICODE)
+        raw_doc = pdfium.PdfDocument(path)
+        raw_tp = raw_doc[0].get_textpage()
+        try:
+            assert pdfium_c.FPDFText_GetUnicode(raw_tp.raw, 4) == 0x0002
+            assert pdfium_c.FPDFText_IsHyphen(raw_tp.raw, 4) == 1
+            assert pdfium_c.FPDFText_HasUnicodeMapError(raw_tp.raw, 4) == 0
+            owner = pdfium_c.FPDFText_GetTextObject(raw_tp.raw, 4)
+            assert _text_object_text(owner, raw_tp.raw) == "mark\x02"
+        finally:
+            raw_tp.close()
+            raw_doc.close()
+
+        result = page_text(open_document(path), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("mark-", ()), ("ers", ())]
+        assert result.stats.unicode_map_error_count == 0
+
+    def test_winansi_soft_hyphen_at_line_end_is_restored(self, tmp_path):
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+        content = b"BT /F1 12 Tf 72 200 Td (mark\\255) Tj 0 -14 Td (ers) Tj ET"
+        path = content_page(tmp_path, content, font=font)
+
+        result = page_text(open_document(path), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [("mark-", ()), ("ers", ())]
+        assert result.stats.unicode_map_error_count == 0
+
+    @pytest.mark.parametrize(
+        "content,expected",
+        [
+            pytest.param(b"BT /F1 12 Tf 72 200 Td <000100090002> Tj ET", ["m\x02a"], id="mid-line"),
+            pytest.param(
+                b"BT /F1 12 Tf 72 200 Td <00010002000300040009> Tj 0 -14 Td <000500030006> Tj ET",
+                ["mark\x02", "ers"],
+                id="line-end",
+            ),
+        ],
+    )
+    def test_mapped_u0002_is_preserved(self, tmp_path, content, expected):
+        path = cid_font_page(tmp_path, content, HYPHEN_TO_UNICODE)
+
+        result = page_text(open_document(path), 0)
+
+        assert [item.text for item in result.spans] == expected
+        assert result.stats.unicode_map_error_count == 0
+
+    def test_unmapped_0x02_is_not_mutated_even_if_flagged_hyphen(self, tmp_path, monkeypatch):
+        # Preserve, not transform: an unmapped raw char code 0x02 (HasUnicodeMapError == 1) stays "\x02"
+        # and keeps its map error even if FPDFText_IsHyphen were to report 1.
+        font = (
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 750 750] /FontMatrix [0.001 0 0 0.001 0 0]"
+            b" /CharProcs << /a 6 0 R /b 6 0 R /c 6 0 R >>"
+            b" /Encoding << /Type /Encoding /Differences [1 /a 2 /b 3 /c] >>"
+            b" /FirstChar 1 /LastChar 3 /Widths [1000 1000 1000] /Resources << >> >>"
+        )
+        glyph = b"<< /Length 38 >>\nstream\n1000 0 0 0 750 750 d1 0 0 750 750 re f\nendstream"
+        content = b"BT /F1 12 Tf 72 200 Td <01010102> Tj 0 -14 Td <0303> Tj ET"
+        path = content_page(tmp_path, content, font=font, extra=(glyph,))
+
+        monkeypatch.setattr(pdfium_c, "FPDFText_IsHyphen", lambda textpage, index: 1)
+        result = page_text(open_document(path), 0)
+
+        assert [(item.text, item.map_errors) for item in result.spans] == [
+            ("\x01\x01\x01\x02", (0, 1, 2, 3)),
+            ("\x03\x03", (0, 1)),
+        ]
+        assert result.stats.unicode_map_error_count == 6
+
+
 class TestRightToLeft:
     """pdfium reads right-to-left text in logical order; the space it inserts between RTL words has no owner."""
 
@@ -1859,6 +1988,22 @@ class TestPageTextErrors:
         monkeypatch.setattr(pdfium_c, function, stand_in)
 
         with pytest.raises(PDFCorruptError, match=re.escape(message)) as caught:
+            page_text(handle, 0)
+
+        assert caught.value.page_number == 1
+        assert handle_closes == ["PdfTextPage", "PdfPage"]
+
+    def test_hyphen_flag_failure_raises_for_the_page_and_closes_handles(self, tmp_path, monkeypatch, handle_closes):
+        path = one_page(
+            tmp_path,
+            TextRun("mark-", x=72.0, y=100.0, size=12.0),
+            TextRun("ers", x=72.0, y=114.0, size=12.0),
+        )
+        handle = open_document(path)
+        monkeypatch.setattr(pdfium_c, "FPDFText_IsHyphen", failing(-1))
+
+        message = re.escape("page 1: pdfium cannot read whether char 4 is a hyphen")
+        with pytest.raises(PDFCorruptError, match=message) as caught:
             page_text(handle, 0)
 
         assert caught.value.page_number == 1

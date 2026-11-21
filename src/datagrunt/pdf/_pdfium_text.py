@@ -38,8 +38,11 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
   that ``Tf``, whatever matrix scales the text (2.4 pt for 12 pt "Total",
   10.2 pt for "TOTAL DUE MW"), and across within about an eighth of its
   width while the two boxes overlap. It collapses runs of spaces to one,
-  decomposes ligatures (U+FB01 reads "fi") and mirrors "(" in right-to-left
-  text (it reads ")"). The engine keeps every char the textpage reports and counts
+  decomposes ligatures (U+FB01 reads "fi"), mirrors "(" in right-to-left
+  text (it reads ")"), and replaces a line-end hyphen (U+002D or U+00AD) with
+  its sentinel U+0002 (``FPDFText_IsHyphen``; ``FPDFTextObj_GetText`` reads
+  the same textpage and reports U+0002 too, so the engine restores ``"-"``).
+  The engine keeps every char the textpage reports and counts
   the text objects that own none: ``TextStats.empty_text_objects`` when the
   object draws no glyph with extent (its box is a point, anywhere, though
   its em is 1 unit or more each way in its form's space: a single space,
@@ -79,8 +82,10 @@ class RawSpan:
         text: The chars pdfium's textpage reports for the object, each
             kept: control chars, U+FFFD and lone surrogates included (A3
             classifies them). A surrogate pair pdfium reports as two chars
-            is one char here; a raw code beyond U+10FFFF is U+FFFD. The
-            textpage itself drops or rewrites some drawn chars (see the
+            is one char here; a raw code beyond U+10FFFF is U+FFFD. A
+            line-end hyphen pdfium replaces with its sentinel U+0002
+            (``FPDFText_IsHyphen`` without a map error) reads as ``"-"``.
+            The textpage itself drops or rewrites some drawn chars (see the
             module notes: ``Tf 0`` text, space runs, ligatures).
         bbox: The union of ``char_boxes``.
         char_boxes: One box per char of ``text``: pdfium's loose char box
@@ -664,6 +669,11 @@ _HIGH_SURROGATES = range(0xD800, 0xDC00)
 _LOW_SURROGATES = range(0xDC00, 0xE000)
 _MAX_CODE_POINT = 0x10FFFF
 _REPLACEMENT_CHAR = "\ufffd"
+# pdfium's textpage replaces a drawn line-end hyphen (U+002D or U+00AD) with
+# sentinel U+0002 flagged by FPDFText_IsHyphen (#478); FPDFTextObj_GetText
+# reads the same textpage and reports U+0002 too, so U+002D ("-") is restored.
+_HYPHEN_MARKER = 0x0002
+_HYPHEN_CODE = ord("-")
 
 
 class _SpanBuilder:
@@ -807,6 +817,12 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
             pdfium_c.FPDFText_HasUnicodeMapError(textpage, char_index), char_index, "maps to Unicode"
         )
         code = pdfium_c.FPDFText_GetUnicode(textpage, char_index)
+        if (
+            code == _HYPHEN_MARKER
+            and not map_error
+            and _textpage_flag(pdfium_c.FPDFText_IsHyphen(textpage, char_index), char_index, "is a hyphen")
+        ):
+            code = _HYPHEN_CODE
         owner = object_address(text_object)
         if owner not in styles:
             if owner not in object_indices:

@@ -1337,6 +1337,24 @@ class TestRegressions:
         assert len(raw.segments.segments) == 2
         assert (result.quality.vector_line_count, result.quality.rotation_deg, result.route) == (2, 90, "digital")
 
+    def test_line_end_hyphen_stays_digital_and_keeps_drawn_hyphen(self, tmp_path):
+        # Issue #478: restoring pdfium's 0x2 line-end hyphen sentinel to "-" preserves A3 digital routing.
+        runs = (
+            TextRun("Gather the 12 item mark-", x=40.0, y=100.0),
+            TextRun("ers shown to the right", x=40.0, y=114.0),
+        )
+
+        result, _ = assessed(built(tmp_path, *runs))
+
+        assert page_text(result) == "Gather the 12 item mark-ers shown to the right"
+        assert (result.route, result.quality.valid_char_ratio, result.unmapped_regions, result.warnings) == (
+            "digital",
+            1.0,
+            (),
+            (),
+        )
+        assert result.image_only_reasons == ()
+
 
 UNRECOVERED_WARNING = (
     "{count} text object(s) that pdfium's textpage drops could not be recovered; their text is missing from this page"
