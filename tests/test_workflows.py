@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import os
 import re
 import subprocess
 import sys
@@ -108,14 +109,26 @@ def test_ci_runs_core_gate_on_push_but_skips_duplicate_wheel_and_compat_builds()
     ci = _load_workflow("ci.yml")
     jobs = ci["jobs"]
 
-    # Core `test` job stays unguarded on `push` so merged `main` and README badge stay verified.
-    assert "if" not in jobs["test"]
+    # Core `test` job is gated only on `changes.outputs.run_ci` (never skipped on `push`
+    # when CI-relevant files change, so merged `main` and README badge stay verified).
+    assert jobs["test"].get("needs") == ["changes"]
+    test_if = str(jobs["test"].get("if", ""))
+    assert "needs.changes.outputs.run_ci == 'true'" in test_if
+    assert "push" not in test_if
 
     # Cross-OS wheel matrix, 3-version Python matrix, and advisory audit already ran on the PR
     # (and Publish to PyPI builds release wheels after Bump Version).
     for job_id in ("python-compat", "build", "audit"):
+        assert jobs[job_id].get("needs") == ["changes"]
         condition = str(jobs[job_id].get("if", ""))
         assert "github.event_name != " in condition and "push" in condition, f"{job_id} missing push dedupe guard"
+        assert "needs.changes.outputs.run_ci == 'true'" in condition, f"{job_id} missing run_ci path-filter guard"
+
+    # Single always-run ruleset gate verifies required jobs when CI ran, and passes on skipped docs-only PRs.
+    gate = jobs["ci-gate"]
+    assert gate["name"] == "CI gate"
+    assert gate.get("if") == "always()"
+    assert gate.get("needs") == ["changes", "test", "build"]
 
 
 def test_publish_to_pypi_guards_both_build_and_publish_on_bump_success() -> None:
@@ -528,3 +541,120 @@ def test_antigravity_workflow_uses_gemini_4_hydrogen(tmp_path: Path, monkeypatch
     assert Path(captured["save_dir"]).is_absolute()
     assert captured["policies"] == [allow_all_sentinel]
     assert (repo_dir / ".antigravity_latest_session").read_text(encoding="utf-8") == "conv-test-123"
+
+
+def test_ci_path_filter_skips_only_non_packaged_docs_and_fails_closed(tmp_path: Path) -> None:
+    ci = _load_workflow("ci.yml")
+    steps = _job_steps(ci, "changes")
+    filter_steps = [s for s in steps if s.get("id") == "filter"]
+    assert len(filter_steps) == 1
+    run_script = str(filter_steps[0].get("run", ""))
+    assert "<<'PY'\n" in run_script
+    py_body = run_script.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+
+    def _git(*args: str) -> str:
+        res = subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_env,
+            timeout=15,
+        )
+        return res.stdout.strip()
+
+    def _commit(files: dict[str, str], message: str) -> str:
+        for rel, content in files.items():
+            target = repo / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+            _git("add", rel)
+        _git("commit", "-m", message)
+        return _git("rev-parse", "HEAD")
+
+    def _classify(*, event: str, before: str = "", head: str = "") -> str:
+        out_file = tmp_path / "github_output.txt"
+        out_file.write_text("", encoding="utf-8")
+        env = {
+            **git_env,
+            "GITHUB_OUTPUT": str(out_file),
+            "EVENT_NAME": event,
+            "PUSH_BEFORE": before,
+            "HEAD_SHA": head,
+        }
+        res = subprocess.run(
+            [sys.executable, "-c", py_body],
+            cwd=repo,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert res.returncode == 0
+        return out_file.read_text(encoding="utf-8").strip()
+
+    _git("init", "-b", "main")
+    base = _commit({"README.md": "# init\n", "src/app.py": "x = 1\n"}, "init")
+
+    # Non-packaged repo docs/meta edits skip heavy CI.
+    docs_sha = _commit(
+        {
+            "GEMINI.md": "# playbook\n",
+            "CLAUDE.md": "# playbook\n",
+            ".gitignore": "*.tmp\n",
+            ".github/ISSUE_TEMPLATE/bug.yml": "name: Bug\n",
+            "docs/notes.md": "notes\n",
+        },
+        "docs only",
+    )
+    assert _classify(event="push", before=base, head=docs_sha) == "run_ci=false"
+
+    # Packaged files (README.md, LICENSE, THIRD_PARTY_NOTICES.txt), Auto Document Updater,
+    # workflows, source, and unknown new files must always run full CI.
+    prev = docs_sha
+    for rel in (
+        "README.md",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES.txt",
+        "scripts/antigravity_workflow.py",
+        ".github/workflows/auto-publish-site.yml",
+        "unknown_new_file.txt",
+    ):
+        nxt = _commit({rel: f"change {rel}\n"}, f"touch {rel}")
+        assert _classify(event="push", before=prev, head=nxt) == "run_ci=true", f"{rel} must trigger CI"
+        prev = nxt
+
+    # Mixed docs + code commit runs CI.
+    mixed = _commit({"GEMINI.md": "updated\n", "src/app.py": "x = 2\n"}, "mixed")
+    assert _classify(event="push", before=prev, head=mixed) == "run_ci=true"
+
+    # Simulated GitHub PR merge commit (HEAD^1 = base, HEAD^2 = feature branch) skips on docs-only PR.
+    _git("checkout", "-b", "docs-pr", mixed)
+    _commit({"GEMINI.md": "pr edit\n"}, "pr docs edit")
+    _git("checkout", "main")
+    _git("merge", "--no-ff", "docs-pr", "-m", "merge docs-pr")
+    assert _classify(event="pull_request") == "run_ci=false"
+
+    # Simulated GitHub PR merge commit touching README runs CI.
+    _git("checkout", "-b", "readme-pr", mixed)
+    _commit({"README.md": "# updated\n"}, "pr readme edit")
+    _git("checkout", "main")
+    _git("merge", "--no-ff", "readme-pr", "-m", "merge readme-pr")
+    assert _classify(event="pull_request") == "run_ci=true"
+
+    # Manual workflow_dispatch and fail-closed fallbacks always run CI.
+    assert _classify(event="workflow_dispatch") == "run_ci=true"
+    assert _classify(event="push", before="0" * 40, head=mixed) == "run_ci=true"
+    _git("checkout", docs_sha)
+    assert _classify(event="pull_request") == "run_ci=true"
