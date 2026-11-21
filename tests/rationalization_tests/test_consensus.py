@@ -2956,24 +2956,33 @@ class TestBenchmarkGate:
             records = [assembly("A-1", f"Title {index}", revision=index) for index in range(count)]
             return outcome({(U1, OPENAI[0]): answer(*records)}, (OPENAI,)), (U1,)
 
-        def best(run: RunOutcome, unit_ids: tuple[str, ...]) -> float:
-            fastest = math.inf
-            for _ in range(3):
-                gc.collect()
-                gc.disable()
-                try:
-                    started = time.perf_counter()
-                    (found,) = build_consensus(run, ASSEMBLY, unit_ids, min_families=1).items
-                    fastest = min(fastest, time.perf_counter() - started)
-                finally:
-                    gc.enable()
-                assert found.disputed_fields == ("title", "revision")
-            return fastest
+        def measure_once(run: RunOutcome, unit_ids: tuple[str, ...]) -> float:
+            gc.collect()
+            gc.disable()
+            try:
+                started = time.perf_counter()
+                (found,) = build_consensus(run, ASSEMBLY, unit_ids, min_families=1).items
+                elapsed = time.perf_counter() - started
+            finally:
+                gc.enable()
+            assert found.disputed_fields == ("title", "revision")
+            return elapsed
 
-        small_s, large_s = best(*copies_run(1_000)), best(*copies_run(2_000))
+        # Use 4,000 vs 8,000 copies (~40-80 ms) with warm-up and interleaved rounds so
+        # shared-runner millisecond jitter cannot push linear ~2x scaling over the gate
+        # while quadratic ~4x regressions still fail cleanly (#515).
+        small = copies_run(4_000)
+        large = copies_run(8_000)
+        measure_once(*small)
+        measure_once(*large)
 
-        print(f"\n1,000 copies: {small_s:.3f} s; 2,000 copies: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
-        assert large_s <= 2.2 * small_s
+        small_s = large_s = math.inf
+        for _ in range(5):
+            small_s = min(small_s, measure_once(*small))
+            large_s = min(large_s, measure_once(*large))
+
+        print(f"\n4,000 copies: {small_s:.3f} s; 8,000 copies: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
+        assert large_s <= 2.6 * small_s
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_units_take_about_twice_the_time(self):
