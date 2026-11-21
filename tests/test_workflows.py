@@ -136,12 +136,40 @@ def test_publish_to_pypi_guards_both_build_and_publish_on_bump_success() -> None
     publish_wf = _load_workflow("publish-to-pypi.yml")
     jobs = publish_wf["jobs"]
 
-    for job_id in ("build", "publish"):
+    for job_id in ("build", "publish", "release"):
         condition = str(jobs[job_id].get("if", ""))
         assert "github.event.workflow_run.conclusion == " in condition and "success" in condition, (
             f"publish-to-pypi.yml job {job_id!r} must not run when Bump Version fails"
         )
         assert "github.event_name == " in condition and "workflow_dispatch" in condition
+
+
+def test_publish_to_pypi_creates_github_release_after_real_pypi_publish() -> None:
+    publish_wf = _load_workflow("publish-to-pypi.yml")
+    assert publish_wf.get("permissions") == {"contents": "read"}
+
+    release = publish_wf["jobs"]["release"]
+    assert release.get("needs") == ["publish"]
+    assert release.get("permissions") == {"contents": "write"}
+
+    condition = str(release.get("if", ""))
+    assert "testpypi" in condition and "!=" in condition, "GitHub Release must not be created for TestPyPI publishes"
+
+    steps = _job_steps(publish_wf, "release")
+    checkout_steps = [s for s in steps if "actions/checkout@" in str(s.get("uses", ""))]
+    assert len(checkout_steps) == 1
+    assert checkout_steps[0].get("with", {}).get("fetch-depth") == 0
+
+    release_steps = [s for s in steps if s.get("name") == "Create GitHub Release for current tag"]
+    assert len(release_steps) == 1
+    assert release_steps[0].get("env", {}).get("GH_TOKEN") == "${{ github.token }}"
+    cmd = str(release_steps[0].get("run", ""))
+    assert 'gh release view "$VERSION"' in cmd
+    assert 'gh release create "$VERSION"' in cmd
+    assert "--generate-notes" in cmd
+    assert "--verify-tag" in cmd
+    assert "--latest" in cmd
+    assert "${{" not in cmd, "release step must not interpolate GitHub expressions directly into bash"
 
 
 def test_bump_version_serializes_runs_and_skips_already_tagged_head() -> None:
