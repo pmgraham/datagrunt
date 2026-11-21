@@ -9,6 +9,7 @@ import sys
 import threading
 import tomllib
 from collections.abc import AsyncIterator
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -572,6 +573,286 @@ def test_antigravity_workflow_uses_gemini_4_hydrogen(tmp_path: Path, monkeypatch
     assert Path(captured["save_dir"]).is_absolute()
     assert captured["policies"] == [allow_all_sentinel]
     assert (repo_dir / ".antigravity_latest_session").read_text(encoding="utf-8") == "conv-test-123"
+
+
+def test_antigravity_workflow_version_slug_dynamic_blog_dir_and_filename_normalization(tmp_path: Path) -> None:
+    mod = _load_antigravity_workflow_module()
+    site_dir = tmp_path / "datagrunt-site"
+
+    assert mod.version_slug("5.4.1") == "5-4-1"
+    assert mod.version_slug("4.6.2") == "4-6-2"
+    with pytest.raises(ValueError, match="non-empty"):
+        mod.version_slug("   ")
+
+    march_2027 = datetime(2027, 3, 15, 10, 30, 0, tzinfo=timezone.utc)
+    nov_2026 = datetime(2026, 11, 21, 17, 48, 0, tzinfo=timezone.utc)
+    assert mod.expected_blog_dir(site_dir, now=march_2027) == site_dir / "content" / "blog" / "2027" / "march"
+    assert mod.expected_blog_dir(site_dir, now=nov_2026) == site_dir / "content" / "blog" / "2026" / "november"
+
+    blog_dir = mod.expected_blog_dir(site_dir, now=nov_2026)
+    blog_dir.mkdir(parents=True)
+
+    # Dotted filename (the #336 regression) is cleanly normalized to the dashed slug.
+    dotted_post = blog_dir / "datagrunt-4.6.2-regex-updates.md"
+    dotted_post.write_text("# Datagrunt 4.6.2\n", encoding="utf-8")
+    normalized = mod.normalize_release_post_filename(dotted_post, "4.6.2")
+    assert normalized == blog_dir / "datagrunt-4-6-2-regex-updates.md"
+    assert normalized.is_file()
+    assert not dotted_post.exists()
+
+    # Already-dashed filename is preserved without error.
+    assert mod.normalize_release_post_filename(normalized, "4.6.2") == normalized
+    assert mod.normalize_and_find_release_posts(site_dir, "4.6.2") == [normalized.resolve()]
+
+    # Collision with an existing dashed file fails loud instead of clobbering.
+    duplicate_dotted = blog_dir / "datagrunt-4.6.2-regex-updates.md"
+    duplicate_dotted.write_text("# Duplicate\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="destination already exists"):
+        mod.normalize_release_post_filename(duplicate_dotted, "4.6.2")
+    duplicate_dotted.unlink()
+
+    # Unrelated filename or missing short-description suffix is rejected.
+    bad_name = blog_dir / "release-notes.md"
+    bad_name.write_text("# Bad\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="datagrunt-4-6-2-"):
+        mod.normalize_release_post_filename(bad_name, "4.6.2")
+
+    no_desc = blog_dir / "datagrunt-4-6-2.md"
+    no_desc.write_text("# No desc\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="datagrunt-4-6-2-"):
+        mod.normalize_release_post_filename(no_desc, "4.6.2")
+
+    # Missing release post for a version fails loud.
+    with pytest.raises(ValueError, match="datagrunt-9-9-9-"):
+        mod.normalize_and_find_release_posts(site_dir, "9.9.9")
+
+
+def test_antigravity_workflow_validates_markdown_links() -> None:
+    mod = _load_antigravity_workflow_module()
+
+    valid_md = """---
+title: "Datagrunt 5.4.1: Release Highlights"
+date: 2026-11-21T17:48:43+00:00
+draft: false
+author: "Martin Graham"
+author_email: "datagrunt@datagrunt.io"
+description: "Highlights for 5.4.1"
+tags: ["python", "csv"]
+---
+
+See the [CSV guide](/docs/csv/), jump to [benchmarks](#benchmarks), read a
+[sibling note](./other-post.md), visit [Datagrunt](https://www.datagrunt.io/docs/ "Docs"),
+or read [RFC 4180](https://en.wikipedia.org/wiki/Comma-separated_values_(RFC_4180)).
+
+[gh]: https://github.com/pmgraham/datagrunt
+[^1]: Footnote with colon: safe text.
+
+```bash
+curl http://localhost:8000/health
+```
+"""
+    assert mod.validate_generated_markdown(valid_md, allow_import_check=False) == []
+
+    # Reject file:// in inline links, angle links, reference links, HTML attrs, and raw text.
+    file_link_md = (
+        "Inspect [dialect.rs](file:///home/runner/work/datagrunt/rust/src/dialect.rs).\n"
+        "Also [spaced](<file:///home/runner/my dir/file.py>).\n"
+        "[ref]: file:///tmp/local.py\n"
+        '<a href="file:///etc/hosts">hosts</a>\n'
+        "Raw path: file:///home/runner/work/datagrunt/README.md\n"
+    )
+    file_errors = mod.validate_generated_markdown(file_link_md, allow_import_check=False)
+    assert len(file_errors) == 5
+    assert all("file://" in err for err in file_errors)
+
+    # Reject non-https absolute schemes: http://, ftp://, javascript:, autolink, raw http://.
+    bad_scheme_md = (
+        "[insecure](http://www.datagrunt.io/docs)\n"
+        "[ftp](ftp://files.example.com/sample.csv)\n"
+        "[xss](javascript:alert(1))\n"
+        "<http://example.com/auto>\n"
+        "Bare link: http://example.com/bare\n"
+    )
+    scheme_errors = mod.validate_generated_markdown(bad_scheme_md, allow_import_check=False)
+    assert len(scheme_errors) == 5
+    assert any("http:" in err for err in scheme_errors)
+    assert any("ftp:" in err for err in scheme_errors)
+    assert any("javascript:" in err for err in scheme_errors)
+
+
+def test_antigravity_workflow_verifies_python_code_sample_imports() -> None:
+    mod = _load_antigravity_workflow_module()
+
+    valid_samples = """
+```python
+from datagrunt import CSVReader, PDFReader, Key, rationalize
+from datagrunt.core import CSVComponents
+import datagrunt.core.csv_io
+
+# Must not be executed during static validation.
+raise RuntimeError("snippet body should never execute")
+```
+
+```py {hl_lines=[1]}
+from datagrunt.pdf import BBox, PDFDocument
+```
+"""
+    assert mod.validate_generated_markdown(valid_samples) == []
+
+    broken_top_level = """
+```python
+from datagrunt import CSVComponents
+```
+"""
+    top_errors = mod.validate_generated_markdown(broken_top_level)
+    assert len(top_errors) == 1
+    assert "CSVComponents" in top_errors[0]
+    assert "'datagrunt'" in top_errors[0]
+
+    # Disabling import checks skips code-sample import validation.
+    assert mod.validate_generated_markdown(broken_top_level, allow_import_check=False) == []
+
+    broken_module_and_syntax = """
+```python
+import datagrunt.does_not_exist
+from datagrunt.fake_submod import Nothing
+```
+
+```python
+from datagrunt import CSVReader
+def broken_syntax(
+```
+"""
+    mixed_errors = mod.validate_generated_markdown(broken_module_and_syntax)
+    assert any("datagrunt.does_not_exist" in err for err in mixed_errors)
+    assert any("datagrunt.fake_submod" in err for err in mixed_errors)
+    assert any("syntax error" in err.lower() for err in mixed_errors)
+
+
+def test_antigravity_workflow_hardened_instructions_and_run_agent_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mod = _load_antigravity_workflow_module()
+    site_dir = tmp_path / "datagrunt-site"
+    repo_dir = tmp_path / "datagrunt"
+    repo_dir.mkdir()
+
+    # Verify system instructions carry dynamic year/month, dashed slug, no-file://, import & anti-fabrication rules.
+    march_2027 = datetime(2027, 3, 15, 10, 30, 0, tzinfo=timezone.utc)
+    instructions = mod.build_system_instructions(
+        version="5.4.1",
+        repo_dir=repo_dir,
+        site_dir=site_dir,
+        now=march_2027,
+    )
+    assert str(site_dir / "content" / "blog" / "2027" / "march") in instructions
+    assert "2026/june" not in instructions
+    assert "datagrunt-5-4-1-" in instructions
+    assert "file://" in instructions
+    assert "src/datagrunt" in instructions
+    assert "NEVER invent" in instructions
+
+    # Wire stub Agent to verify run_agent normalizes dotted filenames and rejects invalid generated posts.
+    allow_all_sentinel = object()
+    blog_dir = site_dir / "content" / "blog" / "2026" / "november"
+    blog_dir.mkdir(parents=True)
+
+    written_payload: dict[str, tuple[str, str]] = {}
+
+    class _WritingStubAgent:
+        conversation_id = "conv-validate-456"
+
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+        async def __aenter__(self) -> "_WritingStubAgent":
+            return self
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+            return None
+
+        async def chat(self, prompt: str) -> AsyncIterator[str]:
+            filename, body = written_payload["post"]
+            (blog_dir / filename).write_text(body, encoding="utf-8")
+
+            async def _tokens() -> AsyncIterator[str]:
+                yield "done"
+
+            return _tokens()
+
+    google_mod = ModuleType("google")
+    antigravity_mod = ModuleType("google.antigravity")
+    hooks_mod = ModuleType("google.antigravity.hooks")
+    setattr(hooks_mod, "policy", SimpleNamespace(allow_all=lambda: allow_all_sentinel))
+    setattr(antigravity_mod, "Agent", _WritingStubAgent)
+    setattr(antigravity_mod, "LocalAgentConfig", lambda **kwargs: dict(kwargs))
+    setattr(antigravity_mod, "hooks", hooks_mod)
+    setattr(google_mod, "antigravity", antigravity_mod)
+
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.antigravity", antigravity_mod)
+    monkeypatch.setitem(sys.modules, "google.antigravity.hooks", hooks_mod)
+    monkeypatch.delenv("USE_VERTEX", raising=False)
+    monkeypatch.setenv("DATAGRUNT_SITE_DIR", str(site_dir))
+
+    # Case 1: Agent writes dotted filename with valid links and valid imports -> normalized & accepted.
+    written_payload["post"] = (
+        "datagrunt-5.4.1-release-highlights.md",
+        """---
+title: "Datagrunt 5.4.1: Highlights"
+date: 2026-11-21T17:48:43+00:00
+draft: false
+---
+
+Read [the docs](/docs/csv/) and [GitHub](https://github.com/pmgraham/datagrunt).
+
+```python
+from datagrunt import CSVReader
+from datagrunt.core import CSVComponents
+```
+""",
+    )
+    asyncio.run(
+        mod.run_agent(
+            version="5.4.1",
+            commit_log="abc feat",
+            file_stat="1 file",
+            git_diff="diff",
+            repo_dir=repo_dir,
+        )
+    )
+    normalized_path = blog_dir / "datagrunt-5-4-1-release-highlights.md"
+    assert normalized_path.is_file()
+    assert not (blog_dir / "datagrunt-5.4.1-release-highlights.md").exists()
+
+    # Case 2: Agent writes broken file:// link and bad import -> run_agent fails loud with ValueError.
+    written_payload["post"] = (
+        "datagrunt-5-4-1-release-highlights.md",
+        """---
+title: "Datagrunt 5.4.1: Broken"
+date: 2026-11-21T17:48:43+00:00
+draft: false
+---
+
+See [dialect.rs](file:///home/runner/work/datagrunt/rust/src/dialect.rs).
+
+```python
+from datagrunt import CSVComponents
+```
+""",
+    )
+    with pytest.raises(ValueError, match="failed validation") as exc_info:
+        asyncio.run(
+            mod.run_agent(
+                version="5.4.1",
+                commit_log="abc feat",
+                file_stat="1 file",
+                git_diff="diff",
+                repo_dir=repo_dir,
+            )
+        )
+    assert "file://" in str(exc_info.value)
+    assert "CSVComponents" in str(exc_info.value)
 
 
 def test_ci_path_filter_skips_only_non_packaged_docs_and_fails_closed(tmp_path: Path) -> None:
