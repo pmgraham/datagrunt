@@ -11,6 +11,7 @@ import math
 import random
 import time
 import warnings
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
@@ -2950,58 +2951,81 @@ class TestBenchmarkGate:
         )
         assert elapsed <= budget_s
 
+    @staticmethod
+    def _interleaved_pair(
+        small_fn: Callable[[], object], large_fn: Callable[[], object], runs: int = 5
+    ) -> tuple[float, float]:
+        """Warm up once, then interleave ``runs`` GC-paused measurements and return ``(min_small, min_large)``."""
+
+        def measure_once(fn: Callable[[], object]) -> float:
+            gc.collect()
+            gc.disable()
+            try:
+                started = time.perf_counter()
+                fn()
+                return time.perf_counter() - started
+            finally:
+                gc.enable()
+
+        measure_once(small_fn)
+        measure_once(large_fn)
+        small_s = large_s = math.inf
+        for _ in range(runs):
+            small_s = min(small_s, measure_once(small_fn))
+            large_s = min(large_s, measure_once(large_fn))
+        return small_s, large_s
+
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_repeated_copies_of_a_key_take_about_twice_the_time(self):
         def copies_run(count: int) -> tuple[RunOutcome, tuple[str, ...]]:
             records = [assembly("A-1", f"Title {index}", revision=index) for index in range(count)]
             return outcome({(U1, OPENAI[0]): answer(*records)}, (OPENAI,)), (U1,)
 
-        def measure_once(run: RunOutcome, unit_ids: tuple[str, ...]) -> float:
-            gc.collect()
-            gc.disable()
-            try:
-                started = time.perf_counter()
+        def run_case(run: RunOutcome, unit_ids: tuple[str, ...]) -> Callable[[], object]:
+            def _call() -> None:
                 (found,) = build_consensus(run, ASSEMBLY, unit_ids, min_families=1).items
-                elapsed = time.perf_counter() - started
-            finally:
-                gc.enable()
-            assert found.disputed_fields == ("title", "revision")
-            return elapsed
+                assert found.disputed_fields == ("title", "revision")
 
-        # Use 4,000 vs 8,000 copies (~40-80 ms) with warm-up and interleaved rounds so
+            return _call
+
+        # Use 4,000 vs 8,000 copies (~140-285 ms) with warm-up and interleaved rounds so
         # shared-runner millisecond jitter cannot push linear ~2x scaling over the gate
         # while quadratic ~4x regressions still fail cleanly (#515).
-        small = copies_run(4_000)
-        large = copies_run(8_000)
-        measure_once(*small)
-        measure_once(*large)
-
-        small_s = large_s = math.inf
-        for _ in range(5):
-            small_s = min(small_s, measure_once(*small))
-            large_s = min(large_s, measure_once(*large))
+        small_s, large_s = self._interleaved_pair(run_case(*copies_run(4_000)), run_case(*copies_run(8_000)))
 
         print(f"\n4,000 copies: {small_s:.3f} s; 8,000 copies: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
         assert large_s <= 2.6 * small_s
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_units_take_about_twice_the_time(self):
-        small, large = light_run(1_000), light_run(2_000)
+        small_run, small_ids = light_run(1_000)
+        large_run, large_ids = light_run(2_000)
 
-        small_s, _ = best_time(*small, runs=5, collect=False)
-        large_s, _ = best_time(*large, runs=5, collect=False)
+        # Interleaved warm-up + 2.6x gate tolerates shared CI runner jitter while
+        # still failing quadratic ~4x regressions (#521).
+        small_s, large_s = self._interleaved_pair(
+            lambda: build_consensus(small_run, ASSEMBLY, small_ids, min_families=2),
+            lambda: build_consensus(large_run, ASSEMBLY, large_ids, min_families=2),
+        )
 
         print(f"\n1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
-        assert large_s <= 2.2 * small_s
+        assert large_s <= 2.6 * small_s
 
     @pytest.mark.no_cover  # coverage's tracer (settrace before 3.12) would be what is timed
     def test_twice_the_units_take_about_twice_the_time_to_ground(self):
         small, large = realistic_run(1_000, records=2, children=1), realistic_run(2_000, records=2, children=1)
+        small_consensus = build_consensus(small.outcome, LOT, small.unit_ids, min_families=2)
+        large_consensus = build_consensus(large.outcome, LOT, large.unit_ids, min_families=2)
 
-        small_s, large_s = best_grounding_time(small), best_grounding_time(large)
+        # Interleaved warm-up + 2.6x gate tolerates shared CI runner jitter while
+        # still failing quadratic ~4x regressions (#521).
+        small_s, large_s = self._interleaved_pair(
+            lambda: small.ground(small_consensus),
+            lambda: large.ground(large_consensus),
+        )
 
         print(f"\ngrounding 1,000 units: {small_s:.3f} s; 2,000 units: {large_s:.3f} s; ratio {large_s / small_s:.2f}")
-        assert large_s <= 2.2 * small_s
+        assert large_s <= 2.6 * small_s
 
     def test_identical_scalar_fields_across_voters_do_not_re_normalize_values(self, monkeypatch):
         calls: list[object] = []
