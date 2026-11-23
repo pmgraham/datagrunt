@@ -18,19 +18,20 @@ figure it was reading, saying why.
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Literal
 
 from datagrunt.pdf._image_facts import RawImage
 from datagrunt.pdf._memory_cap import CAP_EXIT, apply_memory_cap
 from datagrunt.pdf._process import error_reply, send_message
 from datagrunt.pdf._validate import checked_password, checked_path, choice_str, int_at_least, positive_float
-from datagrunt.pdf.pdfium_engine import ImageLoader
+from datagrunt.pdf.pdfium_engine import FigureSession, ImageLoader, open_document
 
 __all__: list[str] = []
 
 _BYTES, _ERROR = b"B", b"E"
 _REQUEST_KEYS = ("figures", "kind", "memory_cap_bytes", "password", "source", "timeout_s")
 _KINDS = ("png", "raw")
+_Kind = Literal["png", "raw"]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -39,7 +40,7 @@ class _Request:
 
     source: str
     password: str | None = field(repr=False)
-    kind: str
+    kind: _Kind
     memory_cap_bytes: int
     timeout_s: float
     figures: tuple[tuple[int, RawImage], ...]
@@ -60,18 +61,37 @@ def _worker_main(message: object, replies: IO[bytes]) -> None:
     try:
         apply_memory_cap(request.memory_cap_bytes, request.timeout_s)
     except Exception as exc:  # no figure is read uncapped: each fails with why
-        for _ in request.figures:
-            send_message(replies, _ERROR + error_reply(exc))
+        _send_error_all(replies, len(request.figures), exc)
         return
-    for page_index, image in request.figures:  # bounded: the batch's figures
-        _send_read(replies, request, page_index, image)
+    _serve_batch(replies, request)
 
 
-def _send_read(replies: IO[bytes], request: _Request, page_index: int, image: RawImage) -> None:
-    """Read one figure and send its bytes, or its error; reaching the cap ends the worker."""
+def _send_error_all(replies: IO[bytes], count: int, exc: Exception) -> None:
+    """Send ``exc`` as the error reply for each of ``count`` figures."""
+    payload = _ERROR + error_reply(exc)
+    for _ in range(count):
+        send_message(replies, payload)
+
+
+def _serve_batch(replies: IO[bytes], request: _Request) -> None:
+    """Open the PDF once for ``request`` and read every figure in order through one ``FigureSession``."""
+    try:
+        handle_ctx = open_document(request.source, password=request.password)
+    except MemoryError:
+        os._exit(CAP_EXIT)
+    except Exception as exc:  # open failed: every figure in the batch receives this error
+        _send_error_all(replies, len(request.figures), exc)
+        return
+    with handle_ctx as handle, FigureSession(handle) as session:
+        for page_index, image in request.figures:  # bounded: the batch's figures
+            _send_read(replies, session, request, page_index, image)
+
+
+def _send_read(replies: IO[bytes], session: FigureSession, request: _Request, page_index: int, image: RawImage) -> None:
+    """Read one figure through ``session`` and send its bytes, or its error; reaching the cap ends the worker."""
     try:
         loader = ImageLoader(source=Path(request.source), page_index=page_index, image=image, password=request.password)
-        data = loader.png_bytes() if request.kind == "png" else loader.raw_bytes()
+        data = session.read(loader, request.kind)
     except MemoryError:
         os._exit(CAP_EXIT)
     except Exception as exc:  # this figure's error, sent to the caller, who raises it as it was
@@ -79,6 +99,12 @@ def _send_read(replies: IO[bytes], request: _Request, page_index: int, image: Ra
         return
     send_message(replies, _BYTES)
     send_message(replies, data)
+
+
+def _checked_kind(value: object) -> _Kind:
+    """Return ``value`` narrowed to ``Literal['png', 'raw']``."""
+    kind = choice_str("kind", value, _KINDS)
+    return "png" if kind == "png" else "raw"
 
 
 def _request_from(message: object) -> _Request:
@@ -92,7 +118,7 @@ def _request_from(message: object) -> _Request:
     return _Request(
         source=str(checked_path(message["source"], "source")),
         password=checked_password(message["password"]),
-        kind=choice_str("kind", message["kind"], _KINDS),
+        kind=_checked_kind(message["kind"]),
         memory_cap_bytes=int_at_least("memory_cap_bytes", message["memory_cap_bytes"], 1),
         timeout_s=positive_float("timeout_s", message["timeout_s"]),
         figures=tuple(_figure_from(position, item) for position, item in enumerate(figures)),

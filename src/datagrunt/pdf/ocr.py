@@ -11,10 +11,14 @@ the grey levels between them to 0..255; a page with nothing left to stretch
 (one grey level, or black to white already) comes back unchanged.
 
 :func:`bands` cuts a page into horizontal :class:`Band` s for OCR (spec
-§3.3 step 4): 900 px tall, stepping by 840 px, so neighbours share 60 rows
-and a line of text up to 60 px tall (14.4 pt at 300 DPI) is whole in one of
-them. The last band ends at the page's bottom row, so it may be shorter
-than 900 px; every row is in one band or two.
+§3.3 step 4): nominally 900 px tall, stepping by 840 px, so neighbours share
+60 rows and a line of text up to 60 px tall (14.4 pt at 300 DPI) is whole in
+one of them. When ink spans the interior of a seam's shared strip (a tall
+line such as a large heading, #444), the cut shifts upward within a bounded
+window to the nearest blank horizontal pixel row so the tall line is kept
+whole in one band; if no blank row lies in the window, it falls back to the
+exact fixed cut. Every band is at most 900 px tall, every row is in one band
+or two, and pages without straddling lines produce identical bands.
 
 The tesseract CLI (never ``pytesseract``) reads the page:
 
@@ -108,6 +112,13 @@ _AUTOCONTRAST_CUTOFF = 1
 # The spec's bands: 900 px tall, neighbours sharing 60 rows.
 _BAND_HEIGHT = 900
 _BAND_OVERLAP = 60
+# A row whose every pixel is at least this grey level is blank, for cutting seams between tall lines (#444).
+_BLANK_ROW_MIN = 240
+_BLANK_TABLE = bytes([0] * _BLANK_ROW_MIN + [1] * (256 - _BLANK_ROW_MIN))
+# Maximum rows above a seam's nominal lower start to search for a blank row (clears up to ~100 pt at 300 DPI).
+_MAX_CUT_WINDOW = 420
+# Maximum blank rows shared at a shifted blank-row cut: enough margin for tesseract without wasting band height.
+_BLANK_CUT_MARGIN = 8
 
 _TURNS = (0, 90, 180, 270)
 _TURN_NAMES = "0, 90, 180 or 270"
@@ -191,12 +202,15 @@ def _image(page: RenderedPage) -> Image.Image:
 
 
 def bands(page: RenderedPage, *, height: int = _BAND_HEIGHT, overlap: int = _BAND_OVERLAP) -> tuple[Band, ...]:
-    """``page`` cut into bands ``height`` rows tall whose neighbours share ``overlap`` rows.
+    """``page`` cut into bands up to ``height`` rows tall whose neighbours share up to ``overlap`` rows.
 
-    Bands start every ``height - overlap`` rows from the top; the last is the
-    first to reach the bottom, and ends there (it may be shorter). A page up
-    to ``height`` rows tall is one band. Every row is in one band or two, and
-    there are at most as many bands as rows.
+    Nominally bands step by ``height - overlap`` rows from the top. When ink
+    fills the interior of a seam's shared strip (a tall line straddling the
+    seam, #444), the cut shifts upward within a bounded window to a blank
+    horizontal pixel row so the tall line stays whole; without a blank row in
+    the window it falls back to the exact fixed cut. A page up to ``height``
+    rows tall is one band, every row is in one band or two, and band count is
+    strictly bounded.
 
     Raises:
         TypeError: If ``page`` is not a :class:`~datagrunt.pdf.render.RenderedPage`,
@@ -210,10 +224,79 @@ def bands(page: RenderedPage, *, height: int = _BAND_HEIGHT, overlap: int = _BAN
     int_at_least("overlap", overlap, 1)
     if 2 * overlap > height:
         raise ValueError(f"overlap ({overlap}) must be at most half of height ({height})")
+    if page.px_height <= height:
+        return (_band(page, 0, page.px_height),)
+    result: list[Band] = []
+    top = 0
+    for _ in range(page.px_height):  # bounded: top advances by at least 1 row per band
+        if top + height >= page.px_height:
+            break
+        end, next_top = _seam_cut(page, top, height, overlap)
+        result.append(_band(page, top, end - top))
+        top = next_top
+    result.append(_band(page, top, page.px_height - top))
+    return tuple(result)
+
+
+def _seam_cut(page: RenderedPage, top: int, height: int, overlap: int) -> tuple[int, int]:
+    """``(band_end, next_top)`` for a non-final band from ``top``: nominal cut, or a blank-row cut (#444)."""
+    pixels, width = page.pixels, page.px_width
     step = height - overlap
-    # The last band is the first whose top is at or past this row: it reaches the bottom.
-    last_top = max(page.px_height - height, 0)
-    return tuple(_band(page, top, min(height, page.px_height - top)) for top in range(0, last_top + step, step))
+    nominal_end = top + height
+    nominal_next = top + step
+    margin = min(_CUT_EDGE_PX + 1, (overlap - 1) // 2)
+    if _has_blank_row(pixels, width, nominal_next + margin, nominal_end - margin):
+        return nominal_end, nominal_next
+    min_step = max(overlap, step - min(_MAX_CUT_WINDOW, step // 2))
+    search_lo = top + min_step
+    edge_blank = _find_blank_up(pixels, width, nominal_end - 1, max(search_lo, nominal_end - margin))
+    if edge_blank is not None:
+        blank: int | None = edge_blank
+    else:
+        blank = _find_blank_up(pixels, width, nominal_next + margin - 1, search_lo)
+    if blank is None:
+        return nominal_end, nominal_next
+    end = blank + 1
+    shared = min(overlap, _BLANK_CUT_MARGIN)
+    run_top = _blank_run_top(pixels, width, blank, max(search_lo, end - shared))
+    return end, run_top
+
+
+def _is_blank_row(pixels: bytes, width: int, row: int) -> bool:
+    """True if every pixel on ``row`` is at least :data:`_BLANK_ROW_MIN` (no ink)."""
+    start = row * width
+    return b"\x00" not in pixels[start : start + width].translate(_BLANK_TABLE)
+
+
+def _has_blank_row(pixels: bytes, width: int, lo: int, hi: int) -> bool:
+    """True if any row in ``range(lo, hi)`` is blank (bounded: at most ``hi - lo`` rows)."""
+    if lo >= hi:
+        return False
+    mid = (lo + hi) // 2
+    if _is_blank_row(pixels, width, mid):
+        return True
+    for row in range(lo, hi):
+        if row != mid and _is_blank_row(pixels, width, row):
+            return True
+    return False
+
+
+def _find_blank_up(pixels: bytes, width: int, start: int, stop: int) -> int | None:
+    """Highest blank row in ``[stop, start]``, or None if none exists (bounded by ``start - stop + 1``)."""
+    for row in range(start, stop - 1, -1):
+        if _is_blank_row(pixels, width, row):
+            return row
+    return None
+
+
+def _blank_run_top(pixels: bytes, width: int, bottom_blank: int, limit: int) -> int:
+    """Lowest row in ``[limit, bottom_blank]`` of the contiguous blank run ending at ``bottom_blank``."""
+    top = bottom_blank
+    for row in range(bottom_blank - 1, limit - 1, -1):
+        if not _is_blank_row(pixels, width, row):
+            return top
+        top = row
+    return top
 
 
 def _band(page: RenderedPage, top: int, rows: int) -> Band:

@@ -29,6 +29,7 @@ from functools import partial
 from typing import IO, NamedTuple, TypeVar
 
 from datagrunt.pdf import pipeline
+from datagrunt.pdf._hybrid_ocr import hybrid_page
 from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
 from datagrunt.pdf._options import PrerenderEntry, _PrerenderCache
 from datagrunt.pdf._process import MAX_REQUEST_BYTES, error_reply, read_message, send_message
@@ -582,7 +583,7 @@ def _background(item: _Assessed, drawn: _Drawn | None) -> Backdrop | str | None:
 
 
 def _routed(raw: RawPage, assessment: PageAssessment, source: PDFSource, options: PipelineOptions) -> Page:
-    """Step 4: a vision page is A5b's vision_page; a digital or hybrid one is assembled."""
+    """Step 4: vision_page for vision, region OCR for hybrid pages with unmapped regions, else assemble."""
     if assessment.route == "vision":
         return vision_page(
             raw,
@@ -592,6 +593,20 @@ def _routed(raw: RawPage, assessment: PageAssessment, source: PDFSource, options
             identity=source.identity,
             sha256=source.sha256,
             min_image_dimension=options.min_image_dimension,
+            options=pipeline._vision(options),
+        )
+    if assessment.route == "hybrid" and options.ocr != "never" and assessment.unmapped_regions:
+        return hybrid_page(
+            raw,
+            assessment,
+            source=source.path,
+            password=source.password,
+            identity=source.identity,
+            sha256=source.sha256,
+            min_image_dimension=options.min_image_dimension,
+            dpi=options.dpi,
+            max_render_pixels=options.max_render_pixels,
+            sandbox=options.sandbox,
             options=pipeline._vision(options),
         )
     return _assembled_page(raw, assessment, source, options)

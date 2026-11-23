@@ -12,7 +12,7 @@ import datagrunt
 ROOT = Path(__file__).resolve().parents[1]
 SRC = Path(datagrunt.__file__).resolve().parent
 FLOOR = (3, 11)
-SUPPORTED = ["3.11", "3.12", "3.13", "3.14"]
+SUPPORTED = ["3.11", "3.12", "3.13", "3.14", "3.15"]
 
 
 def _toml(relative: str) -> dict:

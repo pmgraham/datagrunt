@@ -229,6 +229,7 @@ from datagrunt.pdf._pdfium_recover import (
     RecoveredSpan,
     RecoveredText,
     RecoveryStats,
+    Target,
     TextObject,
     is_glyphless,
     isolate_dropped,
@@ -890,23 +891,37 @@ def _read_paint(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> PathPaint:
         stroked=bool(stroke.value),
         filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
         stroke_width=width.value,
-        dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
+        dashed=bool(stroke.value) and _is_dashed(path, label),
         stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}"),
         fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}"),
     )
 
 
-def _read_dashes(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> tuple[float, ...]:
-    """Read a path object's dash array (empty for a solid stroke)."""
+# Maximum dash-array entries copied from PDFium per stroked path (#454 item 3).
+# FPDFPageObj_GetDashArray refuses partial prefix reads (returns 0 if n < count),
+# so arrays longer than this bound are treated as dashed in O(1) without copying.
+_MAX_DASH_COUNT = 256
+
+
+def _read_dashes(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> tuple[float, ...] | None:
+    """Read a path object's dash array (empty for solid, None when over :data:`_MAX_DASH_COUNT`)."""
     count = pdfium_c.FPDFPageObj_GetDashCount(path)
     if count < 0:
         raise PdfiumFailure(f"read the dash pattern of {label}")
     if count == 0:
         return ()
+    if count > _MAX_DASH_COUNT:
+        return None
     dashes = (ctypes.c_float * count)()
     if not pdfium_c.FPDFPageObj_GetDashArray(path, dashes, count):
         raise PdfiumFailure(f"read the dash pattern of {label}")
     return tuple(dashes)
+
+
+def _is_dashed(path: pdfium_c.FPDF_PAGEOBJECT, label: str) -> bool:
+    """Whether a stroked path object's dash pattern leaves gaps, bounded at :data:`_MAX_DASH_COUNT`."""
+    dashes = _read_dashes(path, label)
+    return True if dashes is None else _leaves_gaps(dashes)
 
 
 def _leaves_gaps(dashes: tuple[float, ...]) -> bool:
@@ -1112,7 +1127,7 @@ def _path_object_segments(
         stroked=bool(stroke.value),
         filled=fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE,
         stroke_width=width_val,
-        dashed=bool(stroke.value) and _leaves_gaps(_read_dashes(path, label)),
+        dashed=bool(stroke.value) and _is_dashed(path, label),
         stroke_rgba=read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, path, f"stroke colour of {label}", rgba_buf),
         fill_rgba=read_rgba(pdfium_c.FPDFPageObj_GetFillColor, path, f"fill colour of {label}", rgba_buf),
     )
@@ -1982,7 +1997,7 @@ def _emit_nonculled_path(
         stroked=stroked,
         filled=filled,
         stroke_width=width_val,
-        dashed=stroked and _leaves_gaps(_read_dashes(obj, label)),
+        dashed=stroked and _is_dashed(obj, label),
         stroke_rgba=stroke_rgba,
         fill_rgba=fill_rgba,
     )
@@ -2113,16 +2128,144 @@ def recover_dropped_text(handle: DocumentHandle, index: int) -> RecoveredText:
             page.close()
 
 
+def _recovery_walk(
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+) -> tuple[tuple[TextObject, ...], dict[int, pdfium_c.FPDF_PAGEOBJECT], dict[int, Matrix]]:
+    """Collect text objects with enclosing form chains plus each form's handle and own matrix."""
+    form_handles: dict[int, pdfium_c.FPDF_PAGEOBJECT] = {}
+    form_own: dict[int, Matrix] = {}
+    form_outer: dict[int, Matrix] = {}
+    form_chains: dict[int, tuple[int, ...]] = {}
+    texts: list[TextObject] = []
+    for index, (obj, form) in enumerate(objects):
+        kind = pdfium_c.FPDFPageObj_GetType(obj)
+        if kind not in (pdfium_c.FPDF_PAGEOBJ_TEXT, pdfium_c.FPDF_PAGEOBJ_FORM):
+            continue
+        own = _read_matrix(obj, f"object {index}")
+        outer = form_outer[form] if form >= 0 else IDENTITY
+        chain = form_chains[form] if form >= 0 else ()
+        if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
+            form_handles[index] = obj
+            form_own[index] = own
+            form_outer[index] = own.then(outer)
+            form_chains[index] = (index, *chain)
+        else:
+            texts.append(TextObject(index, obj, own, outer, chain))
+    return tuple(texts), form_handles, form_own
+
+
+def _expand_box(current: Box, box: Box) -> Box:
+    """Union of two finite user-space boxes."""
+    return min(current[0], box[0]), min(current[1], box[1]), max(current[2], box[2]), max(current[3], box[3])
+
+
+def _mapped_bounds_box(raw_box: Box, matrix: Matrix) -> Box | None:
+    """Map a user-space box's 4 corners through ``matrix``; None if any coordinate is non-finite."""
+    left, bottom, right, top = raw_box
+    if matrix is IDENTITY or matrix == IDENTITY:
+        if not all(math.isfinite(value) for value in raw_box):
+            return None
+        return min(left, right), min(bottom, top), max(left, right), max(bottom, top)
+    corners = (
+        matrix.apply(left, bottom),
+        matrix.apply(right, bottom),
+        matrix.apply(left, top),
+        matrix.apply(right, top),
+    )
+    xs = [point[0] for point in corners]
+    ys = [point[1] for point in corners]
+    if not all(math.isfinite(value) for value in (*xs, *ys)):
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _include_mapped_box(occupied: Box, raw_box: Box, matrix: Matrix) -> Box:
+    """Expand ``occupied`` by ``raw_box`` mapped through ``matrix`` when finite."""
+    mapped = _mapped_bounds_box(raw_box, matrix)
+    return _expand_box(occupied, mapped) if mapped is not None else occupied
+
+
+def _seed_occupied_box(page: pdfium.PdfPage, geometry: PageGeometry) -> Box:
+    """Union of the page's visible box and explicit MediaBox when present and finite."""
+    occupied = geometry.page_box
+    try:
+        media = page.get_mediabox()
+    except pdfium.PdfiumError:
+        return occupied
+    return _include_mapped_box(occupied, media, IDENTITY)
+
+
+def _page_occupied_box(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    form_own: dict[int, Matrix],
+    moved_indices: frozenset[int],
+    reset_forms: frozenset[int],
+) -> Box:
+    """Union user-space box of MediaBox and every stationary page object before and after form resets."""
+    occupied = _seed_occupied_box(page, geometry)
+    orig_outer: dict[int, Matrix] = {}
+    after_outer: dict[int, Matrix] = {}
+    bounds = (ctypes.c_float(), ctypes.c_float(), ctypes.c_float(), ctypes.c_float())
+    for index, (obj, form) in enumerate(objects):
+        parent_orig = orig_outer[form] if form >= 0 else IDENTITY
+        parent_after = after_outer[form] if form >= 0 else IDENTITY
+        if index in form_own:
+            orig_outer[index] = form_own[index].then(parent_orig)
+            after_outer[index] = IDENTITY if index in reset_forms else form_own[index].then(parent_after)
+            continue
+        if index in moved_indices or not pdfium_c.FPDFPageObj_GetBounds(obj, *bounds):
+            continue
+        raw_box = (bounds[0].value, bounds[1].value, bounds[2].value, bounds[3].value)
+        occupied = _include_mapped_box(occupied, raw_box, parent_orig)
+        if parent_after != parent_orig:
+            occupied = _include_mapped_box(occupied, raw_box, parent_after)
+    return occupied
+
+
+def _isolate_page_dropped(
+    page: pdfium.PdfPage,
+    geometry: PageGeometry,
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    texts: tuple[TextObject, ...],
+    dropped: frozenset[int],
+    to_display: Callable[[Box], Box],
+    *,
+    form_handles: dict[int, pdfium_c.FPDF_PAGEOBJECT],
+    form_own: dict[int, Matrix],
+) -> tuple[Target, ...]:
+    """Isolate dropped text objects on ``page`` outside MediaBox and every stationary page object."""
+    occupied_cb = partial(_page_occupied_box, page, geometry, objects, form_own)
+    return isolate_dropped(
+        texts,
+        dropped,
+        to_display,
+        form_handles=form_handles,
+        form_matrices=form_own,
+        occupied_for_reset=occupied_cb,
+    )
+
+
 def _recover(page: pdfium.PdfPage, geometry: PageGeometry) -> RecoveredText:
     """Recover a loaded page's dropped text: read a textpage, move the dropped objects, read another."""
     page_number, to_display = geometry.page_number, _display_mapping(geometry)
     with _pdfium_errors(page_number):
         objects = _page_objects(page.raw, max_objects=MAX_PAGE_OBJECTS)
         walk = _text_walk(objects)
-        texts = tuple(TextObject(*placed) for placed in _objects_in_forms(objects, pdfium_c.FPDF_PAGEOBJ_TEXT))
+        texts, form_handles, form_own = _recovery_walk(objects)
         with _opened_textpage(page, page_number) as textpage:
             before = collect_text(textpage.raw, to_display, walk)
-        targets = isolate_dropped(texts, before.dropped, to_display)
+        targets = _isolate_page_dropped(
+            page,
+            geometry,
+            objects,
+            texts,
+            before.dropped,
+            to_display,
+            form_handles=form_handles,
+            form_own=form_own,
+        )
         with _opened_textpage(page, page_number) as textpage:
             after = collect_text(textpage.raw, to_display, walk)
     display = Display(to_display, geometry.width_pt, geometry.height_pt)

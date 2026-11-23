@@ -10,6 +10,7 @@ import pytest
 
 import datagrunt
 import datagrunt.pdf
+import datagrunt.pdf._process
 import datagrunt.pdf.bundle
 import datagrunt.pdf.elements
 import datagrunt.pdf.exceptions
@@ -55,7 +56,15 @@ CORPUS_NAMES = [
     "extract_corpus",
     "load_corpus",
 ]
-PDF_PACKAGE_NAMES = [*V5_MODEL_NAMES, "PDFReader", "PDFWriter", "load_bundle", "write_bundle", *CORPUS_NAMES]
+PDF_PACKAGE_NAMES = [
+    *V5_MODEL_NAMES,
+    "PDFReader",
+    "PDFWriter",
+    "load_bundle",
+    "write_bundle",
+    *CORPUS_NAMES,
+    "freeze_support",
+]
 # Spec §2.1: the classes, the element types and the exceptions, plus 5.2's bundle and corpus batch API (#463).
 TOP_LEVEL_PDF_NAMES = [
     "PDFReader",
@@ -130,11 +139,21 @@ def _defining_module(name: str):
         return importlib.import_module(FUNCTION_MODULES[name])
     if name in CORPUS_NAMES:
         return importlib.import_module("datagrunt.pdf.corpus")
+    if name == "freeze_support":
+        return importlib.import_module("datagrunt.pdf._process")
     return datagrunt.pdf.exceptions if name in EXCEPTION_NAMES else datagrunt.pdf.elements
 
 
 def test_pdf_package_exports_exactly_the_v5_names():
     assert datagrunt.pdf.__all__ == PDF_PACKAGE_NAMES
+
+
+def test_freeze_support_is_exported_from_pdf_package_only():
+    assert "freeze_support" in datagrunt.pdf.__all__
+    assert "freeze_support" in dir(datagrunt.pdf)
+    assert datagrunt.pdf.freeze_support is datagrunt.pdf._process.freeze_support
+    assert "freeze_support" not in datagrunt.__all__
+    assert not hasattr(datagrunt, "freeze_support")
 
 
 def test_top_level_package_exports_exactly_the_pinned_names():

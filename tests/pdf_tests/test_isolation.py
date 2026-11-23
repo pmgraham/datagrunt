@@ -18,6 +18,8 @@ import hashlib
 import importlib
 import io
 import json
+import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -32,7 +34,7 @@ from datagrunt.pdf.frame import element_frame
 from datagrunt.pdf.pdfium_engine import ImageLoader, open_document, page_images
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import render_page
-from pdf_tests.builders import PageSpec, RasterImage, build_pdf, hand_written_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.test_layout_stream_tables import body_text
 from pdf_tests.test_pipeline import DISTRIBUTED_KEYS, chain_document, mixed_page
 
@@ -598,3 +600,170 @@ class TestDefaultInProcessFastPath:
         assert len(bundled.pages) == 3
         assert (tmp_path / "bundle" / "page_images" / "page_0001.png").is_file()
         assert p_cmds == [] and r_cmds == [] and f_cmds == []
+
+
+FROZEN_EXTRACT_APP = """
+import json
+import sys
+from pathlib import Path
+
+sys.frozen = True
+sys.executable = str(Path(__file__).with_suffix(""))
+
+from datagrunt.pdf import freeze_support
+from datagrunt.pdf.reader import PDFReader
+
+freeze_support()
+
+source, marker = Path(sys.argv[1]), Path(sys.argv[2])
+with marker.open("a", encoding="utf-8") as handle:
+    handle.write("main\\n")
+
+reader = PDFReader(source, workers=2, min_image_dimension=32, sandbox=True)
+doc = reader.document
+result = {
+    "statuses": [page.status for page in doc.pages],
+    "hidden": [page.quality.hidden_spans_flagged for page in doc.pages],
+    "figure_bytes": len(reader.figures[0].read_bytes()),
+    "page_image_bytes": len(reader.pages[0].page_image.read_bytes()),
+    "pypdfium2_loaded": any(name == "pypdfium2" or name.startswith("pypdfium2.") for name in sys.modules),
+}
+print(json.dumps(result))
+"""
+
+FROZEN_CAP_APP = """
+import dataclasses
+import json
+import sys
+from pathlib import Path
+
+sys.frozen = True
+sys.executable = str(Path(__file__).with_suffix(""))
+
+from datagrunt.pdf import freeze_support, pipeline
+from datagrunt.pdf.pipeline import extract_document
+
+freeze_support()
+
+source, cap = Path(sys.argv[1]), int(sys.argv[2])
+real_vision = pipeline._vision
+pipeline._vision = lambda options: dataclasses.replace(real_vision(options), memory_cap_bytes=cap)
+
+doc = extract_document(source, workers=2, ocr="never", sandbox=True)
+result = {
+    "statuses": [page.status for page in doc.pages],
+    "errors": [page.error for page in doc.pages],
+    "texts": [" ".join(getattr(el, "text", "") for el in page.elements) for page in doc.pages],
+}
+print(json.dumps(result))
+"""
+
+FROZEN_OPT_OUT_APP = """
+import json
+import sys
+from pathlib import Path
+
+sys.frozen = True
+sys.executable = str(Path(__file__).with_suffix(""))
+
+from datagrunt.pdf import DatagruntPDFError
+from datagrunt.pdf.pipeline import extract_document
+
+try:
+    extract_document(Path(sys.argv[1]), workers=2, sandbox=True)
+except DatagruntPDFError as exc:
+    print(json.dumps({"error": str(exc)}))
+else:
+    print(json.dumps({"error": None}))
+"""
+
+
+def make_frozen_launcher(tmp_path: Path, name: str, script: str) -> Path:
+    """Create a POSIX executable launcher simulating a frozen binary that re-execs ``script``."""
+    app_py = tmp_path / f"{name}.py"
+    app_py.write_text(script, encoding="utf-8")
+    launcher = tmp_path / name
+    launcher.write_text(
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(app_py))} "$@"\n',
+        encoding="utf-8",
+    )
+    os.chmod(launcher, 0o755)
+    return launcher
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX launcher script simulates a frozen executable binary")
+class TestFrozenApplicationSupport:
+    """Opt-in freeze_support() runs allowlisted, memory-capped workers from a frozen executable (#440)."""
+
+    def test_frozen_app_with_freeze_support_extracts_pdf_figures_and_renders_via_workers(self, tmp_path):
+        white = TextRun("Hidden prompt", x=72.0, y=420.0, size=11.0, rgb=(1.0, 1.0, 1.0))
+        img = RasterImage(72.0, 260.0, 64.0, 32.0, solid_png(64, 32, (0.2, 0.4, 0.6)))
+        source = build_pdf(tmp_path / "doc.pdf", [PageSpec(items=(*body_text(72.0), white, img)) for _ in range(2)])
+        marker = tmp_path / "main_runs.log"
+        launcher = make_frozen_launcher(tmp_path, "frozen_extract", FROZEN_EXTRACT_APP)
+
+        done = subprocess.run(
+            [str(launcher), str(source), str(marker)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        result = json.loads(done.stdout)
+        assert result["statuses"] == ["ok", "ok"]
+        assert result["hidden"] == [1, 1]  # proves nested background render worker ran in frozen mode too
+        assert result["figure_bytes"] > 0 and result["page_image_bytes"] > 0
+        assert result["pypdfium2_loaded"] is False
+        assert marker.read_text(encoding="utf-8").splitlines() == ["main"]  # main never re-executed in workers
+
+    def test_frozen_app_workers_enforce_memory_cap(self, tmp_path):
+        contents = [text_content("page one"), inline_content("page two"), text_content("page three")]
+        source = pages_pdf(tmp_path / "capped.pdf", contents)
+        launcher = make_frozen_launcher(tmp_path, "frozen_cap", FROZEN_CAP_APP)
+
+        done = subprocess.run(
+            [str(launcher), str(source), str(SMALL_CAP)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        result = json.loads(done.stdout)
+        assert result["statuses"] == ["ok", "error", "ok"]
+        assert result["texts"] == ["page one", "", "page three"]
+        assert CAP_WORDS in result["errors"][1] and "page 2" in result["errors"][1]
+
+    def test_frozen_app_without_freeze_support_still_fails_closed(self, tmp_path):
+        source = build_pdf(tmp_path / "doc.pdf", [mixed_page()])
+        launcher = make_frozen_launcher(tmp_path, "frozen_opt_out", FROZEN_OPT_OUT_APP)
+
+        done = subprocess.run(
+            [str(launcher), str(source)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr
+        assert json.loads(done.stdout) == {"error": FROZEN}
+
+
+def test_importing_freeze_support_loads_none_of_the_heavy_stacks():
+    code = (
+        "import json, sys; "
+        "import datagrunt, datagrunt.pdf; "
+        "from datagrunt.pdf import freeze_support; "
+        "assert callable(freeze_support); "
+        "heavy = ('pypdfium2', 'PIL', 'pydantic', 'httpx', 'polars', 'pyarrow'); "
+        "loaded = [m for m in sys.modules if m.split('.')[0] in heavy]; "
+        "print(json.dumps(loaded))"
+    )
+    done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60, check=False)
+
+    assert done.returncode == 0, done.stderr
+    assert json.loads(done.stdout) == []

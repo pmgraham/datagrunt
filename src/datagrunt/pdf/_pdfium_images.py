@@ -210,6 +210,9 @@ _FLATE_ONLY = ("FlateDecode",)
 # draws of one XObject cannot be told apart to read it once.
 _MAX_PAGE_STREAM_BYTES = 2 * _MAX_ASSET_BYTES
 
+# Maximum ICC profile size hashed for ICCBased picture identity (16 MiB).
+_MAX_ICC_PROFILE_BYTES = 16 << 20
+
 # zlib's default level, pinned: the same pixels encode to the same PNG bytes
 # for a given Pillow and zlib build.
 _PNG_COMPRESS_LEVEL = 6
@@ -428,6 +431,9 @@ def _page_image(
         facts = pixel_facts(image, page_raw, label, filters, declared, raw, wrapped, budget.charge)
     except BudgetSpent:
         return unread, _over_budget(label)
+    icc_sha256 = (
+        _icc_profile_sha256(image, page_raw, budget) if facts.read_metadata and facts.colorspace == "ICCBased" else None
+    )
     recorded = RawImage(
         bbox=bbox,
         px_width=facts.px_width,
@@ -438,6 +444,7 @@ def _page_image(
         filters=filters,
         bits_per_pixel=facts.bits_per_pixel,
         colorspace=facts.colorspace,
+        icc_sha256=icc_sha256,
     )
     if facts.stream_refusal is not None:
         return recorded, ("overlong", facts.stream_refusal)
@@ -777,6 +784,25 @@ def _too_many_pixels(width: int, height: int, label: str) -> str:
     """The refusal of an image of more than ``_MAX_DECODED_PIXELS`` pixels."""
     pixels = width * height
     return f"{label} decodes to {width} x {height} = {pixels} pixels, over the {_MAX_DECODED_PIXELS}-pixel bound"
+
+
+def _icc_profile_sha256(
+    image: pdfium_c.FPDF_PAGEOBJECT, page_raw: pdfium_c.FPDF_PAGE, budget: _PageBudget
+) -> str | None:
+    """SHA-256 of an ICCBased image's decoded ICC profile within budget, or None when unavailable."""
+    size = ctypes.c_ulong(0)
+    if not pdfium_c.FPDFImageObj_GetIccProfileDataDecoded(image, page_raw, None, 0, ctypes.byref(size)):
+        return None
+    length = int(size.value)
+    if length < 1 or length > _MAX_ICC_PROFILE_BYTES or not budget.charge(length):
+        return None
+    buffer = (ctypes.c_ubyte * length)()
+    copied = ctypes.c_ulong(0)
+    if not pdfium_c.FPDFImageObj_GetIccProfileDataDecoded(image, page_raw, buffer, length, ctypes.byref(copied)):
+        return None
+    if int(copied.value) != length:
+        return None
+    return hashlib.sha256(bytes(buffer)).hexdigest()
 
 
 def _metadata(

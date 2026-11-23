@@ -88,6 +88,7 @@ class RawImage:
     filters: tuple[str, ...]
     bits_per_pixel: int | None
     colorspace: str | None
+    icc_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bbox", ordered_box("bbox", self.bbox))
@@ -102,6 +103,28 @@ class RawImage:
         if self.bits_per_pixel is not None:
             int_at_least("bits_per_pixel", self.bits_per_pixel, 1)
         _check_colorspace(self.colorspace)
+        if self.icc_sha256 is not None:
+            sha256_hex("icc_sha256", self.icc_sha256)
+
+    @property
+    def picture_key(self) -> tuple[object, ...] | None:
+        """Extraction-time picture identity key, or None when the image cannot be safely deduplicated."""
+        if self.raw_sha256 is None or self.px_width < 1 or self.px_height < 1:
+            return None
+        if self.bits_per_pixel is None and "JPXDecode" not in self.filters:
+            return None
+        if self.colorspace == "ICCBased" and self.icc_sha256 is None:
+            return None
+        return (
+            self.raw_sha256,
+            self.filters,
+            self.px_width,
+            self.px_height,
+            self.declared_px,
+            self.bits_per_pixel,
+            self.colorspace,
+            self.icc_sha256,
+        )
 
 
 def _check_dimension(name: str, value: object) -> None:
