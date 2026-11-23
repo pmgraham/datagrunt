@@ -21,6 +21,7 @@ import pytest
 import datagrunt
 import datagrunt.pdf
 from datagrunt.pdf import _hidden_rules, _pdfium_recover, elements, quality
+from datagrunt.pdf._hidden_geometry import ClipPathPoly, ClipRegion, Occluder
 from datagrunt.pdf._hidden_rules import em_reasons
 from datagrunt.pdf.elements import BBox
 from datagrunt.pdf.pdfium_engine import (
@@ -38,7 +39,16 @@ from datagrunt.pdf.pdfium_engine import (
     extract_page,
     open_document,
 )
-from datagrunt.pdf.quality import SpanPiece, assess_page, classify_spans, needs_background, raster_cover_fraction
+from datagrunt.pdf.quality import (
+    Backdrop,
+    SpanPiece,
+    apply_visibility_diff,
+    assess_page,
+    classify_spans,
+    needs_background,
+    needs_visibility_diff,
+    raster_cover_fraction,
+)
 from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
 from pdf_tests.test_pdfium_engine import ENGINE_MODULES, imported_modules
 from pdf_tests.test_pdfium_spans import SQUEEZED, TURNED, content_page, nested_text_page, two_forms_page
@@ -999,6 +1009,7 @@ class TestModuleImports:
 
     def test_imports_only_the_raw_fact_types_and_a1(self):
         allowed = {
+            "datagrunt.pdf._hidden_geometry",
             "datagrunt.pdf._hidden_rules",
             "datagrunt.pdf._options",  # OcrMode, which the caller checks without pdfium
             "datagrunt.pdf._pdfium_common",
@@ -1094,6 +1105,8 @@ def _synthetic_raw_page(
     height_pt: float = H,
     boxes: tuple[tuple[float, float, float, float], ...] = (),
     glyph_boxes: tuple[tuple[float, float, float, float], ...] = (),
+    occluders: tuple[Occluder, ...] = (),
+    image_occluders: tuple[Occluder, ...] = (),
 ) -> RawPage:
     """Build an in-memory RawPage for deterministic quality and gate scaling tests."""
     char_count = sum(len(s.text) for s in spans)
@@ -1131,6 +1144,8 @@ def _synthetic_raw_page(
             ),
         ),
         object_boxes=ObjectBoxes(boxes=boxes, unboxed=0, glyph_stroke_boxes=glyph_boxes),
+        occluders=occluders,
+        image_occluders=image_occluders,
     )
 
 
@@ -1235,3 +1250,202 @@ class TestHotPathScalingAndAsciiFastPath:
         monkeypatch.setattr(quality, "_valid", guarded_valid)
         got = assess_page(page)
         assert got == slow_oracle
+
+
+class TestHiddenReasons395:
+    """Issue #395: occluded, clipped, and blank_glyph quality flagging, space bridging, and gate skipping."""
+
+    def test_classify_spans_validates_occluders_boundary(self):
+        with pytest.raises(TypeError, match=re.escape("occluders must be a tuple, got list")):
+            classify_spans((raw_span(),), width_pt=W, height_pt=H, images=(), occluders=[])
+        with pytest.raises(TypeError, match=re.escape("occluders[0] must be a Occluder, got str")):
+            classify_spans((raw_span(),), width_pt=W, height_pt=H, images=(), occluders=("bad",))
+
+    def test_later_opaque_rect_occludes_multi_word_span_as_one_piece(self):
+        boxes = row(14, 72.0, 90.0)
+        span = raw_span("SECRET PAYLOAD", boxes, object_index=0)
+        occ = Occluder(object_index=1, bbox=(70.0, 88.0, 170.0, 106.0))
+
+        pieces = classify_spans((span,), width_pt=W, height_pt=H, images=(), occluders=(occ,))
+        assert layout(pieces) == [(0, 14, "SECRET PAYLOAD", ("occluded",))]
+
+    def test_earlier_opaque_rect_leaves_text_visible(self):
+        boxes = row(6, 72.0, 90.0)
+        span = raw_span("SECRET", boxes, object_index=2)
+        occ = Occluder(object_index=1, bbox=(70.0, 88.0, 140.0, 106.0))
+
+        pieces = classify_spans((span,), width_pt=W, height_pt=H, images=(), occluders=(occ,))
+        assert layout(pieces) == [(0, 6, "SECRET", ())]
+
+    def test_partial_occlusion_splits_without_bridging_boundary_space(self):
+        boxes = row(9, 72.0, 90.0)  # "OK HIDDEN": chars 0-2 at x=72..90, chars 3-8 at x=90..126
+        span = raw_span("OK HIDDEN", boxes, object_index=0)
+        occ = Occluder(object_index=1, bbox=(89.5, 88.0, 130.0, 106.0))
+
+        pieces = classify_spans((span,), width_pt=W, height_pt=H, images=(), occluders=(occ,))
+        assert layout(pieces) == [(0, 3, "OK ", ()), (3, 9, "HIDDEN", ("occluded",))]
+
+    def test_blank_glyph_tight_box_flagged_and_split_cleanly(self):
+        cboxes = row(4, 72.0, 90.0)
+        standin = (84.0, 95.0, 90.0, 95.01)  # 0.01 pt height <= 0.0025 * 11 pt
+        tboxes = (cboxes[0], cboxes[1], standin, (90.0, 95.0, 96.0, 95.01))
+        span = raw_span("OKXY", cboxes, tight_boxes=tboxes)
+
+        pieces = classify(span)
+        assert layout(pieces) == [(0, 2, "OK", ()), (2, 4, "XY", ("blank_glyph",))]
+
+    @pytest.mark.parametrize("mode", [3, 7])
+    def test_no_paint_modes_strictly_exempt_from_blank_glyph(self, mode):
+        cboxes = row(4, 72.0, 90.0)
+        zero_tight = tuple((b[0], b[1], b[0], b[1]) for b in cboxes)
+        span = raw_span("CAD1", cboxes, tight_boxes=zero_tight, render_mode=mode)
+
+        pieces = classify(span, images=(FULL_BLEED,))
+        assert layout(pieces) == [(0, 4, "CAD1", ())]
+
+    def test_collapsed_em_zero_scale_not_double_flagged_as_blank_glyph(self):
+        cboxes = row(4, 72.0, 90.0)
+        squeezed_tight = tuple((b[0], b[1], b[0] + 0.004, b[3]) for b in cboxes)
+        span = raw_span("FLAT", cboxes, tight_boxes=squeezed_tight, font_size_pt=12.0, em_width_pt=0.006)
+
+        assert reasons_of(span) == [("zero_scale",)]
+
+    def test_gate_selection_skips_occluded_clipped_and_blank_glyph_pieces(self):
+        cboxes = row(4, 72.0, 90.0)
+        occ_span = raw_span("OCCL", cboxes, fill_rgba=(255, 255, 255, 255), object_index=0)
+        clip = ClipRegion(bbox=(250.0, 0.0, 300.0, 50.0), paths=(ClipPathPoly(bbox=(250.0, 0.0, 300.0, 50.0)),))
+        clip_span = raw_span("CLIP", cboxes, fill_rgba=(255, 255, 255, 255), object_index=1, clip_region=clip)
+        blank_span = raw_span(
+            "BLNK",
+            cboxes,
+            fill_rgba=(255, 255, 255, 255),
+            object_index=2,
+            blank_glyph_offsets=(0, 1, 2, 3),
+        )
+        occ = Occluder(object_index=5, bbox=(60.0, 80.0, 140.0, 120.0))
+        page = _synthetic_raw_page(
+            (occ_span, clip_span, blank_span),
+            boxes=((60.0, 80.0, 140.0, 120.0),),
+            occluders=(occ,),
+        )
+        assessed = assess_page(page)
+
+        assert [p.hidden_reasons for p in assessed.pieces] == [
+            ("occluded",),
+            ("occluded", "clipped"),
+            ("occluded", "blank_glyph"),
+        ]
+        assert needs_background(page, assessed) is False
+
+    def test_replacement_and_control_chars_exempt_from_blank_glyph_but_printable_map_errors_checked(self):
+        cboxes = row(4, 72.0, 90.0)
+        standin = tuple((b[0], b[1], b[2], b[1] + 0.01) for b in cboxes)
+        fffd_span = raw_span("\ufffd\ufffd\ufffd\ufffd", cboxes, tight_boxes=standin, object_index=0)
+        ctrl_span = raw_span("\x03\x04\x05\x06", cboxes, tight_boxes=standin, map_errors=(0, 1, 2, 3), object_index=1)
+        ascii_map_err = raw_span("ABCD", cboxes, tight_boxes=standin, map_errors=(0, 1, 2, 3), object_index=2)
+
+        assert reasons_of(fffd_span, ctrl_span, ascii_map_err) == [(), (), ("blank_glyph",)]
+
+    def test_recovered_span_with_point_tight_box_not_flagged_blank_glyph(self):
+        point_box = (72.0, 100.0, 72.0, 100.0)
+        rec_raw = raw_span("COPY", (point_box,) * 4, tight_boxes=(point_box,) * 4, font_size_pt=12.0, object_index=9)
+        rec_item = _pdfium_recover.RecoveredSpan(span=rec_raw, hidden_reasons=())
+        rec_stats = _pdfium_recover.RecoveryStats(
+            overprint_duplicates=0,
+            whitespace_objects=0,
+            empty_text_objects=0,
+            unrecovered_text_objects=0,
+        )
+        recovered = _pdfium_recover.RecoveredText(page_number=1, spans=(rec_item,), stats=rec_stats)
+        base = _synthetic_raw_page((raw_span("Visible body text here!!", row(24, 20.0)),))
+        page = dataclasses.replace(
+            base,
+            text=dataclasses.replace(
+                base.text,
+                stats=dataclasses.replace(base.text.stats, dropped_text_objects=1),
+            ),
+        )
+
+        assessed = assess_page(page, recovered=recovered)
+        assert [p.hidden_reasons for p in assessed.recovered_pieces] == [()]
+
+
+def _solid_backdrop(
+    bgr: tuple[int, int, int], *, rects: tuple[tuple[tuple[int, int, int, int], tuple[int, int, int]], ...] = ()
+) -> Backdrop:
+    """Build a 1 px/pt 400 x 300 BGR Backdrop filled with ``bgr`` and optional ``(box, bgr)`` rects."""
+    w, h = int(W), int(H)
+    buf = bytearray(bytes(bgr) * (w * h))
+    for (x0, y0, x1, y1), color in rects:
+        row_bytes = bytes(color) * (x1 - x0)
+        for y in range(y0, y1):
+            start = (y * w + x0) * 3
+            buf[start : start + len(row_bytes)] = row_bytes
+    return Backdrop(pixels=bytes(buf), px_width=w, px_height=h)
+
+
+class TestVisibilityDiff395:
+    """#369-compliant rendered BGR diff for Type3 lying-d1 blank glyphs and image occluders."""
+
+    def test_needs_visibility_diff_false_for_plain_helvetica_page(self):
+        page = _synthetic_raw_page((raw_span("Hello World", row(11, 72.0, 90.0)),))
+        assessed = assess_page(page)
+
+        assert needs_visibility_diff(assessed, page) is False
+
+    def test_needs_visibility_diff_true_for_visible_type3_and_exempts_tr3_and_replacement(self):
+        t3_vis = raw_span("OK", row(2, 72.0, 90.0), base_font_name="")
+        t3_enc_only = raw_span("AB", row(2, 72.0, 90.0), base_font_name="", map_errors=(0, 1))
+        t3_tr3 = raw_span("OK", row(2, 72.0, 90.0), base_font_name="", render_mode=3)
+        t3_fffd = raw_span("\ufffd\ufffd", row(2, 72.0, 90.0), base_font_name="", map_errors=(0, 1))
+        page_vis = _synthetic_raw_page((t3_vis,))
+        page_enc_only = _synthetic_raw_page((t3_enc_only,))
+        page_tr3 = _synthetic_raw_page((t3_tr3,))
+        page_fffd = _synthetic_raw_page((t3_fffd,))
+
+        assert needs_visibility_diff(assess_page(page_vis), page_vis) is True
+        assert needs_visibility_diff(assess_page(page_enc_only), page_enc_only) is True
+        assert needs_visibility_diff(assess_page(page_tr3), page_tr3) is False
+        assert needs_visibility_diff(assess_page(page_fffd), page_fffd) is False
+
+    def test_apply_visibility_diff_flags_zero_paint_type3_and_splits_mixed_span(self):
+        cboxes = row(3, 72.0, 90.0, width=8.0, height=12.0)  # 'O':[72..80], 'K':[80..88], 'X':[88..96]
+        span = raw_span("OKX", cboxes, base_font_name="")
+        page = _synthetic_raw_page((span,))
+        assessed = assess_page(page)
+        without_bg = _solid_backdrop((255, 255, 255))
+        # Paint black ink over 'O' and 'K' only; 'X' leaves pixels unchanged.
+        with_bg = _solid_backdrop((255, 255, 255), rects=(((73, 91, 87, 101), (0, 0, 0)),))
+
+        updated = apply_visibility_diff(assessed, page, with_text=with_bg, without_text=without_bg)
+        assert layout(updated.pieces) == [(0, 2, "OK", ()), (2, 3, "X", ("blank_glyph",))]
+        assert updated.quality.hidden_spans_flagged == 1
+
+    def test_apply_visibility_diff_distinguishes_opaque_vs_translucent_image_occluders(self):
+        cboxes = row(6, 72.0, 90.0, width=8.0, height=12.0)
+        span = raw_span("SECRET", cboxes, object_index=0)
+        img_occ = Occluder(object_index=1, bbox=(65.0, 85.0, 130.0, 110.0))
+        page = _synthetic_raw_page((span,), image_occluders=(img_occ,))
+        assessed = assess_page(page)
+        assert needs_visibility_diff(assessed, page) is True
+
+        # Opaque image covers text: with_text and without_text are identical -> occluded.
+        same_bg = _solid_backdrop((255, 255, 255))
+        occluded = apply_visibility_diff(assessed, page, with_text=same_bg, without_text=same_bg)
+        assert layout(occluded.pieces) == [(0, 6, "SECRET", ("occluded",))]
+
+        # Translucent /SMask image lets text show through -> pixels differ -> stays visible.
+        blended_with = _solid_backdrop((255, 255, 255), rects=(((73, 91, 119, 101), (64, 64, 64)),))
+        visible = apply_visibility_diff(assessed, page, with_text=blended_with, without_text=same_bg)
+        assert layout(visible.pieces) == [(0, 6, "SECRET", ())]
+
+    def test_apply_visibility_diff_validates_inputs(self):
+        page = _synthetic_raw_page((raw_span("OK", row(2, 72.0, 90.0), base_font_name=""),))
+        assessed = assess_page(page)
+        bg = _solid_backdrop((255, 255, 255))
+        small = Backdrop(pixels=bytes(200 * 150 * 3), px_width=200, px_height=150)
+
+        with pytest.raises(TypeError, match="assessment must be a PageAssessment"):
+            apply_visibility_diff("bad", page, with_text=bg, without_text=bg)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="same pixel size"):
+            apply_visibility_diff(assessed, page, with_text=bg, without_text=small)

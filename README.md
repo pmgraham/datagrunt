@@ -408,7 +408,8 @@ writer.write_bundle("out/report_bundle")      # all of the above in one checked 
 Text a human reader can't see is flagged, never dropped. Each element's
 `hidden_reasons` lists why: `off_page`, `invisible`, `tiny_font`,
 `transparent`, `matches_background`, `zero_scale`, `duplicate`, `superseded`,
-or `unchecked_background`. An empty list means the element is visible. Markdown
+`unchecked_background`, `occluded`, `clipped`, or `blank_glyph`. An empty list
+means the element is visible. Markdown
 (`to_markdown()`, `write_markdown()` and a bundle's Markdown) leaves hidden
 elements out by default; pass `include_hidden=True` to keep each behind a
 `<!-- hidden: reasons -->` comment. JSON and the DataFrame always keep every

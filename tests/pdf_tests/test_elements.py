@@ -85,6 +85,9 @@ class TestTypeAliases:
             "duplicate",
             "superseded",
             "unchecked_background",
+            "occluded",
+            "clipped",
+            "blank_glyph",
         )
 
     def test_hidden_reason_literal_members(self):
@@ -98,6 +101,9 @@ class TestTypeAliases:
             "duplicate",
             "superseded",
             "unchecked_background",
+            "occluded",
+            "clipped",
+            "blank_glyph",
         )
 
     def test_image_only_reasons_canonical_order(self):

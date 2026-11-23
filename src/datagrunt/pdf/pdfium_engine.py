@@ -194,6 +194,7 @@ from typing import Literal, NamedTuple, NoReturn
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 
+from datagrunt.pdf._hidden_geometry import ClipPathPoly, ClipRegion, Occluder, intersect_clips
 from datagrunt.pdf._path_segments import (
     IDENTITY,
     Matrix,
@@ -247,6 +248,7 @@ from datagrunt.pdf._validate import (
     ordered_box,
     positive_float,
     strict_bool,
+    typed_tuple,
 )
 from datagrunt.pdf.elements import _MAX_ASSET_BYTES
 from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFEncryptedError
@@ -819,7 +821,9 @@ def _read_page_text_objects_and_types(
     with _opened_textpage(page, page_number) as textpage, _pdfium_errors(page_number):
         objects, kinds = _page_objects_and_types(page.raw, max_objects=MAX_PAGE_OBJECTS)
         walk = _text_walk(objects, kinds)
-        return collect_text(textpage.raw, _display_mapping(geometry), walk).page_text, objects, kinds
+        text_clips = _text_clips(objects, kinds, geometry)
+        collected = collect_text(textpage.raw, _display_mapping(geometry), walk, text_clips=text_clips)
+        return collected.page_text, objects, kinds
 
 
 def _read_page_text_and_objects(
@@ -1762,6 +1766,8 @@ class RawPage:
     segments: PageSegments
     images: PageImages
     object_boxes: ObjectBoxes
+    occluders: tuple[Occluder, ...] = ()
+    image_occluders: tuple[Occluder, ...] = ()
 
     def __post_init__(self) -> None:
         checks = (
@@ -1774,6 +1780,8 @@ class RawPage:
         for name, value, expected in checks:
             if not isinstance(value, expected):
                 raise TypeError(f"{name} must be a {expected.__name__}, got {type(value).__name__}")
+        typed_tuple("occluders", self.occluders, Occluder)
+        typed_tuple("image_occluders", self.image_occluders, Occluder)
 
     @property
     def page_number(self) -> int:
@@ -1851,14 +1859,278 @@ def extract_page(handle: DocumentHandle, index: int, *, allow_segment_overflow: 
             page.close()
 
 
+_MAX_CLIP_PATHS = 16
+_MAX_CLIP_SEGMENTS = 256
+_MAX_OCCLUDERS = 8_000
+_MAX_OCCLUDER_SEGMENTS = 1024
+_BEZIER_STEPS = 8
+_RECT_AXIS_TOL = 1e-2
+_EMPTY_CLIP_BOX: Box = (0.0, 0.0, 0.0, 0.0)
+
+
+def _display_point_fn(geometry: PageGeometry) -> Callable[[float, float], tuple[float, float]]:
+    """Map a single finite user-space ``(x, y)`` point to display coordinates."""
+    rotation = _checked_rotation(geometry.rotation_deg)
+    pl, pb, pr, pt = _checked_box("page_box", geometry.page_box, allow_empty=False)
+    if rotation == 0:
+        return lambda x, y: (x - pl, pt - y)
+    if rotation == 90:
+        return lambda x, y: (y - pb, x - pl)
+    if rotation == 180:
+        return lambda x, y: (pr - x, y - pb)
+    return lambda x, y: (pt - y, pr - x)
+
+
+def _flatten_cubic(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    out: list[tuple[float, float]],
+) -> None:
+    """Append ``_BEZIER_STEPS`` display-space vertices approximating cubic Bézier ``(p0, p1, p2, p3)``."""
+    x0, y0 = p0
+    x1, y1 = p1
+    x2, y2 = p2
+    x3, y3 = p3
+    inv = 1.0 / _BEZIER_STEPS
+    for step in range(1, _BEZIER_STEPS + 1):
+        t = step * inv
+        u = 1.0 - t
+        u2 = u * u
+        t2 = t * t
+        c0 = u2 * u
+        c1 = 3.0 * u2 * t
+        c2 = 3.0 * u * t2
+        c3 = t2 * t
+        out.append((c0 * x0 + c1 * x1 + c2 * x2 + c3 * x3, c0 * y0 + c1 * y1 + c2 * y2 + c3 * y3))
+
+
+def _dedup_closing_ring(poly: list[tuple[float, float]]) -> tuple[tuple[float, float], ...]:
+    """Remove consecutive duplicate vertices and a redundant closing repeat of the first vertex."""
+    out: list[tuple[float, float]] = [poly[0]]
+    for pt in poly[1:]:
+        if pt != out[-1]:
+            out.append(pt)
+    if len(out) > 1 and out[-1] == out[0]:
+        out.pop()
+    return tuple(out)
+
+
+def _build_display_subpaths(
+    mapped: list[tuple[str, float, float]],
+) -> tuple[tuple[tuple[float, float], ...], ...]:
+    """Split mapped display-space ``(kind, x, y)`` commands into flattened polygon subpaths."""
+    subpaths: list[list[tuple[float, float]]] = []
+    idx = 0
+    total = len(mapped)
+    while idx < total:
+        kind, x, y = mapped[idx]
+        if kind == "move" or not subpaths:
+            subpaths.append([(x, y)])
+            idx += 1
+            continue
+        if kind == "line":
+            subpaths[-1].append((x, y))
+            idx += 1
+            continue
+        if idx + 2 < total and mapped[idx + 1][0] == "curve" and mapped[idx + 2][0] == "curve":
+            p0 = subpaths[-1][-1]
+            p2 = (mapped[idx + 1][1], mapped[idx + 1][2])
+            p3 = (mapped[idx + 2][1], mapped[idx + 2][2])
+            _flatten_cubic(p0, (x, y), p2, p3, subpaths[-1])
+            idx += 3
+            continue
+        subpaths[-1].append((x, y))
+        idx += 1
+    return tuple(_dedup_closing_ring(poly) for poly in subpaths if poly)
+
+
+def _path_points_to_display_polys(
+    points: list[PathPoint],
+    matrix: Matrix,
+    to_pt: Callable[[float, float], tuple[float, float]],
+) -> tuple[tuple[tuple[tuple[float, float], ...], ...], bool] | None:
+    """Transform and flatten ``points`` into closed display-space subpaths plus ``has_curve``; None if non-finite."""
+    if not matrix.is_finite():
+        return None
+    a, b, c, d, e, f = matrix
+    isfinite = math.isfinite
+    mapped: list[tuple[str, float, float]] = []
+    has_curve = False
+    for kind, px, py, _closes in points:
+        ux = a * px + c * py + e
+        uy = b * px + d * py + f
+        if not (isfinite(ux) and isfinite(uy)):
+            return None
+        dx, dy = to_pt(ux, uy)
+        if not (isfinite(dx) and isfinite(dy)):
+            return None
+        has_curve = has_curve or (kind == "curve")
+        mapped.append((kind, dx, dy))
+    return _build_display_subpaths(mapped), has_curve
+
+
+def _is_axis_aligned_rect(poly: tuple[tuple[float, float], ...], bbox: Box) -> bool:
+    """Return True if ``poly`` is a simple axis-aligned rectangle filling ``bbox``."""
+    x0, y0, x1, y1 = bbox
+    w, h = x1 - x0, y1 - y0
+    if w == 0.0 or h == 0.0:
+        return True
+    if len(poly) < 4:
+        return False
+    ring = tuple(zip(poly, (*poly[1:], poly[0])))
+    if not all(abs(bx - ax) <= _RECT_AXIS_TOL or abs(by - ay) <= _RECT_AXIS_TOL for (ax, ay), (bx, by) in ring):
+        return False
+    area = abs(sum(ax * by - bx * ay for (ax, ay), (bx, by) in ring)) * 0.5
+    return abs(area - w * h) <= _RECT_AXIS_TOL * (w + h) + 1e-6
+
+
+def _polys_bbox_and_shape(
+    polys: tuple[tuple[tuple[float, float], ...], ...], has_curve: bool
+) -> tuple[Box, tuple[tuple[tuple[float, float], ...], ...] | None]:
+    """Compute display-space ``(bbox, polygons_or_none)``; ``polygons`` is None for a single axis-aligned rect."""
+    xs = [pt[0] for poly in polys for pt in poly]
+    ys = [pt[1] for poly in polys for pt in poly]
+    if not xs:
+        return _EMPTY_CLIP_BOX, None
+    bbox = (min(xs), min(ys), max(xs), max(ys))
+    if not has_curve and len(polys) == 1 and _is_axis_aligned_rect(polys[0], bbox):
+        return bbox, None
+    return bbox, polys
+
+
+def _read_clip_path_points(
+    clip: pdfium_c.FPDF_CLIPPATH,
+    path_idx: int,
+    seg_count: int,
+    pt_xy: tuple[ctypes.c_float, ctypes.c_float],
+) -> list[PathPoint] | None:
+    """Read ``seg_count`` segments of clip path ``path_idx``; None if any PDFium read fails."""
+    x, y = pt_xy
+    get_seg = pdfium_c.FPDFClipPath_GetPathSegment
+    get_type = pdfium_c.FPDFPathSegment_GetType
+    get_pt = pdfium_c.FPDFPathSegment_GetPoint
+    get_close = pdfium_c.FPDFPathSegment_GetClose
+    kinds = _POINT_KINDS
+    points: list[PathPoint] = []
+    for seg_idx in range(seg_count):
+        segment = get_seg(clip, path_idx, seg_idx)
+        kind = kinds.get(get_type(segment)) if segment else None
+        if kind is None or not get_pt(segment, x, y):
+            return None
+        points.append(PathPoint(kind, x.value, y.value, bool(get_close(segment))))
+    return points
+
+
+def _clip_path_to_poly(
+    clip: pdfium_c.FPDF_CLIPPATH,
+    path_idx: int,
+    outer: Matrix,
+    to_pt: Callable[[float, float], tuple[float, float]],
+    pt_xy: tuple[ctypes.c_float, ctypes.c_float],
+) -> ClipPathPoly | None:
+    """Convert clip path ``path_idx`` into a display-space :class:`ClipPathPoly`; None to skip fail-open."""
+    seg_count = pdfium_c.FPDFClipPath_CountPathSegments(clip, path_idx)
+    if seg_count < 0 or seg_count > _MAX_CLIP_SEGMENTS:
+        return None
+    if seg_count == 0:
+        return ClipPathPoly(bbox=_EMPTY_CLIP_BOX, polygons=None, even_odd=False)
+    points = _read_clip_path_points(clip, path_idx, seg_count, pt_xy)
+    if points is None:
+        return None
+    converted = _path_points_to_display_polys(points, outer, to_pt)
+    if converted is None:
+        return None
+    polys, has_curve = converted
+    bbox, shape_polys = _polys_bbox_and_shape(polys, has_curve)
+    return ClipPathPoly(bbox=bbox, polygons=shape_polys, even_odd=False)
+
+
+def _object_clip(
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    outer: Matrix,
+    to_pt: Callable[[float, float], tuple[float, float]],
+    pt_xy: tuple[ctypes.c_float, ctypes.c_float],
+) -> tuple[ClipRegion | None, bool]:
+    """Read ``obj``'s clip as ``(ClipRegion | None, is_text_only_clip)``.
+
+    ``count_paths < 0`` or NULL clip means no clip. ``count_paths == 0``
+    means a ``7 Tr`` text-only clip (not empty for text; suppresses opaque
+    occluder emission).
+    """
+    clip = pdfium_c.FPDFPageObj_GetClipPath(obj)
+    if not clip:
+        return None, False
+    count_paths = pdfium_c.FPDFClipPath_CountPaths(clip)
+    if count_paths < 0:
+        return None, False
+    if count_paths == 0:
+        return None, True
+    region: ClipRegion | None = None
+    for path_idx in range(min(count_paths, _MAX_CLIP_PATHS)):
+        entry = _clip_path_to_poly(clip, path_idx, outer, to_pt, pt_xy)
+        if entry is None:
+            continue
+        region = intersect_clips(region, ClipRegion(bbox=entry.bbox, paths=(entry,)))
+    return region, False
+
+
+def _text_clips(
+    objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
+    kinds: list[int],
+    geometry: PageGeometry,
+) -> dict[int, ClipRegion]:
+    """Collect display-space :class:`ClipRegion`s keyed by text object address."""
+    to_pt = _display_point_fn(geometry)
+    pt_xy = (ctypes.c_float(), ctypes.c_float())
+    fs_matrix = pdfium_c.FS_MATRIX()
+    form_matrices: dict[int, Matrix] = {}
+    form_clips: dict[int, ClipRegion | None] = {}
+    text_clips: dict[int, ClipRegion] = {}
+    form_kind = pdfium_c.FPDF_PAGEOBJ_FORM
+    text_kind = pdfium_c.FPDF_PAGEOBJ_TEXT
+    for index, ((obj, form), kind) in enumerate(zip(objects, kinds, strict=True)):
+        if kind == form_kind:
+            outer = form_matrices[form] if form >= 0 else IDENTITY
+            parent_clip = form_clips[form] if form >= 0 else None
+            form_matrices[index] = _read_matrix(obj, f"object {index}", fs_matrix).then(outer)
+            own_clip, _text_only = _object_clip(obj, outer, to_pt, pt_xy)
+            form_clips[index] = intersect_clips(parent_clip, own_clip)
+            continue
+        if kind != text_kind:
+            continue
+        outer = form_matrices[form] if form >= 0 else IDENTITY
+        parent_clip = form_clips[form] if form >= 0 else None
+        own_clip, _text_only = _object_clip(obj, outer, to_pt, pt_xy)
+        eff = intersect_clips(parent_clip, own_clip)
+        if eff is not None:
+            text_clips[object_address(obj)] = eff
+    return text_clips
+
+
+class _FormContext(NamedTuple):
+    """Inherited transform, clip, transparency, and text-clip flags from enclosing Form XObjects."""
+
+    matrix: Matrix
+    clip: ClipRegion | None
+    transparent: bool
+    text_clipped: bool
+
+
+_ROOT_FORM = _FormContext(IDENTITY, None, False, False)
+
+
 class _FusedWalkState:
-    """Mutable accumulator for single-pass segments + object_boxes + image placement walk."""
+    """Mutable accumulator for single-pass segments + object_boxes + occluders + image placement walk."""
 
     __slots__ = (
         "allow_overflow",
         "boxes",
         "glyph_boxes",
         "image_entries",
+        "image_occluders",
+        "occluders",
         "room",
         "scratch",
         "seg_overflow",
@@ -1866,6 +2138,7 @@ class _FusedWalkState:
         "skipped",
         "to_coords",
         "to_display",
+        "to_pt",
         "unboxed",
     )
 
@@ -1873,11 +2146,13 @@ class _FusedWalkState:
         self,
         to_display: Callable[[Box], Box],
         to_coords: Callable[[float, float, float, float], Box],
+        to_pt: Callable[[float, float], tuple[float, float]],
         *,
         allow_overflow: bool,
     ) -> None:
         self.to_display = to_display
         self.to_coords = to_coords
+        self.to_pt = to_pt
         self.allow_overflow = allow_overflow
         self.scratch = _PathScratch()
         self.room = _SegmentRoom()
@@ -1886,8 +2161,104 @@ class _FusedWalkState:
         self.seg_overflow: str | None = None
         self.boxes: list[Box] = []
         self.glyph_boxes: list[Box] = []
+        self.occluders: list[Occluder] = []
+        self.image_occluders: list[Occluder] = []
         self.unboxed = 0
         self.image_entries: list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]] = []
+
+
+def _append_path_occluder(
+    state: _FusedWalkState,
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    fill_mode: int,
+    fill_rgba: tuple[int, int, int, int],
+    points: list[PathPoint],
+    matrix: Matrix,
+    ctx: _FormContext,
+) -> None:
+    """Append a display-space :class:`Occluder` for an opaque filled path when valid and non-empty."""
+    if fill_rgba[3] != 255 or ctx.transparent or ctx.text_clipped or len(state.occluders) >= _MAX_OCCLUDERS:
+        return
+    if pdfium_c.FPDFPageObj_HasTransparency(obj):
+        return
+    obj_clip, text_clipped = _object_clip(obj, ctx.matrix, state.to_pt, state.scratch.pt_xy)
+    if text_clipped:
+        return
+    converted = _path_points_to_display_polys(points, matrix, state.to_pt)
+    if converted is None:
+        return
+    polys, has_curve = converted
+    bbox, shape_polys = _polys_bbox_and_shape(polys, has_curve)
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        return
+    eff_clip = intersect_clips(ctx.clip, obj_clip)
+    if eff_clip is not None and (eff_clip.bbox[0] >= eff_clip.bbox[2] or eff_clip.bbox[1] >= eff_clip.bbox[3]):
+        return
+    even_odd = fill_mode == pdfium_c.FPDF_FILLMODE_ALTERNATE
+    state.occluders.append(
+        Occluder(object_index=index, bbox=bbox, polygons=shape_polys, even_odd=even_odd, clip=eff_clip)
+    )
+
+
+def _maybe_culled_path_occluder(
+    state: _FusedWalkState,
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    label: str,
+    fill_mode: int,
+    count: int,
+    matrix: Matrix,
+    ctx: _FormContext,
+) -> None:
+    """Collect an opaque filled path occluder even when the path was < 11.9 pt and culled from segments."""
+    if fill_mode == pdfium_c.FPDF_FILLMODE_NONE or count > _MAX_OCCLUDER_SEGMENTS:
+        return
+    if ctx.transparent or ctx.text_clipped or len(state.occluders) >= _MAX_OCCLUDERS:
+        return
+    if pdfium_c.FPDFPageObj_HasTransparency(obj):
+        return
+    fill_rgba = read_rgba(pdfium_c.FPDFPageObj_GetFillColor, obj, f"fill colour of {label}", state.scratch.rgba)
+    if fill_rgba[3] != 255:
+        return
+    points = _read_counted_points(obj, count, label, state.scratch.pt_xy)
+    _append_path_occluder(state, obj, index, fill_mode, fill_rgba, points, matrix, ctx)
+
+
+def _append_image_occluder(
+    state: _FusedWalkState,
+    obj: pdfium_c.FPDF_PAGEOBJECT,
+    index: int,
+    box: Box,
+    ctx: _FormContext,
+) -> None:
+    """Append a candidate image :class:`Occluder` (``/SMask`` disambiguated later via guarded render diff)."""
+    if ctx.transparent or ctx.text_clipped or len(state.image_occluders) >= _MAX_OCCLUDERS:
+        return
+    if box[0] >= box[2] or box[1] >= box[3] or pdfium_c.FPDFPageObj_HasTransparency(obj):
+        return
+    obj_clip, text_clipped = _object_clip(obj, ctx.matrix, state.to_pt, state.scratch.pt_xy)
+    if text_clipped:
+        return
+    eff_clip = intersect_clips(ctx.clip, obj_clip)
+    if eff_clip is not None and (eff_clip.bbox[0] >= eff_clip.bbox[2] or eff_clip.bbox[1] >= eff_clip.bbox[3]):
+        return
+    state.image_occluders.append(Occluder(object_index=index, bbox=box, polygons=None, even_odd=False, clip=eff_clip))
+
+
+def _enter_form_context(
+    obj: pdfium_c.FPDF_PAGEOBJECT, index: int, parent: _FormContext, state: _FusedWalkState
+) -> _FormContext:
+    """Compose a Form XObject's transform, clip, transparency, and text-clip state onto ``parent``."""
+    own = _read_matrix(obj, f"object {index}", state.scratch.fs_matrix)
+    own_clip, text_only = _object_clip(obj, parent.matrix, state.to_pt, state.scratch.pt_xy)
+    transparent = parent.transparent or bool(pdfium_c.FPDFPageObj_HasTransparency(obj))
+    return _FormContext(
+        matrix=own.then(parent.matrix),
+        clip=intersect_clips(parent.clip, own_clip),
+        transparent=transparent,
+        text_clipped=parent.text_clipped or text_only,
+    )
 
 
 def _step_overflow_path_box(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix) -> None:
@@ -1901,19 +2272,16 @@ def _step_overflow_path_box(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJEC
             state.glyph_boxes.append(box)
 
 
-def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, index: int, outer: Matrix) -> None:
-    """Inspect one path object once for both ``PageSegments`` and ``ObjectBoxes``."""
-    if state.seg_overflow is not None:
-        _step_overflow_path_box(state, obj, outer)
-        return
+def _read_path_header(
+    state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, label: str
+) -> tuple[Matrix, int, bool, float, int]:
+    """Read a path's matrix, draw mode, stroke width, and segment count once per path."""
     s = state.scratch
-    label = f"object {index}"
     own = _read_matrix(obj, label, s.fs_matrix)
-    matrix = own if (outer is IDENTITY and own.is_finite()) else own.then(outer)
     if not pdfium_c.FPDFPath_GetDrawMode(obj, s.fill_mode, s.stroke) or s.fill_mode.value not in _FILL_MODES:
         raise PdfiumFailure(f"read the draw mode of {label}")
+    fill_mode = s.fill_mode.value
     stroked = bool(s.stroke.value)
-    filled = s.fill_mode.value != pdfium_c.FPDF_FILLMODE_NONE
     width_val = 0.0
     if stroked:
         if not pdfium_c.FPDFPageObj_GetStrokeWidth(obj, s.stroke_width):
@@ -1922,14 +2290,14 @@ def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, inde
     count = pdfium_c.FPDFPath_CountSegments(obj)
     if count < 0:
         raise PdfiumFailure(f"count the path segments of {label}")
-    try:
-        state.room.take(count, label)
-    except WalkBoundHit as exc:
-        if not state.allow_overflow:
-            raise
-        state.seg_overflow = str(exc)
-        state.segments.clear()
-    b_l, b_b, b_r, b_t = s.bounds
+    return own, fill_mode, stroked, width_val, count
+
+
+def _record_path_bounds(
+    state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, outer: Matrix
+) -> tuple[bool, float, float, float, float, Box | None]:
+    """Read and record a path's display box once, returning ``(has_bounds, l, b, r, t, box)``."""
+    b_l, b_b, b_r, b_t = state.scratch.bounds
     has_bounds = bool(pdfium_c.FPDFPageObj_GetBounds(obj, b_l, b_b, b_r, b_t))
     l_v, b_v, r_v, t_v = b_l.value, b_b.value, b_r.value, b_t.value
     box = _box_from_raw_coords(l_v, b_v, r_v, t_v, outer, state.to_coords) if has_bounds else None
@@ -1937,9 +2305,30 @@ def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, inde
         state.unboxed += 1
     else:
         state.boxes.append(box)
+    return has_bounds, l_v, b_v, r_v, t_v, box
+
+
+def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, index: int, ctx: _FormContext) -> None:
+    """Inspect one path object once for ``PageSegments``, ``ObjectBoxes``, and ``Occluder``s."""
+    outer = ctx.matrix
+    if state.seg_overflow is not None:
+        _step_overflow_path_box(state, obj, outer)
+        return
+    label = f"object {index}"
+    own, fill_mode, stroked, width_val, count = _read_path_header(state, obj, label)
+    matrix = own if (outer is IDENTITY and own.is_finite()) else own.then(outer)
+    filled = fill_mode != pdfium_c.FPDF_FILLMODE_NONE
+    try:
+        state.room.take(count, label)
+    except WalkBoundHit as exc:
+        if not state.allow_overflow:
+            raise
+        state.seg_overflow = str(exc)
+        state.segments.clear()
+    has_bounds, l_v, b_v, r_v, t_v, box = _record_path_bounds(state, obj, outer)
     if state.seg_overflow is not None:
         if box is not None and _is_visible_glyph_from_mode(
-            obj, box, count, stroked=stroked, filled=filled, rgba_buf=s.rgba
+            obj, box, count, stroked=stroked, filled=filled, rgba_buf=state.scratch.rgba
         ):
             state.glyph_boxes.append(box)
         return
@@ -1954,21 +2343,13 @@ def _step_fused_path(state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, inde
     )
     if culled:
         if box is not None and _is_visible_glyph_from_mode(
-            obj, box, count, stroked=stroked, filled=filled, rgba_buf=s.rgba
+            obj, box, count, stroked=stroked, filled=filled, rgba_buf=state.scratch.rgba
         ):
             state.glyph_boxes.append(box)
+        _maybe_culled_path_occluder(state, obj, index, label, fill_mode, count, matrix, ctx)
         return
     _emit_nonculled_path(
-        state,
-        obj,
-        index,
-        label,
-        matrix,
-        box,
-        count,
-        stroked=stroked,
-        filled=filled,
-        width_val=width_val,
+        state, obj, index, label, matrix, box, count, stroked=stroked, fill_mode=fill_mode, width_val=width_val, ctx=ctx
     )
 
 
@@ -1982,11 +2363,13 @@ def _emit_nonculled_path(
     count: int,
     *,
     stroked: bool,
-    filled: bool,
+    fill_mode: int,
     width_val: float,
+    ctx: _FormContext,
 ) -> None:
-    """Read RGBA once for both glyph-box check and ``path_segments`` on a non-culled path."""
+    """Read RGBA and points once for glyph-box, ``path_segments``, and opaque fill ``Occluder`` checks."""
     s = state.scratch
+    filled = fill_mode != pdfium_c.FPDF_FILLMODE_NONE
     stroke_rgba = read_rgba(pdfium_c.FPDFPageObj_GetStrokeColor, obj, f"stroke colour of {label}", s.rgba)
     fill_rgba = read_rgba(pdfium_c.FPDFPageObj_GetFillColor, obj, f"fill colour of {label}", s.rgba)
     if box is not None and _is_glyph_from_paint(
@@ -2002,6 +2385,8 @@ def _emit_nonculled_path(
         fill_rgba=fill_rgba,
     )
     points = _read_counted_points(obj, count, label, s.pt_xy)
+    if filled and count <= _MAX_OCCLUDER_SEGMENTS:
+        _append_path_occluder(state, obj, index, fill_mode, fill_rgba, points, matrix, ctx)
     try:
         found = path_segments(points, matrix=matrix, paint=paint, object_index=index, to_display=state.to_display)
     except NonFiniteGeometry:
@@ -2010,48 +2395,58 @@ def _emit_nonculled_path(
         state.segments.extend(found)
 
 
+def _step_non_path_object(
+    state: _FusedWalkState, obj: pdfium_c.FPDF_PAGEOBJECT, index: int, kind: int, ctx: _FormContext
+) -> None:
+    """Record image placement, object box, and candidate image occluder for a non-path, non-form object."""
+    if kind == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+        state.image_entries.append((index, obj, ctx.matrix))
+    box = _object_box(obj, ctx.matrix, state.to_display, state.scratch.bounds)
+    if box is None:
+        state.unboxed += 1
+        return
+    state.boxes.append(box)
+    if kind == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+        _append_image_occluder(state, obj, index, box, ctx)
+
+
 def _collect_segments_and_boxes(
     geometry: PageGeometry,
     objects: list[tuple[pdfium_c.FPDF_PAGEOBJECT, int]],
     *,
     kinds: list[int] | None = None,
     allow_segment_overflow: bool = False,
-) -> tuple[PageSegments, ObjectBoxes, list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]]]:
-    """Walk ``objects`` once to collect ``PageSegments``, ``ObjectBoxes``, and placed image entries."""
+) -> tuple[
+    PageSegments,
+    ObjectBoxes,
+    list[tuple[int, pdfium_c.FPDF_PAGEOBJECT, Matrix]],
+    tuple[Occluder, ...],
+    tuple[Occluder, ...],
+]:
+    """Walk ``objects`` once to collect segments, boxes, images, path occluders, and candidate image occluders."""
     state = _FusedWalkState(
         _display_mapping(geometry),
         _display_coords_fn(geometry),
+        _display_point_fn(geometry),
         allow_overflow=allow_segment_overflow,
     )
-    form_matrices: dict[int, Matrix] = {}
-    get_type = pdfium_c.FPDFPageObj_GetType
-    resolved_kinds = [get_type(obj) for obj, _f in objects] if kinds is None else kinds
+    form_ctx: dict[int, _FormContext] = {}
+    resolved_kinds = [pdfium_c.FPDFPageObj_GetType(obj) for obj, _f in objects] if kinds is None else kinds
     for index, ((obj, form), kind) in enumerate(zip(objects, resolved_kinds, strict=True)):
         if kind == pdfium_c.FPDF_PAGEOBJ_TEXT:
             continue
-        outer = form_matrices[form] if form >= 0 else IDENTITY
+        ctx = form_ctx[form] if form >= 0 else _ROOT_FORM
         if kind == pdfium_c.FPDF_PAGEOBJ_FORM:
-            form_matrices[index] = _read_matrix(obj, f"object {index}", state.scratch.fs_matrix).then(outer)
+            form_ctx[index] = _enter_form_context(obj, index, ctx, state)
         elif kind == pdfium_c.FPDF_PAGEOBJ_PATH:
-            _step_fused_path(state, obj, index, outer)
+            _step_fused_path(state, obj, index, ctx)
         else:
-            if kind == pdfium_c.FPDF_PAGEOBJ_IMAGE:
-                state.image_entries.append((index, obj, outer))
-            box = _object_box(obj, outer, state.to_display, state.scratch.bounds)
-            if box is None:
-                state.unboxed += 1
-            else:
-                state.boxes.append(box)
-    seg_result = (
-        PageSegments._trusted(
-            (),
-            SegmentStats(skipped_nonfinite_paths=state.skipped, segment_bound_hit=state.seg_overflow),
-        )
-        if state.seg_overflow is not None
-        else PageSegments._trusted(tuple(state.segments), SegmentStats(skipped_nonfinite_paths=state.skipped))
-    )
+            _step_non_path_object(state, obj, index, kind, ctx)
+    seg_stats = SegmentStats(skipped_nonfinite_paths=state.skipped, segment_bound_hit=state.seg_overflow)
+    seg_items = () if state.seg_overflow is not None else tuple(state.segments)
+    seg_result = PageSegments._trusted(seg_items, seg_stats)
     box_result = ObjectBoxes._trusted(tuple(state.boxes), state.unboxed, tuple(state.glyph_boxes))
-    return seg_result, box_result, state.image_entries
+    return seg_result, box_result, state.image_entries, tuple(state.occluders), tuple(state.image_occluders)
 
 
 class _PageStageGuardInfo(NamedTuple):
@@ -2074,13 +2469,21 @@ def _read_stages_with_guard(
         text, objects, kinds = _read_page_text_objects_and_types(page, geometry)
         stage = "objects"
         with _pdfium_errors(page_number):
-            segments, object_boxes, image_entries = _collect_segments_and_boxes(
+            segments, object_boxes, image_entries, occluders, image_occluders = _collect_segments_and_boxes(
                 geometry, objects, kinds=kinds, allow_segment_overflow=allow_segment_overflow
             )
         images, first_refusal = _read_images_and_refusal(page, geometry, objects=objects, image_entries=image_entries)
     except PDFCorruptError as exc:
         return PageFailure(page_number=page_number, stage=stage, message=str(exc))
-    raw = RawPage(geometry=geometry, text=text, segments=segments, images=images, object_boxes=object_boxes)
+    raw = RawPage(
+        geometry=geometry,
+        text=text,
+        segments=segments,
+        images=images,
+        object_boxes=object_boxes,
+        occluders=occluders,
+        image_occluders=image_occluders,
+    )
     image_items = [(idx, obj) for idx, obj, _outer in image_entries]
     return _PageStageGuardInfo(raw=raw, objects=objects, image_items=image_items, first_render_refusal=first_refusal)
 

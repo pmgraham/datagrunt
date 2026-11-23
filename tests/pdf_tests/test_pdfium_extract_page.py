@@ -16,6 +16,7 @@ import pypdfium2.raw as pdfium_c
 import pytest
 
 from datagrunt.pdf import PDFCorruptError, _pdfium_text, pdfium_engine
+from datagrunt.pdf._hidden_geometry import build_occluder_bands, char_is_occluded
 from datagrunt.pdf.pdfium_engine import (
     ImageStats,
     ObjectBoxes,
@@ -112,11 +113,15 @@ class TestGoodPage:
             segments=page_segments(handle, 0),
             images=page_images(handle, 0),
             object_boxes=page_object_boxes(handle, 0),
+            occluders=(),
+            image_occluders=got.image_occluders,
         )
         # Not vacuous: every stage found its item on the page.
         assert [item.text for item in got.text.spans] == ["Hello"]
         assert [item.object_index for item in got.segments.segments] == [1]
         assert [item.object_index for item in got.images.images] == [2]
+        assert [item.object_index for item in got.image_occluders] == [2]
+        assert got.occluders == ()
         assert len(got.object_boxes.boxes) == 2  # the line and the image
         assert (got.page_number, got.geometry.rotation_deg) == (1, rotate)
 
@@ -555,6 +560,16 @@ class TestRawPage:
             pytest.param({"text": None}, "text must be a PageText, got NoneType", id="text"),
             pytest.param({"segments": EMPTY_IMAGES}, "segments must be a PageSegments, got PageImages", id="segments"),
             pytest.param({"images": EMPTY_SEGMENTS}, "images must be a PageImages, got PageSegments", id="images"),
+            pytest.param({"occluders": []}, "occluders must be a tuple, got list", id="occluders-list"),
+            pytest.param({"occluders": ("bad",)}, "occluders[0] must be a Occluder, got str", id="occluders-item"),
+            pytest.param(
+                {"image_occluders": []}, "image_occluders must be a tuple, got list", id="image-occluders-list"
+            ),
+            pytest.param(
+                {"image_occluders": ("bad",)},
+                "image_occluders[0] must be a Occluder, got str",
+                id="image-occluders-item",
+            ),
         ],
     )
     def test_invalid_field_raises(self, overrides, message):
@@ -610,3 +625,149 @@ class TestPageFailure:
     def test_invalid_field_raises(self, overrides, error, message):
         with pytest.raises(error, match=re.escape(message)):
             failure(**overrides)
+
+
+_TRANSLUCENT_GS = b"<< /Type /ExtGState /ca 0.3 /CA 0.3 >>"
+_MULTIPLY_GS = b"<< /Type /ExtGState /BM /Multiply >>"
+_OPAQUE_IMG = (
+    b"<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8"
+    b" /Length 4 >>\nstream\n\x80\x80\x80\x80\nendstream"
+)
+_SMASK_DATA = (
+    b"<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8"
+    b" /Length 4 >>\nstream\n\x40\x40\x40\x40\nendstream"
+)
+_SMASK_IMG = (
+    b"<< /Type /XObject /Subtype /Image /Width 2 /Height 2 /ColorSpace /DeviceGray /BitsPerComponent 8"
+    b" /SMask 9 0 R /Length 4 >>\nstream\n\x80\x80\x80\x80\nendstream"
+)
+
+
+def _extract_hand_page(
+    tmp_path: Path, content: bytes, *, extra: tuple[bytes, ...] = (), resources: bytes = b""
+) -> RawPage:
+    path = content_page(tmp_path, content, extra=extra, resources=resources)
+    with open_document(path) as handle:
+        raw = extract_page(handle, 0)
+    assert isinstance(raw, RawPage)
+    return raw
+
+
+class TestOccluderExtraction:
+    """Opaque fills and raster images emit paint-order Occluder entries; strokes and translucent paint do not."""
+
+    def test_opaque_filled_rect_and_small_culled_fill_emit_occluders(self, tmp_path):
+        # First rect is 100x40 (non-culled), second is 8x8 (<11.9 pt culled from RawSegment).
+        content = b"0 0 0 rg 50 100 100 40 re f 200 150 8 8 re f"
+        raw = _extract_hand_page(tmp_path, content)
+
+        assert len(raw.occluders) == 2
+        assert raw.occluders[0].object_index == 0
+        assert raw.occluders[0].polygons is None
+        assert raw.occluders[0].bbox == pytest.approx((50.0, 160.0, 150.0, 200.0), abs=0.5)
+        assert raw.occluders[1].object_index == 1
+        assert raw.occluders[1].polygons is None
+        assert raw.occluders[1].bbox == pytest.approx((200.0, 142.0, 208.0, 150.0), abs=0.5)
+
+    def test_stroked_translucent_and_multiply_paths_emit_no_occluders(self, tmp_path):
+        content = b"1 w 10 10 100 40 re S q /T gs 0 0 0 rg 10 80 100 40 re f Q q /M gs 1 1 0 rg 10 140 100 40 re f Q"
+        raw = _extract_hand_page(
+            tmp_path,
+            content,
+            extra=(_TRANSLUCENT_GS, _MULTIPLY_GS),
+            resources=b"/ExtGState << /T 6 0 R /M 7 0 R >>",
+        )
+
+        assert raw.occluders == ()
+
+    def test_hollow_frame_and_triangle_emit_polygon_occluders(self, tmp_path):
+        # Hollow frame via even-odd f*: outer [20,20,180,180], inner [40,40,160,160] (user space)
+        frame = b"20 20 160 160 re 40 40 120 120 re f* "
+        # Solid triangle via nonzero f
+        tri = b"220 20 m 320 20 l 270 120 l h f"
+        raw = _extract_hand_page(tmp_path, frame + tri)
+
+        assert len(raw.occluders) == 2
+        occ_frame, occ_tri = raw.occluders
+        assert occ_frame.polygons is not None and len(occ_frame.polygons) == 2
+        assert occ_frame.even_odd is True
+        assert occ_tri.polygons is not None and len(occ_tri.polygons) == 1
+        assert occ_tri.even_odd is False
+
+        # Verify center of hollow frame does NOT occlude text, while triangle interior DOES.
+        idx = build_occluder_bands(raw.occluders, raw.geometry.height_pt)
+        assert not char_is_occluded((90.0, 190.0, 110.0, 210.0), 0, idx)
+        assert char_is_occluded((265.0, 235.0, 275.0, 245.0), 0, idx)
+
+    def test_clipped_fill_attaches_clip_and_text_only_clip_omits_occluder(self, tmp_path):
+        # Clipped fill at index 0
+        clipped_fill = b"q 10 10 40 40 re W n 0 0 200 200 re f Q "
+        # Mode-7 text clip (count_paths == 0) + fill -> must NOT emit occluder
+        text_clip_fill = b"q BT /F1 12 Tf 7 Tr 50 150 Td (Mask) Tj ET 0 0 300 300 re f Q"
+        raw = _extract_hand_page(tmp_path, clipped_fill + text_clip_fill)
+
+        assert len(raw.occluders) == 1
+        assert raw.occluders[0].object_index == 0
+        assert raw.occluders[0].clip is not None
+        assert raw.occluders[0].clip.bbox == pytest.approx((10.0, 250.0, 50.0, 290.0), abs=0.5)
+
+    def test_non_transparent_images_emit_image_occluder_candidates_while_translucent_do_not(self, tmp_path):
+        # Zero pixel decoding in engine: /Op and /Sm (whose /SMask is disambiguated via guarded render diff)
+        # enter image_occluders, while /ca 0.3 translucent image is rejected immediately by HasTransparency.
+        content = (
+            b"q 100 0 0 60 20 20 cm /Op Do Q q /T gs 100 0 0 60 140 20 cm /Op Do Q q 100 0 0 60 260 20 cm /Sm Do Q"
+        )
+        raw = _extract_hand_page(
+            tmp_path,
+            content,
+            extra=(_TRANSLUCENT_GS, _OPAQUE_IMG, _SMASK_IMG, _SMASK_DATA),
+            resources=b"/ExtGState << /T 6 0 R >> /XObject << /Op 7 0 R /Sm 8 0 R >>",
+        )
+
+        assert raw.occluders == ()
+        assert [occ.object_index for occ in raw.image_occluders] == [0, 2]
+        assert raw.image_occluders[0].polygons is None
+        assert raw.image_occluders[0].bbox == pytest.approx((20.0, 220.0, 120.0, 280.0), abs=0.5)
+        assert raw.image_occluders[1].bbox == pytest.approx((260.0, 220.0, 360.0, 280.0), abs=0.5)
+
+    def test_transparent_form_xobject_suppresses_child_occluders_and_clips_propagate(self, tmp_path):
+        inner = b"0 0 0 rg 10 10 80 80 re f"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length %d >>\nstream\n%s\nendstream" % (
+            len(inner),
+            inner,
+        )
+        # First form drawn under /ca 0.3 -> child fill suppressed; second drawn under clip -> inherits clip.
+        content = b"q /T gs /F Do Q q 0 0 50 50 re W n 1 0 0 1 20 20 cm /F Do Q"
+        raw = _extract_hand_page(
+            tmp_path,
+            content,
+            extra=(_TRANSLUCENT_GS, form),
+            resources=b"/ExtGState << /T 6 0 R >> /XObject << /F 7 0 R >>",
+        )
+
+        assert len(raw.occluders) == 1
+        assert raw.occluders[0].clip is not None
+        assert raw.occluders[0].clip.bbox == pytest.approx((0.0, 250.0, 50.0, 300.0), abs=0.5)
+
+    def test_max_occluders_cap_bounds_collection(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pdfium_engine, "_MAX_OCCLUDERS", 2)
+        content = b" ".join(b"%d 20 20 20 re f" % (10 + i * 30) for i in range(5))
+        raw = _extract_hand_page(tmp_path, content)
+
+        assert len(raw.occluders) == 2
+
+    def test_curved_fill_and_form_inner_clip_emit_accurate_occluders(self, tmp_path):
+        # Curved opaque fill (cubic Bezier blob) + translated Form XObject with inner clip
+        inner = b"q 10 10 40 40 re W n 0 0 100 100 re f Q"
+        form = b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Length %d >>\nstream\n%s\nendstream" % (
+            len(inner),
+            inner,
+        )
+        content = b"10 10 m 10 90 90 90 90 10 c h f q 1 0 0 1 150 50 cm /F Do Q"
+        raw = _extract_hand_page(tmp_path, content, extra=(form,), resources=b"/XObject << /F 6 0 R >>")
+
+        assert len(raw.occluders) == 2
+        assert raw.occluders[0].polygons is not None
+        assert raw.occluders[1].clip is not None
+        # Form translated (150, 50): inner clip [10,10,50,50] -> user [160,60,200,100] -> display [160,200,200,240]
+        assert raw.occluders[1].clip.bbox == pytest.approx((160.0, 200.0, 200.0, 240.0), abs=0.5)

@@ -20,6 +20,7 @@ import pytest
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
 from datagrunt.pdf import PDFCorruptError, _pdfium_common
+from datagrunt.pdf._hidden_geometry import ClipPathPoly, ClipRegion, char_is_clipped
 from datagrunt.pdf._hidden_rules import em_size
 from datagrunt.pdf.pdfium_engine import PageText, RawSpan, TextStats, open_document, page_text
 from pdf_tests.builders import FormXObject, PageSpec, TextRun, break_page, build_pdf, hand_written_pdf
@@ -284,6 +285,48 @@ class TestRawSpan:
                 ValueError,
                 "map_errors must be strictly increasing, got (1, 1)",
                 id="errors-repeated",
+            ),
+            pytest.param(
+                {"clip_region": "not-a-clip"},
+                TypeError,
+                "clip_region must be a ClipRegion or None, got str",
+                id="clip-region-type",
+            ),
+            pytest.param(
+                {"blank_glyph_offsets": [0]},
+                TypeError,
+                "blank_glyph_offsets must be a tuple, got list",
+                id="blank-list",
+            ),
+            pytest.param(
+                {"blank_glyph_offsets": (True,)},
+                TypeError,
+                "blank_glyph_offsets[0] must be an int, got True (bool)",
+                id="blank-bool",
+            ),
+            pytest.param(
+                {"blank_glyph_offsets": (-1,)},
+                ValueError,
+                "blank_glyph_offsets[0] must be >= 0, got -1",
+                id="blank-negative",
+            ),
+            pytest.param(
+                {"blank_glyph_offsets": (2,)},
+                ValueError,
+                "blank_glyph_offsets[0] must be inside text, in 0..1, got 2",
+                id="blank-past-end",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "blank_glyph_offsets": (2, 1)},
+                ValueError,
+                "blank_glyph_offsets must be strictly increasing, got (2, 1)",
+                id="blank-unsorted",
+            ),
+            pytest.param(
+                {**FOUR_CHARS, "blank_glyph_offsets": (1, 1)},
+                ValueError,
+                "blank_glyph_offsets must be strictly increasing, got (1, 1)",
+                id="blank-repeated",
             ),
         ],
     )
@@ -2075,3 +2118,255 @@ class TestUnionBox:
         boxes = ((5.0, 1.0, 6.0, 2.0), (0.0, 3.0, 1.0, 9.0), (2.0, -1.0, 8.0, 0.0))
 
         assert _pdfium_common.union_box(boxes) == (0.0, -1.0, 8.0, 9.0)
+
+
+def _type3_page(tmp_path: Path, content: bytes, *, filename: str = "type3.pdf") -> Path:
+    """A 400 x 300 pt PDF with a Type3 font /F1: A='O' (visible re f), B='X' (lying d1), C='Z' (0-box d1)."""
+    proc_visible = b"600 0 50 50 550 650 d1 50 50 500 600 re f"
+    proc_lying = b"600 0 50 50 550 650 d1"
+    proc_zero = b"600 0 0 0 0 0 d1"
+    cmap = (
+        b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+        b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+        b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+        b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+        b"3 beginbfchar\n<41> <004F>\n<42> <0058>\n<43> <005A>\nendbfchar\n"
+        b"endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+    )
+    font = (
+        b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0]"
+        b" /CharProcs << /a 6 0 R /b 7 0 R /c 8 0 R >>"
+        b" /Encoding << /Type /Encoding /Differences [65 /a /b /c] >>"
+        b" /FirstChar 65 /LastChar 67 /Widths [600 600 600] /ToUnicode 9 0 R >>"
+    )
+    extra = (
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_visible), proc_visible),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_lying), proc_lying),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_zero), proc_zero),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(cmap), cmap),
+    )
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        font,
+        *extra,
+    ]
+    return hand_written_pdf(tmp_path / filename, objects)
+
+
+def _rotated_content_page(tmp_path: Path, content: bytes, *, rotate: int = 90) -> Path:
+    """A hand-written 400 x 300 pt page with ``/Rotate`` drawing ``content`` with /F1 Helvetica."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Rotate %d /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R >> >> >>" % rotate,
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        HELVETICA,
+    ]
+    return hand_written_pdf(tmp_path / f"rot_{rotate}.pdf", objects)
+
+
+class TestClipRegionExtraction:
+    """Clip paths on text objects (including Form XObjects and rotations) populate RawSpan.clip_region."""
+
+    def test_unclipped_and_enclosing_clip_leave_clip_region_none(self, tmp_path):
+        unclipped = content_page(tmp_path, b"BT /F1 12 Tf 50 150 Td (Hello) Tj ET")
+        enclosed = content_page(tmp_path, b"q 0 0 400 300 re W n BT /F1 12 Tf 50 150 Td (Hello) Tj ET Q")
+
+        assert spans_of(unclipped)[0].clip_region is None
+        assert spans_of(enclosed)[0].clip_region is None
+
+    def test_text_outside_clip_rect_gets_axis_aligned_clip_region(self, tmp_path):
+        content = b"q 10 10 50 50 re W n BT /F1 12 Tf 200 200 Td (Secret) Tj ET Q"
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert got.clip_region is not None
+        assert got.clip_region.bbox == pytest.approx((10.0, 240.0, 60.0, 290.0), abs=0.5)
+        assert len(got.clip_region.paths) == 1
+        assert got.clip_region.paths[0].polygons is None
+        assert all(char_is_clipped(box, got.clip_region) for box in got.tight_boxes)
+
+    def test_zero_area_clip_produces_empty_clip_region(self, tmp_path):
+        content = b"q 0 0 0 0 re W n BT /F1 12 Tf 50 150 Td (Hidden) Tj ET Q"
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert got.clip_region is not None
+        cx0, cy0, cx1, cy1 = got.clip_region.bbox
+        assert cx0 >= cx1 or cy0 >= cy1
+        assert all(char_is_clipped(box, got.clip_region) for box in got.tight_boxes)
+
+    def test_nested_clips_intersect_their_boxes(self, tmp_path):
+        content = b"q 10 100 100 100 re W n 50 120 100 100 re W n BT /F1 12 Tf 200 200 Td (Nested) Tj ET Q"
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert got.clip_region is not None
+        # Intersection in user space: [50, 120, 110, 200] -> display [50, 100, 110, 180]
+        assert got.clip_region.bbox == pytest.approx((50.0, 100.0, 110.0, 180.0), abs=0.5)
+
+    def test_partial_clip_leaves_prefix_unclipped_and_suffix_clipped(self, tmp_path):
+        content = b"q 40 130 45 40 re W n BT /F1 12 Tf 50 150 Td (VisibleClipped) Tj ET Q"
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert got.clip_region is not None
+        flags = [char_is_clipped(box, got.clip_region) for box in got.tight_boxes]
+        assert not flags[0]
+        assert flags[-1]
+
+    def test_polygon_and_curved_clip_paths_preserve_polygons(self, tmp_path):
+        tri = b"q 10 10 m 80 10 l 45 80 l h W n BT /F1 12 Tf 200 200 Td (Tri) Tj ET Q"
+        (got_tri,) = spans_of(content_page(tmp_path, tri))
+        assert got_tri.clip_region is not None
+        assert any(p.polygons is not None for p in got_tri.clip_region.paths)
+        assert all(char_is_clipped(box, got_tri.clip_region) for box in got_tri.tight_boxes)
+
+        curve = b"q 10 10 m 10 90 90 90 90 10 c h W n BT /F1 12 Tf 200 200 Td (Curved) Tj ET Q"
+        (got_curve,) = spans_of(content_page(tmp_path, curve))
+        assert got_curve.clip_region is not None
+        assert any(p.polygons is not None for p in got_curve.clip_region.paths)
+        assert all(char_is_clipped(box, got_curve.clip_region) for box in got_curve.tight_boxes)
+
+    def test_text_only_clip_mode_7_is_not_treated_as_empty_clip(self, tmp_path):
+        content = b"q BT /F1 12 Tf 7 Tr 30 150 Td (Mask) Tj ET BT /F1 12 Tf 0 Tr 30 150 Td (Inside) Tj ET Q"
+        spans = spans_of(content_page(tmp_path, content))
+
+        assert len(spans) == 2
+        assert spans[1].clip_region is None
+
+    def test_form_xobject_outer_clip_and_bbox_propagate_to_child_text(self, tmp_path):
+        inner_out_bbox = b"BT /F1 12 Tf 150 50 Td (OutOfFormBBox) Tj ET"
+        form_bbox = (
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /Font << /F1 5 0 R >> >>"
+            b" /Length %d >>\nstream\n%s\nendstream" % (len(inner_out_bbox), inner_out_bbox)
+        )
+        p_bbox = content_page(
+            tmp_path, b"q 1 0 0 1 20 20 cm /X Do Q", extra=(form_bbox,), resources=b"/XObject << /X 6 0 R >>"
+        )
+        (got_bbox,) = spans_of(p_bbox)
+        assert got_bbox.clip_region is not None
+        assert all(char_is_clipped(box, got_bbox.clip_region) for box in got_bbox.tight_boxes)
+
+        inner_ok = b"BT /F1 12 Tf 50 50 Td (ClippedByOuter) Tj ET"
+        form_ok = (
+            b"<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> >>"
+            b" /Length %d >>\nstream\n%s\nendstream" % (len(inner_ok), inner_ok)
+        )
+        p_outer = content_page(
+            tmp_path,
+            b"q 0 0 30 30 re W n 1 0 0 1 50 50 cm /X Do Q",
+            extra=(form_ok,),
+            resources=b"/XObject << /X 6 0 R >>",
+        )
+        (got_outer,) = spans_of(p_outer)
+        assert got_outer.clip_region is not None
+        assert all(char_is_clipped(box, got_outer.clip_region) for box in got_outer.tight_boxes)
+
+    def test_rotated_90_page_transforms_clip_to_display_space(self, tmp_path):
+        # 400 x 300 page rotated 90 CW -> display 300 x 400.
+        # User rect [10, 20, 60, 100] -> display (20, 10, 100, 60).
+        content = b"q 10 20 50 80 re W n BT /F1 12 Tf 250 200 Td (Rot) Tj ET Q"
+        (got,) = spans_of(_rotated_content_page(tmp_path, content, rotate=90))
+
+        assert got.clip_region is not None
+        assert got.clip_region.bbox == pytest.approx((20.0, 10.0, 100.0, 60.0), abs=0.5)
+        assert all(char_is_clipped(box, got.clip_region) for box in got.tight_boxes)
+
+    def test_raw_span_pickle_round_trip_preserves_clip_and_blank_offsets(self):
+        clip = ClipRegion(bbox=(1.0, 2.0, 30.0, 40.0), paths=(ClipPathPoly(bbox=(1.0, 2.0, 30.0, 40.0)),))
+        original = span(clip_region=clip, blank_glyph_offsets=(0, 1))
+
+        assert pickle.loads(pickle.dumps(original)) == original
+
+
+class TestBlankGlyphOffsets:
+    """RawSpan.blank_glyph_offsets flags blank Type3/outline-free glyphs while exempting modes 3/7 and collapsed em."""
+
+    def test_normal_helvetica_has_no_blank_glyphs(self, tmp_path):
+        (got,) = spans_of(content_page(tmp_path, b"BT /F1 12 Tf 50 150 Td (Hello World) Tj ET"))
+
+        assert got.blank_glyph_offsets == ()
+
+    def test_render_modes_3_and_7_are_strictly_exempt_from_blank_glyphs(self, tmp_path):
+        path = _type3_page(
+            tmp_path,
+            b"BT /F1 12 Tf 3 Tr 50 150 Td (BC) Tj ET BT /F1 12 Tf 7 Tr 50 200 Td (BC) Tj ET",
+        )
+        spans = spans_of(path)
+
+        assert len(spans) == 2
+        assert spans[0].blank_glyph_offsets == ()
+        assert spans[1].blank_glyph_offsets == ()
+
+    def test_collapsed_matrix_zero_scale_is_not_flagged_as_blank_glyph(self, tmp_path):
+        content = b"BT /F1 12 Tf 0.05 Tz 50 150 Td (HIDDEN) Tj ET"
+        (got,) = spans_of(content_page(tmp_path, content))
+
+        assert got.blank_glyph_offsets == ()
+
+    def test_type3_zero_box_blank_flagged_while_visible_and_nonzero_d1_wait_for_render_diff(self, tmp_path):
+        # A='O' (visible re f), B='X' (lying non-zero d1, verified via guarded render diff), C='Z' (0 0 0 0 d1)
+        # Note: a solo 0-box glyph is dropped by PDFium as an empty text object, so pair C as (AC).
+        path = _type3_page(
+            tmp_path,
+            b"BT /F1 12 Tf 50 220 Td (A) Tj ET BT /F1 12 Tf 50 180 Td (B) Tj ET BT /F1 12 Tf 50 140 Td (AC) Tj ET",
+        )
+        spans = spans_of(path)
+
+        assert [s.text for s in spans] == ["O", "X", "OZ"]
+        assert spans[0].blank_glyph_offsets == ()
+        assert spans[1].blank_glyph_offsets == ()
+        assert spans[2].blank_glyph_offsets == (1,)
+
+    def test_unmapped_replacement_chars_are_exempt_from_blank_glyph_offsets(self, tmp_path):
+        # Map code 0x43 (0 0 0 0 d1) to U+FFFD so it stays visible for hybrid unmapped_regions.
+        proc_visible = b"600 0 50 50 550 650 d1 50 50 500 600 re f"
+        proc_zero = b"600 0 0 0 0 0 d1"
+        cmap = (
+            b"/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n"
+            b"/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n"
+            b"/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n"
+            b"1 begincodespacerange <00> <FF> endcodespacerange\n"
+            b"2 beginbfchar\n<41> <004F>\n<43> <FFFD>\nendbfchar\n"
+            b"endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend"
+        )
+        font = (
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0]"
+            b" /CharProcs << /a 6 0 R /c 7 0 R >>"
+            b" /Encoding << /Type /Encoding /Differences [65 /a 67 /c] >>"
+            b" /FirstChar 65 /LastChar 67 /Widths [600 600 600] /ToUnicode 8 0 R >>"
+        )
+        extra = (
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_visible), proc_visible),
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_zero), proc_zero),
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(cmap), cmap),
+        )
+        path = content_page(tmp_path, b"BT /F1 12 Tf 50 140 Td (AC) Tj ET", font=font, extra=extra)
+        (got,) = spans_of(path)
+
+        assert got.text == "O\ufffd"
+        assert got.blank_glyph_offsets == ()
+
+    def test_encoding_only_type3_zero_box_blank_glyph_is_still_flagged(self, tmp_path):
+        # Type3 font with /Encoding only (no /ToUnicode): PDFium extracts ASCII "AB" with map_errors=(0, 1);
+        # index 1 (0 0 0 0 d1) must NOT bypass blank_glyph_offsets.
+        proc_visible = b"600 0 50 50 550 650 d1 50 50 500 600 re f"
+        proc_zero = b"600 0 0 0 0 0 d1"
+        font = (
+            b"<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0]"
+            b" /CharProcs << /A 6 0 R /B 7 0 R >>"
+            b" /Encoding << /Type /Encoding /Differences [65 /A /B] >>"
+            b" /FirstChar 65 /LastChar 66 /Widths [600 600] >>"
+        )
+        extra = (
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_visible), proc_visible),
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(proc_zero), proc_zero),
+        )
+        path = content_page(tmp_path, b"BT /F1 12 Tf 50 140 Td (AB) Tj ET", font=font, extra=extra)
+        (got,) = spans_of(path)
+
+        assert got.text == "AB"
+        assert got.map_errors == (0, 1)
+        assert got.blank_glyph_offsets == (1,)

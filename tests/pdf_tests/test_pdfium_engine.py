@@ -136,7 +136,12 @@ class TestModuleImports:
             pytest.param(_hidden_rules, {"datagrunt.pdf.elements"}, id="hidden-rules"),
             pytest.param(
                 _pdfium_text,
-                {"datagrunt.pdf._hidden_rules", "datagrunt.pdf._pdfium_common", "datagrunt.pdf._validate"},
+                {
+                    "datagrunt.pdf._hidden_geometry",
+                    "datagrunt.pdf._hidden_rules",
+                    "datagrunt.pdf._pdfium_common",
+                    "datagrunt.pdf._validate",
+                },
                 id="text",
             ),
             pytest.param(_path_segments, {"datagrunt.pdf._validate"}, id="segments"),

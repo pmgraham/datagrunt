@@ -57,6 +57,9 @@ HiddenReason: TypeAlias = Literal[
     "duplicate",
     "superseded",
     "unchecked_background",
+    "occluded",
+    "clipped",
+    "blank_glyph",
 ]
 """Why a text span is hidden from a human reader (it is flagged, never dropped).
 
@@ -75,8 +78,13 @@ its own reasons. ``unchecked_background`` means the page drew the text where
 a matching background could hide it (its paint is near white, or other
 paint lies under it), but that background could not be checked: the page's
 render was refused or failed (#400). It is flagged, never dropped: a check
-that cannot run fails closed. New reasons are appended, so the canonical
-order of the older ones never changes.
+that cannot run fails closed. ``occluded`` means opaque paint (a filled path
+or opaque image) drawn later in page paint order covers the text (#395).
+``clipped`` means the text lies outside its active PDF clipping region, so
+no part of its glyphs is painted (#395). ``blank_glyph`` means a visible
+non-whitespace, non-control/separator character whose font glyph draws no
+outline (pdfium's 1/1000-em stand-in box, #395). New reasons are appended,
+so the canonical order of the older ones never changes.
 """
 
 # Canonical order, derived from the Literal so the two can never drift apart.
