@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from functools import partial
 from typing import IO, NamedTuple, TypeVar
 
-from datagrunt.pdf import pipeline
+from datagrunt.pdf import _render_worker, pipeline
 from datagrunt.pdf._hybrid_ocr import hybrid_page
 from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
 from datagrunt.pdf._options import PrerenderEntry, _PrerenderCache
@@ -63,7 +63,14 @@ from datagrunt.pdf.pipeline import (
     _span,
     error_page,
 )
-from datagrunt.pdf.quality import Backdrop, PageAssessment, assess_page, needs_background
+from datagrunt.pdf.quality import (
+    Backdrop,
+    PageAssessment,
+    apply_visibility_diff,
+    assess_page,
+    needs_background,
+    needs_visibility_diff,
+)
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_pages
 from datagrunt.pdf.vision import fallback_page, vision_page
 
@@ -257,16 +264,74 @@ def _capture_page_prerender(
     return (draw_dpi, rendered.px_width, rendered.px_height, png_data)
 
 
+def _draw_open_colour(
+    page: object,
+    info: object,
+    source: PDFSource,
+    dpi: int,
+    cap: int,
+    *,
+    without_text: bool,
+) -> _Drawn:
+    """Render an open PdfPage in 24-bit BGR in-process, returning RenderRefused/RenderFailed as values."""
+    try:
+        return _render_worker.draw_open_page_in_process(
+            page,
+            info.raw.geometry,  # type: ignore[attr-defined]
+            info.objects,  # type: ignore[attr-defined]
+            info.image_items,  # type: ignore[attr-defined]
+            info.first_render_refusal,  # type: ignore[attr-defined]
+            source.path,
+            dpi=dpi,
+            memory_cap_bytes=cap,
+            colour=True,
+            without_text=without_text,
+            annotations=False,
+        )
+    except (RenderRefused, RenderFailed) as exc:
+        return exc
+
+
+def _fused_render_stage(
+    page: object,
+    info: object,
+    source: PDFSource,
+    index: int,
+    options: PipelineOptions,
+    assessment: PageAssessment,
+    bg_dpi: int | str | None,
+    diff_dpi: int | str | None,
+    drawn_out: dict[int, _Drawn],
+    with_text_out: dict[int, _Drawn],
+    prerender_out: _PrerenderCache | None,
+) -> None:
+    """Run optional pre-render, with-text visibility-diff render, and textless background render in safe order."""
+    if (
+        prerender_out is not None
+        and not prerender_out.is_full
+        and (options.ocr == "never" or assessment.route != "vision")
+    ):
+        captured = _capture_page_prerender(page, info, source, options, cache=prerender_out)
+        if captured is not None:
+            prerender_out.put(index, captured)
+    cap = pipeline._vision(options).memory_cap_bytes
+    if isinstance(diff_dpi, int):
+        with_text_out[index] = _draw_open_colour(page, info, source, diff_dpi, cap, without_text=False)
+    without_dpi = bg_dpi if isinstance(bg_dpi, int) else (diff_dpi if isinstance(diff_dpi, int) else None)
+    if isinstance(without_dpi, int):
+        drawn_out[index] = _draw_open_colour(page, info, source, without_dpi, cap, without_text=True)
+
+
 def _assessed_fused_single_load(
     handle: DocumentHandle,
     source: PDFSource,
     index: int,
     options: PipelineOptions,
     drawn_out: dict[int, _Drawn],
+    with_text_out: dict[int, _Drawn],
     prerender_out: _PrerenderCache | None,
 ) -> "_Assessed | PageFailure":
-    """Load ``index`` once: extract stages, optionally pre-render gray PNG, and optionally draw background."""
-    from datagrunt.pdf import _render_worker
+    """Load ``index`` once: extract stages, optionally pre-render gray PNG, and draw visibility/background renders."""
     from datagrunt.pdf import pdfium_engine as _eng
 
     with _eng._PDFIUM_LOCK:
@@ -286,33 +351,21 @@ def _assessed_fused_single_load(
             recovered = recover_dropped_text(handle, index) if dropped > 0 else None
             assessment = assess_page(info.raw, ocr=options.ocr, recovered=recovered)
             bg_dpi = _background_dpi(info.raw, assessment, options)
-            if (
-                prerender_out is not None
-                and not prerender_out.is_full
-                and (options.ocr == "never" or assessment.route != "vision")
-            ):
-                captured = _capture_page_prerender(page, info, source, options, cache=prerender_out)
-                if captured is not None:
-                    prerender_out.put(index, captured)
-            if isinstance(bg_dpi, int):
-                cap = pipeline._vision(options).memory_cap_bytes
-                try:
-                    drawn_out[index] = _render_worker.draw_open_page_in_process(
-                        page,
-                        info.raw.geometry,
-                        info.objects,
-                        info.image_items,
-                        info.first_render_refusal,
-                        source.path,
-                        dpi=bg_dpi,
-                        memory_cap_bytes=cap,
-                        colour=True,
-                        without_text=True,
-                        annotations=False,
-                    )
-                except (RenderRefused, RenderFailed) as exc:
-                    drawn_out[index] = exc
-            return _Assessed(index, info.raw, recovered, assessment, bg_dpi)
+            diff_dpi = _diff_dpi(info.raw, assessment, options)
+            _fused_render_stage(
+                page,
+                info,
+                source,
+                index,
+                options,
+                assessment,
+                bg_dpi,
+                diff_dpi,
+                drawn_out,
+                with_text_out,
+                prerender_out,
+            )
+            return _Assessed(index, info.raw, recovered, assessment, bg_dpi, diff_dpi)
         finally:
             page.close()
 
@@ -347,23 +400,32 @@ def _window_pages(
     staged: list["Page | _Assessed | PageFailure"] = []
     fuse = _can_fuse_page_load(options)
     drawn: dict[int, _Drawn] = {}
+    with_text_drawn: dict[int, _Drawn] = {}
     for index in window:  # bounded: the window's pages
         progress(index)
         step_fn = (
-            partial(_assessed_fused_single_load, handle, source, index, options, drawn, prerender_out)
+            partial(_assessed_fused_single_load, handle, source, index, options, drawn, with_text_drawn, prerender_out)
             if fuse
             else partial(_assessed, handle, index, options)
         )
         staged.append(_isolated(handle, index, options, step_fn))
     if not fuse:
         drawn = _backgrounds(handle, source, staged, options)
+        with_text_drawn = _with_text_renders(handle, source, staged, options)
     for item in staged:  # bounded: the window's pages
         if isinstance(item, Page):
             yield item
             continue
         index = item.page_number - 1 if isinstance(item, PageFailure) else item.page_index
         progress(index)
-        yield _isolated(handle, index, options, partial(_step_four, handle, item, drawn.get(index), source, options))
+        yield _isolated(
+            handle,
+            index,
+            options,
+            partial(
+                _step_four, handle, item, drawn.get(index), source, options, with_text_drawn=with_text_drawn.get(index)
+            ),
+        )
 
 
 def _error_page(handle: DocumentHandle, index: int, error: str) -> Page:
@@ -417,11 +479,11 @@ def _isolated_page(handle: DocumentHandle, source: PDFSource, index: int, option
 
 
 class _Assessed(NamedTuple):
-    """A page through steps 1-3 but its background check.
+    """A page through steps 1-3 but its visibility-diff and background checks.
 
     ``background_dpi`` is the DPI its background is drawn at (the gate
     passed it), why it cannot be drawn (a str), or None (the gate did not
-    pass it).
+    pass it). ``diff_dpi`` is the DPI for visibility-diff rendering, or None.
     """
 
     page_index: int
@@ -429,6 +491,7 @@ class _Assessed(NamedTuple):
     recovered: RecoveredText | None
     assessment: PageAssessment
     background_dpi: int | str | None
+    diff_dpi: int | str | None = None
 
 
 def _isolated(handle: DocumentHandle, index: int, options: PipelineOptions, step: Callable[[], _T]) -> _T | Page:
@@ -462,13 +525,13 @@ def _assessed(handle: DocumentHandle, index: int, options: PipelineOptions) -> _
     dropped = raw.text.stats.dropped_text_objects
     recovered = recover_dropped_text(handle, index) if dropped > 0 else None
     assessment = assess_page(raw, ocr=options.ocr, recovered=recovered)
-    return _Assessed(index, raw, recovered, assessment, _background_dpi(raw, assessment, options))
+    bg_dpi = _background_dpi(raw, assessment, options)
+    diff_dpi = _diff_dpi(raw, assessment, options)
+    return _Assessed(index, raw, recovered, assessment, bg_dpi, diff_dpi)
 
 
-def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineOptions) -> int | str | None:
-    """The DPI the page's background is drawn at, why it cannot be drawn, or None when the gate does not pass it."""
-    if not needs_background(raw, assessment):
-        return None
+def _render_dpi_or_reason(raw: RawPage, options: PipelineOptions) -> int | str:
+    """Compute the capped background/diff DPI for ``raw``, or the refusal message if it cannot be rendered."""
     bound = min(options.max_render_pixels, pipeline._BACKGROUND_MAX_PIXELS)
     try:
         return effective_dpi(pipeline._BACKGROUND_DPI, bound, raw.geometry.width_pt, raw.geometry.height_pt)
@@ -476,15 +539,29 @@ def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineO
         return str(exc)
 
 
-def _in_process_backgrounds(
+def _background_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineOptions) -> int | str | None:
+    """The DPI the page's background is drawn at, why it cannot be drawn, or None when the gate does not pass it."""
+    if not needs_background(raw, assessment):
+        return None
+    return _render_dpi_or_reason(raw, options)
+
+
+def _diff_dpi(raw: RawPage, assessment: PageAssessment, options: PipelineOptions) -> int | str | None:
+    """The DPI for visibility-diff rendering, why it cannot be drawn, or None when not needed (#395)."""
+    if not needs_visibility_diff(assessment, raw):
+        return None
+    return _render_dpi_or_reason(raw, options)
+
+
+def _in_process_renders(
     handle: DocumentHandle,
     source: PDFSource,
     pages: tuple[tuple[int, int], ...],
     options: PipelineOptions,
+    *,
+    without_text: bool,
 ) -> dict[int, _Drawn]:
-    """Draw each gated page's textless BGR background directly on the open ``handle``."""
-    from datagrunt.pdf import _render_worker
-
+    """Draw each page in 24-bit BGR directly on the open ``handle``."""
     cap = pipeline._vision(options).memory_cap_bytes
     outcomes: dict[int, _Drawn] = {}
     for page_index, dpi in pages:
@@ -496,7 +573,7 @@ def _in_process_backgrounds(
                 dpi=dpi,
                 memory_cap_bytes=cap,
                 colour=True,
-                without_text=True,
+                without_text=without_text,
                 annotations=False,
             )
         except (RenderRefused, RenderFailed) as exc:
@@ -504,22 +581,19 @@ def _in_process_backgrounds(
     return outcomes
 
 
-def _backgrounds(
+def _batch_colour_renders(
     handle: DocumentHandle,
     source: PDFSource,
-    staged: list[Page | _Assessed | PageFailure],
+    pages: tuple[tuple[int, int], ...],
     options: PipelineOptions,
+    *,
+    without_text: bool,
 ) -> dict[int, _Drawn]:
-    """Each gated page's background render, by page index."""
-    pages = tuple(
-        (item.page_index, item.background_dpi)
-        for item in staged
-        if isinstance(item, _Assessed) and isinstance(item.background_dpi, int)
-    )
+    """Render ``pages`` in 24-bit BGR (in-process when unsandboxed, else via guarded ``render_pages`` worker)."""
     if not pages:
         return {}
     if not options.sandbox and render_pages is _default_render_pages:
-        return _in_process_backgrounds(handle, source, pages, options)
+        return _in_process_renders(handle, source, pages, options, without_text=without_text)
     try:
         drawn = render_pages(
             source.path,
@@ -528,11 +602,43 @@ def _backgrounds(
             memory_cap_bytes=pipeline._vision(options).memory_cap_bytes,
             timeout_s=pipeline._BACKGROUND_START_S + pipeline._BACKGROUND_PAGE_S * len(pages),
             colour=True,
-            without_text=True,
+            without_text=without_text,
         )
     except Exception as exc:  # step 5, page by page: see the docstring
         return dict.fromkeys((index for index, _dpi in pages), exc)
     return {index: result for (index, _dpi), result in zip(pages, drawn, strict=True)}
+
+
+def _backgrounds(
+    handle: DocumentHandle,
+    source: PDFSource,
+    staged: list[Page | _Assessed | PageFailure],
+    options: PipelineOptions,
+) -> dict[int, _Drawn]:
+    """Each gated or visibility-diff page's textless BGR render, by page index."""
+    pages: list[tuple[int, int]] = []
+    for item in staged:
+        if not isinstance(item, _Assessed):
+            continue
+        dpi = item.background_dpi if isinstance(item.background_dpi, int) else item.diff_dpi
+        if isinstance(dpi, int):
+            pages.append((item.page_index, dpi))
+    return _batch_colour_renders(handle, source, tuple(pages), options, without_text=True)
+
+
+def _with_text_renders(
+    handle: DocumentHandle,
+    source: PDFSource,
+    staged: list[Page | _Assessed | PageFailure],
+    options: PipelineOptions,
+) -> dict[int, _Drawn]:
+    """Each visibility-diff page's with-text BGR render, by page index."""
+    pages = tuple(
+        (item.page_index, item.diff_dpi)
+        for item in staged
+        if isinstance(item, _Assessed) and isinstance(item.diff_dpi, int)
+    )
+    return _batch_colour_renders(handle, source, pages, options, without_text=False)
 
 
 def _step_four(
@@ -541,6 +647,8 @@ def _step_four(
     drawn: _Drawn | None,
     source: PDFSource,
     options: PipelineOptions,
+    *,
+    with_text_drawn: _Drawn | None = None,
 ) -> Page:
     """Step 4: a page A2 could not read is A5b's ``fallback_page`` (render and OCR); else :func:`_finished`."""
     if isinstance(item, PageFailure):
@@ -555,16 +663,36 @@ def _step_four(
             ocr=options.ocr,
             options=vision,
         )
-    return _finished(item, drawn, source, options)
+    return _finished(item, drawn, source, options, with_text_drawn=with_text_drawn)
 
 
-def _finished(item: _Assessed, drawn: _Drawn | None, source: PDFSource, options: PipelineOptions) -> Page:
-    """Step 3's background check, then step 4: the page assessed again with its backdrop (or why not), then routed."""
-    background = _background(item, drawn)
+def _backdrop_or_none(drawn: _Drawn | None) -> Backdrop | None:
+    """Convert a RenderedPage to a Backdrop, or None when absent/refused/failed."""
+    if isinstance(drawn, RenderedPage):
+        return Backdrop(pixels=drawn.pixels, px_width=drawn.px_width, px_height=drawn.px_height)
+    return None
+
+
+def _finished(
+    item: _Assessed,
+    drawn: _Drawn | None,
+    source: PDFSource,
+    options: PipelineOptions,
+    *,
+    with_text_drawn: _Drawn | None = None,
+) -> Page:
+    """Step 3's visibility diff and background check, then step 4 routing."""
     assessment = item.assessment
+    with_bg = _backdrop_or_none(with_text_drawn)
+    without_bg = _backdrop_or_none(drawn)
+    if isinstance(item.diff_dpi, int) and with_bg is not None and without_bg is not None:
+        assessment = apply_visibility_diff(
+            assessment, item.raw, with_text=with_bg, without_text=without_bg, ocr=options.ocr
+        )
+    background = _background(item, drawn) if item.background_dpi is not None else None
     if background is not None:
         assessment = assess_page(
-            item.raw, ocr=options.ocr, recovered=item.recovered, background=background, _initial=item.assessment
+            item.raw, ocr=options.ocr, recovered=item.recovered, background=background, _initial=assessment
         )
     return _routed(item.raw, assessment, source, options)
 

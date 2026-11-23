@@ -59,13 +59,14 @@ Text (#365 T2), pinned by ``tests/pdf_tests/test_pdfium_spans.py``:
 import ctypes
 import math
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import pypdfium2.raw as pdfium_c
 
-from datagrunt.pdf._hidden_rules import em_size
+from datagrunt.pdf._hidden_geometry import ClipRegion, is_blank_glyph_char
+from datagrunt.pdf._hidden_rules import em_reasons, em_size
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, WalkBoundHit, object_address, read_rgba, union_box
 from datagrunt.pdf._validate import finite_float, int_at_least, ordered_box, rgba_tuple, strict_bool, typed_tuple
 
@@ -158,12 +159,17 @@ class RawSpan:
     object_index: int
     generated_breaks: tuple[int, ...]
     map_errors: tuple[int, ...]
+    clip_region: ClipRegion | None = None
+    blank_glyph_offsets: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         self._check_text_and_boxes()
         last = len(self.text) - 1
         _check_offsets("generated_breaks", self.generated_breaks, 1, last)
         _check_offsets("map_errors", self.map_errors, 0, last)
+        _check_offsets("blank_glyph_offsets", self.blank_glyph_offsets, 0, last)
+        if self.clip_region is not None and not isinstance(self.clip_region, ClipRegion):
+            raise TypeError(f"clip_region must be a ClipRegion or None, got {type(self.clip_region).__name__}")
         object.__setattr__(self, "font_size_pt", finite_float("font_size_pt", self.font_size_pt))
         object.__setattr__(self, "em_width_pt", finite_float("em_width_pt", self.em_width_pt, lo=0.0))
         if not isinstance(self.base_font_name, str):
@@ -212,58 +218,131 @@ class RawSpan:
         object_index: int,
         generated_breaks: tuple[int, ...],
         map_errors: tuple[int, ...],
+        clip_region: ClipRegion | None = None,
+        blank_glyph_offsets: tuple[int, ...] = (),
     ) -> "RawSpan":
         """Construct from textpage-validated boxes and styles without O(chars) re-validation."""
-        if not isinstance(text, str) or not text:
-            raise ValueError("text must be a non-empty str")
-        n = len(text)
-        if (
-            not isinstance(bbox, tuple)
-            or len(bbox) != 4
-            or not isinstance(char_boxes, tuple)
-            or not isinstance(tight_boxes, tuple)
-            or len(char_boxes) != n
-            or len(tight_boxes) != n
-            or not isinstance(generated_breaks, tuple)
-            or not isinstance(map_errors, tuple)
-        ):
-            raise TypeError("span boxes and offset collections must be tuples of matching length")
-        if (
-            not isinstance(base_font_name, str)
-            or type(is_bold) is not bool
-            or type(is_italic) is not bool
-            or isinstance(render_mode, bool)
-            or not isinstance(render_mode, int)
-            or not (0 <= render_mode <= 7)
-            or isinstance(object_index, bool)
-            or not isinstance(object_index, int)
-            or object_index < 0
-            or not isinstance(fill_rgba, tuple)
-            or len(fill_rgba) != 4
-            or not isinstance(stroke_rgba, tuple)
-            or len(stroke_rgba) != 4
-        ):
-            raise ValueError("invalid span scalar metadata")
-        f_size, f_em = float(font_size_pt), float(em_width_pt)
-        if not (math.isfinite(f_size) and math.isfinite(f_em) and f_em >= 0.0):
-            raise ValueError(f"non-finite or negative span font metrics: {f_size!r}, {f_em!r}")
+        _check_trusted_collections(
+            text, bbox, char_boxes, tight_boxes, generated_breaks, map_errors, clip_region, blank_glyph_offsets
+        )
+        f_size, f_em = _check_trusted_scalars(
+            font_size_pt,
+            em_width_pt,
+            base_font_name,
+            is_bold,
+            is_italic,
+            render_mode,
+            fill_rgba,
+            stroke_rgba,
+            object_index,
+        )
         self = object.__new__(cls)
-        object.__setattr__(self, "text", text)
-        object.__setattr__(self, "bbox", bbox)
-        object.__setattr__(self, "char_boxes", char_boxes)
-        object.__setattr__(self, "tight_boxes", tight_boxes)
-        object.__setattr__(self, "font_size_pt", f_size)
-        object.__setattr__(self, "em_width_pt", f_em)
-        object.__setattr__(self, "base_font_name", base_font_name)
-        object.__setattr__(self, "is_bold", is_bold)
-        object.__setattr__(self, "is_italic", is_italic)
-        object.__setattr__(self, "render_mode", render_mode)
-        object.__setattr__(self, "fill_rgba", fill_rgba)
-        object.__setattr__(self, "stroke_rgba", stroke_rgba)
-        object.__setattr__(self, "object_index", object_index)
-        object.__setattr__(self, "generated_breaks", generated_breaks)
-        object.__setattr__(self, "map_errors", map_errors)
+        values = (
+            text,
+            bbox,
+            char_boxes,
+            tight_boxes,
+            f_size,
+            f_em,
+            base_font_name,
+            is_bold,
+            is_italic,
+            render_mode,
+            fill_rgba,
+            stroke_rgba,
+            object_index,
+            generated_breaks,
+            map_errors,
+            clip_region,
+            blank_glyph_offsets,
+        )
+        for name, val in zip(_RAW_SPAN_SLOTS, values, strict=True):
+            object.__setattr__(self, name, val)
         return self
+
+
+_RAW_SPAN_SLOTS: tuple[str, ...] = (
+    "text",
+    "bbox",
+    "char_boxes",
+    "tight_boxes",
+    "font_size_pt",
+    "em_width_pt",
+    "base_font_name",
+    "is_bold",
+    "is_italic",
+    "render_mode",
+    "fill_rgba",
+    "stroke_rgba",
+    "object_index",
+    "generated_breaks",
+    "map_errors",
+    "clip_region",
+    "blank_glyph_offsets",
+)
+
+
+def _check_trusted_collections(
+    text: str,
+    bbox: Box,
+    char_boxes: tuple[Box, ...],
+    tight_boxes: tuple[Box, ...],
+    generated_breaks: tuple[int, ...],
+    map_errors: tuple[int, ...],
+    clip_region: ClipRegion | None,
+    blank_glyph_offsets: tuple[int, ...],
+) -> None:
+    """Validate string, tuple lengths, and optional ``ClipRegion`` for :meth:`RawSpan._trusted`."""
+    if not isinstance(text, str) or not text:
+        raise ValueError("text must be a non-empty str")
+    n = len(text)
+    if (
+        not isinstance(bbox, tuple)
+        or len(bbox) != 4
+        or not isinstance(char_boxes, tuple)
+        or not isinstance(tight_boxes, tuple)
+        or len(char_boxes) != n
+        or len(tight_boxes) != n
+        or not isinstance(generated_breaks, tuple)
+        or not isinstance(map_errors, tuple)
+        or not isinstance(blank_glyph_offsets, tuple)
+        or (clip_region is not None and not isinstance(clip_region, ClipRegion))
+    ):
+        raise TypeError("span boxes, clip_region, and offset collections must have valid tuple/ClipRegion types")
+
+
+def _check_trusted_scalars(
+    font_size_pt: float,
+    em_width_pt: float,
+    base_font_name: str,
+    is_bold: bool,
+    is_italic: bool,
+    render_mode: int,
+    fill_rgba: tuple[int, int, int, int],
+    stroke_rgba: tuple[int, int, int, int],
+    object_index: int,
+) -> tuple[float, float]:
+    """Validate scalar metadata for :meth:`RawSpan._trusted` and return ``(font_size_pt, em_width_pt)``."""
+    if (
+        not isinstance(base_font_name, str)
+        or type(is_bold) is not bool
+        or type(is_italic) is not bool
+        or isinstance(render_mode, bool)
+        or not isinstance(render_mode, int)
+        or not (0 <= render_mode <= 7)
+        or isinstance(object_index, bool)
+        or not isinstance(object_index, int)
+        or object_index < 0
+        or not isinstance(fill_rgba, tuple)
+        or len(fill_rgba) != 4
+        or not isinstance(stroke_rgba, tuple)
+        or len(stroke_rgba) != 4
+    ):
+        raise ValueError("invalid span scalar metadata")
+    f_size, f_em = float(font_size_pt), float(em_width_pt)
+    if not (math.isfinite(f_size) and math.isfinite(f_em) and f_em >= 0.0):
+        raise ValueError(f"non-finite or negative span font metrics: {f_size!r}, {f_em!r}")
+    return f_size, f_em
 
 
 def _box_is_finite(box: Box) -> bool:
@@ -674,17 +753,36 @@ _REPLACEMENT_CHAR = "\ufffd"
 # reads the same textpage and reports U+0002 too, so U+002D ("-") is restored.
 _HYPHEN_MARKER = 0x0002
 _HYPHEN_CODE = ord("-")
+_EXEMPT_BLANK_MODES = frozenset({3, 7})
+
+
+def _blank_glyph_offsets(text: str, tight_boxes: tuple[Box, ...], style: _Style) -> tuple[int, ...]:
+    """Compute strictly increasing blank-glyph offsets, exempting modes 3/7, collapsed em, and U+FFFD."""
+    if style.render_mode in _EXEMPT_BLANK_MODES or em_reasons(style.em_width_pt, abs(style.font_size_pt)):
+        return ()
+    em_pt = max(abs(style.font_size_pt), style.em_width_pt)
+    return tuple(
+        idx
+        for idx, ch in enumerate(text)
+        if ch != _REPLACEMENT_CHAR and is_blank_glyph_char(ch, tight_boxes[idx], em_pt)
+    )
 
 
 class _SpanBuilder:
     """Groups a page's kept textpage chars into RawSpans, in order."""
 
     def __init__(
-        self, to_display: Callable[[Box], Box], object_indices: dict[int, int], styles: dict[int, _Style]
+        self,
+        to_display: Callable[[Box], Box],
+        object_indices: dict[int, int],
+        styles: dict[int, _Style],
+        *,
+        text_clips: Mapping[int, ClipRegion] | None = None,
     ) -> None:
         self._to_display = to_display
         self._object_indices = object_indices
         self._styles = styles
+        self._text_clips = text_clips
         self._spans: list[RawSpan] = []
         self._owner = 0
         self._chars: list[str] = []
@@ -744,14 +842,18 @@ class _SpanBuilder:
         if not self._chars:
             return
         to_disp = self._to_display
+        text = "".join(self._chars)
         boxes = tuple(to_disp(box) for box in self._boxes)
+        tight_boxes = tuple(to_disp(box) for box in self._tight)
         style = self._styles[self._owner]
+        clip_region = None if self._text_clips is None else self._text_clips.get(self._owner)
+        blank_offsets = _blank_glyph_offsets(text, tight_boxes, style)
         self._spans.append(
             RawSpan._trusted(
-                text="".join(self._chars),
+                text=text,
                 bbox=union_box(boxes),
                 char_boxes=boxes,
-                tight_boxes=tuple(to_disp(box) for box in self._tight),
+                tight_boxes=tight_boxes,
                 font_size_pt=style.font_size_pt,
                 em_width_pt=style.em_width_pt,
                 base_font_name=style.base_font_name,
@@ -763,6 +865,8 @@ class _SpanBuilder:
                 object_index=self._object_indices[self._owner],
                 generated_breaks=tuple(self._breaks),
                 map_errors=tuple(self._errors),
+                clip_region=clip_region,
+                blank_glyph_offsets=blank_offsets,
             )
         )
         self._chars, self._boxes, self._tight, self._breaks, self._errors = [], [], [], [], []
@@ -837,31 +941,19 @@ def _read_textpage(textpage: pdfium_c.FPDF_TEXTPAGE, object_indices: dict[int, i
     return _Textpage(chars, generated, ownerless, styles, frozenset(skipped))
 
 
-def collect_text(textpage: pdfium_c.FPDF_TEXTPAGE, to_display: Callable[[Box], Box], walk: ObjectWalk) -> CollectedText:
-    """Read every textpage char once: count them and group the owned, non-generated ones.
-
-    A text object with a char box (loose or tight), font size or em width
-    that is not finite (pdfium places it nowhere) is skipped whole and
-    counted; a skipped char ends the span it interrupts. A text object that
-    owns no char is empty if it draws no glyph with extent
-    (``walk.glyphless``), else dropped.
-
-    Args:
-        textpage: The page's loaded textpage.
-        to_display: Maps a user-space ``(left, bottom, right, top)`` box to a
-            displayed, top-left ``(x0, y0, x1, y1)`` box.
-        walk: The page's object walk.
-
-    Raises:
-        PdfiumFailure: If a pdfium call fails.
-        WalkBoundHit: If the textpage holds more than :data:`MAX_PAGE_CHARS` chars.
-    """
+def collect_text(
+    textpage: pdfium_c.FPDF_TEXTPAGE,
+    to_display: Callable[[Box], Box],
+    walk: ObjectWalk,
+    *,
+    text_clips: Mapping[int, ClipRegion] | None = None,
+) -> CollectedText:
+    """Read every textpage char once, grouping owned non-generated chars into :class:`RawSpan`s."""
     read = _read_textpage(textpage, walk.indices)
     ownerless = walk.text_objects - {char.owner for char in read.chars if char is not None}
-    # In walk order, so a pdfium failure always names the same object.
     empty = frozenset(address for address in sorted(ownerless, key=walk.indices.__getitem__) if walk.glyphless(address))
     dropped = ownerless - empty
-    builder = _SpanBuilder(to_display, walk.indices, read.styles)
+    builder = _SpanBuilder(to_display, walk.indices, read.styles, text_clips=text_clips)
     kept = map_errors = 0
     for char in read.chars:
         if char is None:

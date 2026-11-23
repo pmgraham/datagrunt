@@ -1,7 +1,7 @@
 """End-to-end security and invariant sweep for ``datagrunt.rationalization`` (plan §1, §6 T15).
 
 Verifies across the full ``rationalize()`` pipeline:
-- Invariant 1 & R8: All 9 ``HIDDEN_REASONS`` (plus hidden section headings) are excluded and counted across all 4
+- Invariant 1 & R8: All 12 ``HIDDEN_REASONS`` (plus hidden section headings) are excluded and counted across all 4
   wire adapters (``OpenAICompatibleProvider``, ``AnthropicProvider``, ``GeminiProvider``, ``CallableProvider``), and
   all R8 code points (bidi, tag, control, CRLF) and delimiter-injection strings are escaped on the wire.
 - Invariant 2: The input ``PDFDocument`` is never mutated and ``src/datagrunt/pdf`` has zero diff against ``main``.
@@ -82,12 +82,14 @@ R8_VISIBLE_TEXT = (
     f"Notes: bidi=\u202e tag=\U000e0041 ctrl=\x07 inject={INJECTION_ATTEMPT}"
 )
 
+VISIBLE_ELEMENT_ID = make_element_id(1, len(HIDDEN_REASONS) + 1)
+
 EXPECTED_ANSWER: dict[str, Any] = {
     "records": [
         {
             "record": {"part": "PN-700", "name": "Titanium Valve", "qty": 5},
             "grounding_quotes": ["Part: PN-700", "Name: Titanium Valve", "Qty: 5"],
-            "source_element_ids": ["p0001_e010"],
+            "source_element_ids": [VISIBLE_ELEMENT_ID],
         }
     ]
 }
@@ -118,7 +120,7 @@ def _hidden_canary(reason: HiddenReason) -> str:
 
 
 def _build_security_document() -> PDFDocument:
-    """Build a document with all 9 hidden reasons, a hidden section heading, and R8 + injection text."""
+    """Build a document with all 12 hidden reasons, a hidden section heading, and R8 + injection text."""
     scope = (SECTION_HEADING_CANARY,)
     heading = Heading(
         element_id=make_element_id(1, 0),
@@ -144,7 +146,7 @@ def _build_security_document() -> PDFDocument:
                 text=_hidden_canary(reason),
             )
         )
-    visible_index = len(HIDDEN_REASONS) + 1  # index 10 -> p0001_e010
+    visible_index = len(HIDDEN_REASONS) + 1  # index 13 -> p0001_e013
     visible_para = Paragraph(
         element_id=make_element_id(1, visible_index),
         page_number=1,
@@ -228,7 +230,7 @@ def _gemini_wire_reply(answer: Mapping[str, Any] = EXPECTED_ANSWER) -> dict[str,
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# 1. Invariant 1 & R8 Escaping: All 9 HIDDEN_REASONS x All 4 Wire Adapters
+# 1. Invariant 1 & R8 Escaping: All 12 HIDDEN_REASONS x All 4 Wire Adapters
 # ---------------------------------------------------------------------------------------------------------------
 
 
@@ -331,7 +333,7 @@ def test_all_hidden_reasons_and_r8_escaping_across_all_wire_adapters(adapter_kin
     assert INJECTION_ATTEMPT not in wire_body
     assert INJECTION_ATTEMPT not in user_envelope
 
-    # Telemetry counts for R8 categories and all 9 hidden reasons.
+    # Telemetry counts for R8 categories and all 12 hidden reasons.
     assert dict(result.telemetry.escaped_by_category) == {"bidi": 1, "tag": 1, "control": 1}
     expected_hidden_counts = {reason: (2 if reason == "invisible" else 1) for reason in HIDDEN_REASONS}
     assert dict(result.telemetry.hidden_excluded_by_reason) == expected_hidden_counts

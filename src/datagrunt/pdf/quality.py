@@ -156,15 +156,21 @@ Pieces the gate does not select stay visible.
 - Unmapped regions: the box of each maximal run of invalid chars in a
   visible piece: recorded, for an OCR pass the pipeline does not run yet.
 
-Known limitations (A3 review M7; each needs what this pure stage cannot
-see, and an occlusion follow-up is proposed for the last two):
+- ``occluded`` (#395): opaque paint (a filled path or opaque raster image)
+  drawn later in page paint order covers at least 8 of 9 inset sample points
+  of the char's tight box (within :data:`MAX_OCCLUSION_CHECKS` per page;
+  fails open when the budget is exhausted).
+- ``clipped`` (#395): 0 of 9 inset sample points of the char's tight box
+  pass the span's active PDF clipping region (with hairline tolerance).
+- ``blank_glyph`` (#395): for painting render modes (strictly exempting
+  no-paint modes 3 and 7, including AutoCAD SHX and OCR layers) and non-
+  collapsed em squares, a non-whitespace, non-control/separator char whose
+  glyph outline draws no ink (either reported by the engine in
+  ``RawSpan.blank_glyph_offsets`` or collapsed to pdfium's 1/1000-em stand-in
+  tight box).
 
-- A glyph with no outline whose ToUnicode map says it is text (a space
-  that reads "IGNORE ALL") draws nothing but reads as visible text; alone
-  in its object it is an empty object, counted and never read.
-- Text a clip path excludes is not flagged: clip paths are not applied.
-- Text under a later opaque image or fill is not flagged: occlusion is
-  not checked.
+Known limitations (A3 review M7):
+
 - On a ``3 Tr`` CAD line, stem strokes plus an extra visible mark placed at
   the overhanging character pitch have the same bounding boxes as a genuine
   1-pitch SHX shift (and satisfy multi-word corroboration when peer words on
@@ -217,6 +223,16 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from typing import NamedTuple, get_args
 
+from datagrunt.pdf._hidden_geometry import (
+    MAX_OCCLUSION_CHECKS,
+    ClipRegion,
+    Occluder,
+    OccluderIndex,
+    build_occluder_bands,
+    char_is_clipped,
+    char_is_occluded,
+    is_blank_glyph_char,
+)
 from datagrunt.pdf._hidden_rules import em_reasons, off_page
 from datagrunt.pdf._options import OcrMode
 from datagrunt.pdf._pdfium_common import Box, union_box
@@ -250,10 +266,12 @@ __all__ = [
     "OcrMode",
     "PageAssessment",
     "SpanPiece",
+    "apply_visibility_diff",
     "assess_page",
     "classify_spans",
     "flag_background",
     "needs_background",
+    "needs_visibility_diff",
     "raster_cover_fraction",
     "valid_char",
 ]
@@ -308,6 +326,11 @@ _WHITE_RGB = (255, 255, 255)  # a page's default background
 MAX_GATE_CHECKS = 1_000_000
 # The gate indexes a page's object boxes by this many horizontal bands of it.
 _GATE_BANDS = 32
+# Max RGB channel difference (<= 4) between with-text and without-text BGR renders meaning no visible ink (#395).
+_VISIBILITY_DIFF_THRESHOLD = 4
+# Upper bound on sampled rows and columns per char tight box during visibility diff.
+_VISIBILITY_DIFF_MAX_AXIS = 64
+_IGNORED_BLANK_CATEGORIES = frozenset({"C", "Z"})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -361,6 +384,7 @@ def classify_spans(
     height_pt: float,
     images: tuple[RawImage, ...],
     glyph_boxes: tuple[Box, ...] = (),
+    occluders: tuple[Occluder, ...] = (),
 ) -> tuple[SpanPiece, ...]:
     """Cut each span into maximal runs of chars that share their hidden reasons (see the module notes).
 
@@ -376,21 +400,25 @@ def classify_spans(
         width_pt: The displayed page width in points (``PageGeometry.width_pt``).
         height_pt: The displayed page height in points.
         images: The page's images (``PageImages.images``).
+        glyph_boxes: Optional vector stroke boxes for ``3 Tr`` CAD backing.
+        occluders: Optional opaque paint occluders for paint-order occlusion checks.
 
     Raises:
-        TypeError: If ``spans`` or ``images`` is not a tuple of RawSpan /
-            RawImage, or a page side is not a number (bool rejected).
+        TypeError: If ``spans``, ``images``, or ``occluders`` is not a tuple of
+            RawSpan / RawImage / Occluder, or a page side is not a number (bool rejected).
         ValueError: If a page side is not finite and greater than zero.
     """
     typed_tuple("spans", spans, RawSpan)
     typed_tuple("images", images, RawImage)
+    typed_tuple("occluders", occluders, Occluder)
     if not isinstance(glyph_boxes, tuple):
         raise TypeError(f"glyph_boxes must be a tuple, got {type(glyph_boxes).__name__}")
     checked_glyphs = tuple(ordered_box(f"glyph_boxes[{idx}]", box) for idx, box in enumerate(glyph_boxes))
     width, height = positive_float("width_pt", width_pt), positive_float("height_pt", height_pt)
     boxes = _scan_boxes(images)
     v_bands = _glyph_bands(checked_glyphs, height)
-    return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands)
+    occ_index = build_occluder_bands(occluders, height) if occluders else None
+    return _classify(spans, width, height, boxes, _cover_fraction(boxes, width, height), v_bands, occ_index)
 
 
 _NARROW_BAND_MAX_PT = 36.0
@@ -1353,10 +1381,15 @@ def _classify(
     boxes: tuple[Box, ...],
     cover: float,
     v_bands: tuple[_GlyphBand, ...] = (),
+    occ_index: OccluderIndex | None = None,
+    occ_budget: list[int] | None = None,
+    *,
+    check_blank_glyphs: bool = True,
 ) -> tuple[SpanPiece, ...]:
-    """:func:`classify_spans` of checked input, given raster ``cover`` and banded vector glyph boxes."""
+    """:func:`classify_spans` of checked input, given raster ``cover``, banded strokes, and occluder index."""
     raster = boxes if cover > _OCR_LAYER_COVER else ()
     budget = [_MAX_VECTOR_TEXT_CHECKS]
+    active_occ_budget = occ_budget if occ_budget is not None else [MAX_OCCLUSION_CHECKS]
     tr3_boxes = (
         tuple(
             sp.char_boxes[i]
@@ -1370,7 +1403,20 @@ def _classify(
     )
     tr3_bands = _glyph_bands(tr3_boxes, height, glyph_only=False) if tr3_boxes else ()
     return tuple(
-        piece for span in spans for piece in _span_pieces(span, width, height, raster, v_bands, budget, tr3_bands)
+        piece
+        for span in spans
+        for piece in _span_pieces(
+            span,
+            width,
+            height,
+            raster,
+            v_bands,
+            budget,
+            tr3_bands,
+            occ_index,
+            active_occ_budget,
+            check_blank_glyphs=check_blank_glyphs,
+        )
     )
 
 
@@ -1412,6 +1458,90 @@ def _over_raster(box: Box, raster: tuple[Box, ...]) -> bool:
     return any(image[0] <= x <= image[2] and image[1] <= y <= image[3] for image in raster)
 
 
+def _bridge_flag_spaces(text: str, flags: Sequence[bool]) -> tuple[bool, ...]:
+    """Propagate a per-char hidden flag across bridged interior and edge whitespace."""
+    n = len(text)
+    if len(flags) != n:
+        raise ValueError(f"flags length {len(flags)} must match text length {n}")
+    if n == 0 or not any(flags):
+        return tuple(flags)
+    left: list[bool | None] = [None] * n
+    last: bool | None = None
+    for idx, ch in enumerate(text):
+        if not ch.isspace():
+            last = flags[idx]
+        left[idx] = last
+    right: list[bool | None] = [None] * n
+    last = None
+    for idx in range(n - 1, -1, -1):
+        if not text[idx].isspace():
+            last = flags[idx]
+        right[idx] = last
+    out = list(flags)
+    for idx, ch in enumerate(text):
+        if ch.isspace():
+            l_val = left[idx] if left[idx] is not None else right[idx]
+            r_val = right[idx] if right[idx] is not None else left[idx]
+            out[idx] = bool(l_val and r_val)
+    return tuple(out)
+
+
+def _char_occluded_flags(
+    span: RawSpan,
+    occ_index: OccluderIndex | None,
+    occ_budget: list[int] | None,
+) -> tuple[bool, ...]:
+    """Per-char occlusion flags from later opaque fills/images, bridging interior/edge whitespace."""
+    n = len(span.text)
+    if n == 0 or occ_index is None or occ_index.total_occluders == 0:
+        return (False,) * n
+    if span.object_index < 0 or span.object_index >= occ_index.max_object_index:
+        return (False,) * n
+    budget = occ_budget if occ_budget is not None else [MAX_OCCLUSION_CHECKS]
+    flags = [
+        False if ch.isspace() else char_is_occluded(span.tight_boxes[idx], span.object_index, occ_index, budget)
+        for idx, ch in enumerate(span.text)
+    ]
+    return _bridge_flag_spaces(span.text, flags)
+
+
+def _char_clipped_flags(span: RawSpan, clip: ClipRegion | None) -> tuple[bool, ...]:
+    """Per-char clip flags against ``clip``, bridging interior/edge whitespace."""
+    n = len(span.text)
+    if n == 0 or clip is None:
+        return (False,) * n
+    flags = [
+        False if ch.isspace() else char_is_clipped(span.tight_boxes[idx], clip) for idx, ch in enumerate(span.text)
+    ]
+    return _bridge_flag_spaces(span.text, flags)
+
+
+def _char_blank_glyph_flags(
+    span: RawSpan,
+    blank_offsets: tuple[int, ...],
+    has_em_reason: bool,
+    *,
+    check_tight_box: bool = True,
+) -> tuple[bool, ...]:
+    """Per-char blank-glyph flags, exempting no-paint modes (3, 7), invalid chars, and collapsed-em spans."""
+    n = len(span.text)
+    if n == 0 or span.render_mode in _NO_PAINT_MODES:
+        return (False,) * n
+    blank_set = frozenset(blank_offsets)
+    use_tight = check_tight_box and not has_em_reason
+    if not use_tight and not blank_set:
+        return (False,) * n
+    is_ascii = span.text.isascii()
+    em_pt = max(abs(span.font_size_pt), span.em_width_pt)
+    flags = [
+        False
+        if (not is_ascii and not _valid_char(ch))
+        else ((idx in blank_set) or (use_tight and is_blank_glyph_char(ch, span.tight_boxes[idx], em_pt)))
+        for idx, ch in enumerate(span.text)
+    ]
+    return _bridge_flag_spaces(span.text, flags)
+
+
 def _span_pieces(
     span: RawSpan,
     width: float,
@@ -1420,6 +1550,10 @@ def _span_pieces(
     v_bands: tuple[_GlyphBand, ...] = (),
     budget: list[int] | None = None,
     tr3_bands: tuple[_GlyphBand, ...] = (),
+    occ_index: OccluderIndex | None = None,
+    occ_budget: list[int] | None = None,
+    *,
+    check_blank_glyphs: bool = True,
 ) -> Iterator[SpanPiece]:
     """Yield ``span``'s pieces: maximal runs of chars with equal hidden reasons."""
     no_paint = span.render_mode in _NO_PAINT_MODES
@@ -1431,12 +1565,21 @@ def _span_pieces(
         if no_paint and v_bands
         else (False,) * len(span.char_boxes)
     )
-    flagged = dict.fromkeys(em_reasons(span.em_width_pt, abs(span.font_size_pt)), True)
+    span_em = em_reasons(span.em_width_pt, abs(span.font_size_pt))
+    flagged = dict.fromkeys(span_em, True)
     flagged["transparent"] = _transparent(span)
+    occ_flags = _char_occluded_flags(span, occ_index, occ_budget)
+    clip_flags = _char_clipped_flags(span, span.clip_region)
+    blank_flags = _char_blank_glyph_flags(
+        span, span.blank_glyph_offsets, bool(span_em), check_tight_box=check_blank_glyphs
+    )
     reasons: list[tuple[HiddenReason, ...]] = []
-    for box, v_ok in zip(span.char_boxes, vec_flags, strict=True):
+    for idx, (box, v_ok) in enumerate(zip(span.char_boxes, vec_flags, strict=True)):
         flagged["off_page"] = off_page(box, width, height)
         flagged["invisible"] = no_paint and not _over_raster(box, under) and not v_ok
+        flagged["occluded"] = occ_flags[idx]
+        flagged["clipped"] = clip_flags[idx]
+        flagged["blank_glyph"] = blank_flags[idx]
         reasons.append(tuple(reason for reason in HIDDEN_REASONS if flagged.get(reason, False)))
     start = 0
     for end in range(1, len(reasons) + 1):
@@ -1827,13 +1970,13 @@ def assess_page(
     width, height = page.geometry.width_pt, page.geometry.height_pt
     boxes = _scan_boxes(page.images.images)
     cover = _cover_fraction(boxes, width, height)
-    if _initial is not None and recovered is None:
+    if _initial is not None:
         pieces: tuple[SpanPiece, ...] = _initial.pieces
-        own: tuple[SpanPiece, ...] = ()
+        own: tuple[SpanPiece, ...] = (
+            _classify_recovered_only(page, width, height, boxes, cover, recovered) if recovered is not None else ()
+        )
     else:
-        v_bands = _glyph_bands(page.object_boxes.glyph_stroke_boxes, height)
-        pieces = _classify(page.text.spans, width, height, boxes, cover, v_bands)
-        own = _recovered_own(recovered, width, height, boxes, cover, v_bands)
+        pieces, own = _classify_page_spans(page, width, height, boxes, cover, recovered)
     if isinstance(background, Backdrop):
         scale = _scale(background, width, height)
         pieces = _flag_background(pieces, background, scale, selected=_gate_selection(pieces, page))
@@ -1866,6 +2009,238 @@ def _check_background(background: object) -> None:
 def _background_warnings(background: Backdrop | str | None) -> tuple[str, ...]:
     """The warning of a page whose background could not be checked (``background`` says why), if so."""
     return (f"background not checked: {background}",) if isinstance(background, str) else ()
+
+
+def _span_is_type3_diff_candidate(span: RawSpan) -> bool:
+    """True when ``span`` is a painting, non-collapsed Type3 span that may carry lying-d1 blank glyphs."""
+    return (
+        span.base_font_name == ""
+        and span.render_mode not in _NO_PAINT_MODES
+        and not em_reasons(span.em_width_pt, abs(span.font_size_pt))
+    )
+
+
+def _char_is_type3_diff_candidate(ch: str) -> bool:
+    """True when ``ch`` is a valid, non-whitespace, non-control/separator char eligible for blank-glyph diff."""
+    if ch.isspace() or unicodedata.category(ch)[0] in _IGNORED_BLANK_CATEGORIES:
+        return False
+    return _valid_char(ch)
+
+
+def _piece_needs_visibility_diff(piece: SpanPiece, img_index: OccluderIndex | None, budget: list[int]) -> bool:
+    """True if visible ``piece`` hits a later image occluder or has a checkable Type3 char."""
+    span = piece.span
+    if img_index is not None and 0 <= span.object_index < img_index.max_object_index:
+        if any(
+            not span.text[idx].isspace()
+            and char_is_occluded(span.tight_boxes[idx], span.object_index, img_index, budget)
+            for idx in range(piece.start, piece.end)
+        ):
+            return True
+    if not _span_is_type3_diff_candidate(span):
+        return False
+    return any(_char_is_type3_diff_candidate(span.text[idx]) for idx in range(piece.start, piece.end))
+
+
+def needs_visibility_diff(assessment: PageAssessment, page: RawPage) -> bool:
+    """True if any visible piece needs a rendered BGR diff for image occlusion or Type3 lying-d1 blank glyphs."""
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    if not isinstance(page, RawPage):
+        raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
+    img_index = build_occluder_bands(page.image_occluders, page.geometry.height_pt) if page.image_occluders else None
+    budget = [MAX_OCCLUSION_CHECKS]
+    return any(
+        not piece.hidden_reasons and _piece_needs_visibility_diff(piece, img_index, budget)
+        for piece in assessment.pieces
+    )
+
+
+def _row_exceeds_diff(a: bytes, b: bytes, start: int, end: int, byte_step: int) -> bool:
+    """True if any BGR channel in ``[start:end]`` (strided by ``byte_step``) differs by > _VISIBILITY_DIFF_THRESHOLD."""
+    if byte_step == _BGR_BYTES:
+        if a[start:end] == b[start:end]:
+            return False
+        return any(abs(x - y) > _VISIBILITY_DIFF_THRESHOLD for x, y in zip(a[start:end], b[start:end]))
+    for offset in range(start, end, byte_step):
+        if (
+            abs(a[offset] - b[offset]) > _VISIBILITY_DIFF_THRESHOLD
+            or abs(a[offset + 1] - b[offset + 1]) > _VISIBILITY_DIFF_THRESHOLD
+            or abs(a[offset + 2] - b[offset + 2]) > _VISIBILITY_DIFF_THRESHOLD
+        ):
+            return True
+    return False
+
+
+def _box_has_ink_diff(
+    box: Box,
+    with_text: Backdrop,
+    without_text: Backdrop,
+    scale: tuple[float, float],
+) -> bool:
+    """True if any pixel in ``box`` (mapped to BGR coordinates) differs by > _VISIBILITY_DIFF_THRESHOLD."""
+    x0, y0, x1, y1 = box
+    sx, sy = scale
+    w, h = with_text.px_width, with_text.px_height
+    if x1 * sx < -1.0 or x0 * sx > w + 1.0 or y1 * sy < -1.0 or y0 * sy > h + 1.0:
+        return True
+    px_x0 = max(0, min(w - 1, math.floor(x0 * sx)))
+    px_x1 = min(w, max(px_x0 + 1, math.ceil(x1 * sx)))
+    px_y0 = max(0, min(h - 1, math.floor(y0 * sy)))
+    px_y1 = min(h, max(px_y0 + 1, math.ceil(y1 * sy)))
+    x_step = max(1, (px_x1 - px_x0 + _VISIBILITY_DIFF_MAX_AXIS - 1) // _VISIBILITY_DIFF_MAX_AXIS)
+    y_step = max(1, (px_y1 - px_y0 + _VISIBILITY_DIFF_MAX_AXIS - 1) // _VISIBILITY_DIFF_MAX_AXIS)
+    row_bytes = w * _BGR_BYTES
+    col_start = px_x0 * _BGR_BYTES
+    col_end = px_x1 * _BGR_BYTES
+    byte_step = x_step * _BGR_BYTES
+    for row in range(px_y0, px_y1, y_step):
+        base = row * row_bytes
+        if _row_exceeds_diff(with_text.pixels, without_text.pixels, base + col_start, base + col_end, byte_step):
+            return True
+    return False
+
+
+def _diff_split_piece(
+    piece: SpanPiece,
+    img_index: OccluderIndex | None,
+    budget: list[int],
+    with_text: Backdrop,
+    without_text: Backdrop,
+    scale: tuple[float, float],
+) -> tuple[SpanPiece, ...]:
+    """Apply rendered BGR diff to one visible ``piece``, returning split pieces with ``occluded`` / ``blank_glyph``."""
+    span = piece.span
+    length = piece.end - piece.start
+    check_img = img_index is not None and 0 <= span.object_index < img_index.max_object_index
+    check_t3 = _span_is_type3_diff_candidate(span)
+    if not check_img and not check_t3:
+        return (piece,)
+    occ_flags = [False] * length
+    blank_flags = [False] * length
+    for k in range(length):
+        idx = piece.start + k
+        ch = span.text[idx]
+        hit_img = (
+            check_img
+            and img_index is not None
+            and not ch.isspace()
+            and char_is_occluded(span.tight_boxes[idx], span.object_index, img_index, budget)
+        )
+        hit_t3 = check_t3 and _char_is_type3_diff_candidate(ch)
+        if not hit_img and not hit_t3:
+            continue
+        if not _box_has_ink_diff(span.tight_boxes[idx], with_text, without_text, scale):
+            if hit_img:
+                occ_flags[k] = True
+            else:
+                blank_flags[k] = True
+    bridged_occ = _bridge_flag_spaces(piece.text, occ_flags)
+    bridged_blank = _bridge_flag_spaces(piece.text, blank_flags)
+    if not any(bridged_occ) and not any(bridged_blank):
+        return (piece,)
+    return _slice_diff_pieces(piece, bridged_occ, bridged_blank)
+
+
+_DIFF_REASON_MAP: tuple[tuple[HiddenReason, ...], ...] = (
+    (),
+    ("blank_glyph",),
+    ("occluded",),
+    ("occluded", "blank_glyph"),
+)
+
+
+def _slice_diff_pieces(
+    piece: SpanPiece,
+    occ_flags: tuple[bool, ...],
+    blank_flags: tuple[bool, ...],
+) -> tuple[SpanPiece, ...]:
+    """Cut ``piece`` into maximal runs of ``()``, ``('occluded',)``, or ``('blank_glyph',)``."""
+    per_char = [
+        _DIFF_REASON_MAP[(2 if is_occ else 0) + (1 if is_blank else 0)]
+        for is_occ, is_blank in zip(occ_flags, blank_flags, strict=True)
+    ]
+    out: list[SpanPiece] = []
+    start = 0
+    for end in range(1, len(per_char) + 1):
+        if end == len(per_char) or per_char[end] != per_char[start]:
+            out.append(
+                SpanPiece(
+                    span=piece.span,
+                    start=piece.start + start,
+                    end=piece.start + end,
+                    hidden_reasons=per_char[start],
+                )
+            )
+            start = end
+    return tuple(out)
+
+
+def _reassess_after_diff(
+    assessment: PageAssessment,
+    page: RawPage,
+    new_pieces: tuple[SpanPiece, ...],
+    ocr: OcrMode,
+) -> PageAssessment:
+    """Recompute route, quality counts, unmapped regions, and routing warnings after visibility-diff flagging."""
+    width, height = page.geometry.width_pt, page.geometry.height_pt
+    cover = _cover_fraction(_scan_boxes(page.images.images), width, height)
+    route, route_warnings, reasons = _route(_visible_text(new_pieces), cover, _painted(page), ocr, pieces=new_pieces)
+    kept_warnings = tuple(w for w in assessment.warnings if not w.startswith("ocr='never': "))
+    new_quality = PageQuality(
+        valid_char_ratio=assessment.quality.valid_char_ratio,
+        char_count=assessment.quality.char_count,
+        vector_line_count=assessment.quality.vector_line_count,
+        hidden_spans_flagged=_spans_flagged(new_pieces + assessment.recovered_pieces),
+        rotation_deg=assessment.quality.rotation_deg,
+        deskew_angle_deg=assessment.quality.deskew_angle_deg,
+        ocr_mean_confidence=assessment.quality.ocr_mean_confidence,
+    )
+    return PageAssessment(
+        pieces=new_pieces,
+        recovered_pieces=assessment.recovered_pieces,
+        quality=new_quality,
+        route=route,
+        unmapped_regions=_unmapped_regions(new_pieces),
+        warnings=route_warnings + kept_warnings,
+        image_only_reasons=reasons,
+    )
+
+
+def apply_visibility_diff(
+    assessment: PageAssessment,
+    page: RawPage,
+    *,
+    with_text: Backdrop,
+    without_text: Backdrop,
+    ocr: OcrMode = "auto",
+) -> PageAssessment:
+    """Flag image-occluded and Type3 zero-paint chars via rendered BGR diff and recompute routing/quality (#395)."""
+    if not isinstance(assessment, PageAssessment):
+        raise TypeError(f"assessment must be a PageAssessment, got {type(assessment).__name__}")
+    if not isinstance(page, RawPage):
+        raise TypeError(f"page must be a RawPage, got {type(page).__name__}")
+    if not isinstance(with_text, Backdrop):
+        raise TypeError(f"with_text must be a Backdrop, got {type(with_text).__name__}")
+    if not isinstance(without_text, Backdrop):
+        raise TypeError(f"without_text must be a Backdrop, got {type(without_text).__name__}")
+    choice_str("ocr", ocr, _OCR_MODES)
+    if (with_text.px_width, with_text.px_height) != (without_text.px_width, without_text.px_height):
+        raise ValueError("with_text and without_text must have the same pixel size")
+    width, height = page.geometry.width_pt, page.geometry.height_pt
+    scale = _scale(with_text, width, height)
+    img_index = build_occluder_bands(page.image_occluders, height) if page.image_occluders else None
+    budget = [MAX_OCCLUSION_CHECKS]
+    updated: list[SpanPiece] = []
+    for piece in assessment.pieces:
+        if piece.hidden_reasons:
+            updated.append(piece)
+        else:
+            updated.extend(_diff_split_piece(piece, img_index, budget, with_text, without_text, scale))
+    new_pieces = tuple(updated)
+    if new_pieces == assessment.pieces:
+        return assessment
+    return _reassess_after_diff(assessment, page, new_pieces, ocr)
 
 
 def needs_background(page: RawPage, assessment: PageAssessment) -> bool:
@@ -1979,6 +2354,38 @@ def _check_recovered(recovered: object, page_number: int, dropped: int) -> None:
         raise ValueError(f"{found}: it is not this page's recovery")
 
 
+def _classify_recovered_only(
+    page: RawPage,
+    width: float,
+    height: float,
+    boxes: tuple[Box, ...],
+    cover: float,
+    recovered: RecoveredText,
+) -> tuple[SpanPiece, ...]:
+    """Classify recovered spans against ``page``'s stroke bands and occluder index."""
+    v_bands = _glyph_bands(page.object_boxes.glyph_stroke_boxes, height)
+    occ_index = build_occluder_bands(page.occluders, height) if page.occluders else None
+    occ_budget = [MAX_OCCLUSION_CHECKS]
+    return _recovered_own(recovered, width, height, boxes, cover, v_bands, occ_index, occ_budget)
+
+
+def _classify_page_spans(
+    page: RawPage,
+    width: float,
+    height: float,
+    boxes: tuple[Box, ...],
+    cover: float,
+    recovered: RecoveredText | None,
+) -> tuple[tuple[SpanPiece, ...], tuple[SpanPiece, ...]]:
+    """Build per-page stroke bands and occluder index once, then classify page and recovered spans."""
+    v_bands = _glyph_bands(page.object_boxes.glyph_stroke_boxes, height)
+    occ_index = build_occluder_bands(page.occluders, height) if page.occluders else None
+    occ_budget = [MAX_OCCLUSION_CHECKS]
+    pieces = _classify(page.text.spans, width, height, boxes, cover, v_bands, occ_index, occ_budget)
+    own = _recovered_own(recovered, width, height, boxes, cover, v_bands, occ_index, occ_budget)
+    return pieces, own
+
+
 def _recovered_own(
     recovered: RecoveredText | None,
     width: float,
@@ -1986,6 +2393,8 @@ def _recovered_own(
     boxes: tuple[Box, ...],
     cover: float,
     v_bands: tuple[_GlyphBand, ...] = (),
+    occ_index: OccluderIndex | None = None,
+    occ_budget: list[int] | None = None,
 ) -> tuple[SpanPiece, ...]:
     """The recovered spans' pieces, in recovery order, each with its recovered reasons and the computed ones.
 
@@ -1995,7 +2404,9 @@ def _recovered_own(
         return ()
     found: list[SpanPiece] = []
     for item in recovered.spans:
-        for piece in _classify((item.span,), width, height, boxes, cover, v_bands):
+        for piece in _classify(
+            (item.span,), width, height, boxes, cover, v_bands, occ_index, occ_budget, check_blank_glyphs=False
+        ):
             given = set(piece.hidden_reasons) | set(item.hidden_reasons)
             reasons = tuple(reason for reason in HIDDEN_REASONS if reason in given)
             found.append(SpanPiece(span=piece.span, start=piece.start, end=piece.end, hidden_reasons=reasons))
