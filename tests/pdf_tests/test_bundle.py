@@ -28,7 +28,7 @@ import pytest
 from PIL import Image
 
 import datagrunt
-from datagrunt.pdf import _loaders, bundle
+from datagrunt.pdf import _loaders, bundle, pdfium_engine
 from datagrunt.pdf.bundle import BUNDLE_FORMAT_VERSION, load_bundle, write_bundle
 from datagrunt.pdf.codec import document_from_json_bytes
 from datagrunt.pdf.elements import Figure, PDFDocument
@@ -38,7 +38,7 @@ from datagrunt.pdf.ocr import tesseract_available
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderedPage, RenderFailed, RenderRefused, effective_dpi, render_page, render_size
 from datagrunt.pdf.writer import PDFWriter
-from pdf_tests.builders import PageSpec, TextRun, build_pdf, hand_written_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.documents import (
     FIGURE_A_SHA,
     FIGURE_B_SHA,
@@ -887,6 +887,55 @@ class TestFiguresSharingAStream:
             ("figure", 2, "p0002_e000"),
         ]
         assert load_bundle(tmp_path / "out") == returned
+
+    @pytest.mark.parametrize(
+        ("first_dict", "second_dict"),
+        [
+            pytest.param(AS_RGB, AS_RGB + b" /Decode [1 0 1 0 1 0]", id="decode-array"),
+            pytest.param(
+                AS_RGB + b" /Mask [10 10 200 200 10 10]",
+                AS_RGB + b" /Mask [0 0 0 0 0 0]",
+                id="color-key-mask",
+            ),
+        ],
+    )
+    def test_one_stream_with_different_decode_or_mask_writes_two_pictures(self, tmp_path, first_dict, second_dict):
+        document, returned = self.bundled(tmp_path, first_dict, second_dict)
+        own = [figure.read_bytes() for figure in document.figures]
+        assert own[0] != own[1]
+        assert [figure.image_path.read_bytes() for figure in returned.figures] == own
+        assert [figure.read_bytes() for figure in load_bundle(tmp_path / "out").figures] == own
+
+    def test_write_bundle_reads_each_distinct_picture_once_and_spreads_workers(self, tmp_path, monkeypatch):
+        specs = [
+            PageSpec(
+                items=(
+                    TextRun(f"Page {n}", 72.0, 60.0),
+                    RasterImage(72.0, 100.0, 64.0, 64.0, PNG_A),
+                    RasterImage(200.0, 100.0, 64.0, 64.0, PNG_B),
+                )
+            )
+            for n in range(1, 9)
+        ]
+        path = build_pdf(tmp_path / "reused_bundle.pdf", specs)
+        document = extract_document(path, ocr="never", min_image_dimension=16)
+        assert len(document.figures) == 16
+
+        reads = 0
+        real_read = pdfium_engine.FigureSession.read
+
+        def counting_read(self, loader, kind):
+            nonlocal reads
+            reads += 1
+            return real_read(self, loader, kind)
+
+        monkeypatch.setattr(pdfium_engine.FigureSession, "read", counting_read)
+        written = write_bundle(document, tmp_path / "out", source=path, dpi=72, workers=2)
+
+        assert reads == 2
+        assert len({fig.image_path for fig in written.figures}) == 2
+        assert manifest_of(tmp_path / "out")["missing"] == []
+        assert load_bundle(tmp_path / "out") == written
 
 
 def paged_pdf(directory: Path, count: int) -> Path:

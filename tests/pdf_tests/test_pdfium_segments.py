@@ -19,7 +19,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import PDFCorruptError, _path_segments
+from datagrunt.pdf import PDFCorruptError, _path_segments, pdfium_engine
 from datagrunt.pdf._path_segments import IDENTITY, Matrix, NonFiniteGeometry, PathPaint, PathPoint, path_segments
 from datagrunt.pdf.pdfium_engine import (
     PageSegments,
@@ -401,6 +401,42 @@ class TestPaint:
         blue, red, grey = (0, 0, 255, 255), (255, 0, 0, 255), (230, 230, 230, 64)
         expected = [("thin_fill", False, blue)] + [("fill_edge", False, blue)] * 4 + [("stroke", True, red)] * 6
         assert got == expected + [("fill_edge", False, grey)] * 4
+
+    def test_giant_dash_array_is_bounded_without_copying_elements(self, tmp_path, monkeypatch):
+        dash_count = pdfium_engine._MAX_DASH_COUNT + 500
+        pattern = b"[" + b" ".join([b"3", b"2"] * (dash_count // 2)) + b"]"
+        path = content_page(tmp_path, pattern + b" 0 d 10 10 m 100 10 l S")
+        calls: list[int] = []
+        real_get_dash_array = pdfium_c.FPDFPageObj_GetDashArray
+
+        def spy_dash_array(obj, buf, count):
+            calls.append(count)
+            return real_get_dash_array(obj, buf, count)
+
+        monkeypatch.setattr(pdfium_c, "FPDFPageObj_GetDashArray", spy_dash_array)
+        handle = open_document(path)
+        seg_page = page_segments(handle, 0)
+        extracted = extract_page(handle, 0)
+
+        assert paints(seg_page.segments) == [("stroke", True, (0, 0, 0, 255))]
+        assert paints(extracted.segments.segments) == [("stroke", True, (0, 0, 0, 255))]
+        assert calls == []
+
+    def test_dash_array_at_bound_still_inspects_all_zero_and_dashed_patterns(self, tmp_path):
+        bound = pdfium_engine._MAX_DASH_COUNT
+        all_zero = b"[" + b" ".join([b"0"] * bound) + b"]"
+        dashed_at_bound = b"[" + b" ".join([b"3", b"2"] * (bound // 2)) + b"]"
+        over_bound = b"[" + b" ".join([b"3", b"2"] * (bound // 2 + 1)) + b"]"
+
+        assert paints(segments_of(content_page(tmp_path, all_zero + b" 0 d 10 10 m 100 10 l S"))) == [
+            ("stroke", False, (0, 0, 0, 255))
+        ]
+        assert paints(segments_of(content_page(tmp_path, dashed_at_bound + b" 0 d 10 10 m 100 10 l S"))) == [
+            ("stroke", True, (0, 0, 0, 255))
+        ]
+        assert paints(segments_of(content_page(tmp_path, over_bound + b" 0 d 10 10 m 100 10 l S"))) == [
+            ("stroke", True, (0, 0, 0, 255))
+        ]
 
 
 def form_xobject(content: bytes, *, matrix: bytes = b"[1 0 0 1 0 0]", resources: bytes = b"") -> bytes:

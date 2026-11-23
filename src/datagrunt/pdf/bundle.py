@@ -201,11 +201,10 @@ Known limitations, documented:
 - ``output_dir`` filled by another process between the publish check and
   the rename makes ``os.replace`` fail with ``OSError`` (``ENOTEMPTY``),
   not ``FileExistsError``; it is never merged into, and staging is removed.
-- Figures are read in batches of up to 64 a figure worker
-  (:func:`~datagrunt.pdf._loaders.figure_pngs`), each read reopening the
-  PDF, not batched by page through one handle. Every figure is read, the
-  figures of one stream too: only its PNG shows it is the same picture
-  (see ``images/`` above).
+- Figures are read in batches spread across ``workers``
+  (:func:`~datagrunt.pdf._loaders.figure_pngs`), reusing one open PDFium
+  document and page walk per batch and reading each distinct picture once when
+  its image dictionary is proven unique across the source PDF (#449).
 
 :func:`load_bundle` takes a bundle directory or its ``manifest.json``
 and returns the document. Nothing is trusted before it is checked:
@@ -754,7 +753,9 @@ def _staged(
     """Write every artifact, then the manifest, into ``staging``: the document (paths in ``target``), and warnings."""
     ledger = _Ledger()
     if include_images:
-        figures = _write_figures(document, staging, source.path, ledger, sandbox=options.sandbox)
+        figures = _write_figures(
+            document, staging, source.path, ledger, sandbox=options.sandbox, workers=options.workers
+        )
     else:
         figures = _skip_figures(document, ledger)
     skipped = _opted_out(include_images=include_images, render_pages=render_pages)
@@ -884,7 +885,13 @@ def _write_rows(frame: pl.DataFrame, write: Callable[[bytes], object]) -> None:
 
 
 def _write_figures(
-    document: PDFDocument, staging: Path, source: Path, ledger: _Ledger, *, sandbox: bool = False
+    document: PDFDocument,
+    staging: Path,
+    source: Path,
+    ledger: _Ledger,
+    *,
+    sandbox: bool = False,
+    workers: int = 1,
 ) -> dict[str, str]:
     """Write each bound figure's PNG, each distinct picture once (:class:`_Pictures`); each written one's path, by id.
 
@@ -893,7 +900,7 @@ def _write_figures(
     paths: dict[str, str] = {}
     pictures = _Pictures()
     figures = _bound_figures(document.figures, source, ledger, sandbox=sandbox)
-    for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each in its turn
+    for figure, read in zip(figures, figure_pngs(figures, workers=workers), strict=True):
         data, why = _png(read)
         if data is None:
             reason = f"figure {figure.sha256} was not written: {why}"

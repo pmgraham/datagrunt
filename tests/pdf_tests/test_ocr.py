@@ -101,10 +101,36 @@ class TestNormalized:
 
 
 def striped(width: int, height: int) -> RenderedPage:
-    """A ``width`` x ``height`` page whose every row has its own grey level (row index mod 256)."""
+    """A ``width`` x ``height`` page whose every row has a non-blank grey level (row index mod 200)."""
     return RenderedPage(
-        pixels=bytes(row % 256 for row in range(height) for _ in range(width)), px_width=width, px_height=height
+        pixels=bytes(row % 200 for row in range(height) for _ in range(width)), px_width=width, px_height=height
     )
+
+
+def canvas_page(
+    width: int, height: int, *, fill: int = 255, dark_runs: tuple[tuple[int, int, int], ...] = ()
+) -> RenderedPage:
+    """A ``width`` x ``height`` page filled with ``fill``, painting ``(start_row, end_row, level)`` horizontal ink."""
+    rows = bytearray([fill] * (width * height))
+    for start, end, level in dark_runs:
+        rows[start * width : end * width] = bytes([level] * ((end - start) * width))
+    return RenderedPage(pixels=bytes(rows), px_width=width, px_height=height)
+
+
+def fifteen_headings_page() -> tuple[RenderedPage, list[tuple[str, int, int]]]:
+    """A 1600 x 3300 px (300 DPI) page with 15 tall headings (100 px font) straddling all three nominal seams."""
+    font = ImageFont.load_default(size=100)
+    image = Image.new("L", (1600, 3300), 255)
+    draw = ImageDraw.Draw(image)
+    boxes: list[tuple[str, int, int]] = []
+    for idx in range(15):
+        label = f"HEADING {idx + 1:02d}"
+        middle = 240 + idx * 210
+        _, top, _, bottom = draw.textbbox((0, 0), label, font=font)
+        origin_y = middle - (top + bottom) // 2
+        draw.text((120, origin_y), label, fill=0, font=font)
+        boxes.append((label, origin_y + top, origin_y + bottom))
+    return RenderedPage(pixels=image.tobytes(), px_width=image.width, px_height=image.height), boxes
 
 
 def rows_of(band: Band) -> range:
@@ -221,6 +247,108 @@ class TestBands:
     def test_a_non_page_is_refused(self):
         with pytest.raises(TypeError, match=re.escape("page must be a RenderedPage, got str")):
             bands("page")
+
+
+class TestBlankRowBandCuts:
+    """bands() shifts a seam to a blank row within a bounded window when tall ink straddles the nominal seam (#444)."""
+
+    def test_tall_line_straddling_nominal_seam_is_kept_whole_by_blank_cut(self):
+        page = canvas_page(200, 1650, dark_runs=((800, 950, 0),))
+
+        result = bands(page)
+
+        assert len(result) == 2
+        assert (result[0].top_px, result[0].px_height) == (0, 800)
+        assert (result[1].top_px, result[1].px_height) == (792, 1650 - 792)
+        assert result[0].top_px + result[0].px_height <= 800
+        assert result[1].top_px < 800 and result[1].top_px + result[1].px_height > 950
+
+    def test_near_white_scan_background_counts_as_blank_but_antialiased_ink_does_not(self):
+        page = canvas_page(200, 1650, fill=245, dark_runs=((800, 950, 200),))
+
+        result = bands(page)
+
+        assert (result[0].top_px, result[0].px_height) == (0, 800)
+        assert (result[1].top_px, result[1].px_height) == (792, 1650 - 792)
+
+    def test_single_blank_row_above_straddling_line_is_clean_cut_without_slicing_ink(self):
+        page = canvas_page(100, 1650, dark_runs=((0, 809, 0), (810, 960, 0)))
+
+        result = bands(page)
+
+        assert (result[0].top_px, result[0].px_height) == (0, 810)
+        assert (result[1].top_px, result[1].px_height) == (809, 1650 - 809)
+
+    def test_blank_gap_narrower_than_margin_shares_only_the_blank_rows(self):
+        page = canvas_page(100, 1650, dark_runs=((700, 816, 0), (820, 960, 0)))
+
+        result = bands(page)
+
+        assert (result[0].top_px, result[0].px_height) == (0, 820)
+        assert (result[1].top_px, result[1].px_height) == (816, 1650 - 816)
+
+    def test_tall_line_ending_one_row_above_nominal_bottom_is_kept_whole_in_upper_band(self):
+        page = canvas_page(100, 1650, dark_runs=((750, 899, 0),))
+
+        result = bands(page)
+
+        assert (result[0].top_px, result[0].px_height) == (0, 900)
+        assert (result[1].top_px, result[1].px_height) == (899, 1650 - 899)
+
+    def test_falls_back_to_exact_fixed_cut_when_no_blank_row_exists_in_window(self):
+        page = canvas_page(100, 1650, dark_runs=((300, 1000, 0),))
+
+        result = bands(page)
+
+        assert [(band.top_px, band.px_height) for band in result] == [(0, 900), (840, 810)]
+
+    def test_pages_without_straddling_lines_and_single_band_pages_are_unchanged(self):
+        blank_letter = canvas_page(100, 3300)
+        assert [(b.top_px, b.px_height) for b in bands(blank_letter)] == [
+            (0, 900),
+            (840, 900),
+            (1680, 900),
+            (2520, 780),
+        ]
+        normal_lines = canvas_page(100, 1650, dark_runs=((820, 856, 0), (880, 916, 0)))
+        assert [(b.top_px, b.px_height) for b in bands(normal_lines)] == [(0, 900), (840, 810)]
+        midpoint_line = canvas_page(100, 1650, dark_runs=((855, 885, 0),))
+        assert [(b.top_px, b.px_height) for b in bands(midpoint_line)] == [(0, 900), (840, 810)]
+        single = canvas_page(100, 900, dark_runs=((200, 850, 0),))
+        assert [(b.top_px, b.px_height) for b in bands(single)] == [(0, 900)]
+        assert ocr._has_blank_row(b"\xff" * 4, 2, 1, 1) is False
+
+    def test_fifteen_large_headings_straddling_seams_are_all_contained_whole(self):
+        page, headings = fifteen_headings_page()
+        straddling = [
+            label for label, y0, y1 in headings if any(y0 < seam and y1 > seam + 60 for seam in (840, 1680, 2520))
+        ]
+        assert len(straddling) == 3
+
+        result = bands(page)
+
+        assert len(result) <= 7
+        assert all(1 <= band.px_height <= 900 for band in result)
+        spans = [(b.top_px, b.top_px + b.px_height) for b in result]
+        for label, y0, y1 in headings:
+            whole = [b for b in result if b.top_px < y0 and y1 < b.top_px + b.px_height]
+            assert len(whole) == 1, f"{label} ({y0}..{y1}) not whole in exactly one band: {spans}"
+
+    def test_band_count_memory_and_row_coverage_remain_strictly_bounded(self):
+        dark_runs = tuple((start, min(start + 419, 4000), 0) for start in range(421, 4000, 420))
+        page = canvas_page(80, 4000, dark_runs=dark_runs)
+
+        result = bands(page)
+
+        assert len(result) <= (4000 // 420) + 2
+        assert all(1 <= band.px_height <= 900 for band in result)
+        assert sum(len(band.pixels) for band in result) <= 2 * len(page.pixels)
+        seen = [0] * 4000
+        for band in result:
+            for row in rows_of(band):
+                seen[row] += 1
+        assert set(seen) <= {1, 2}
+        assert result[-1].top_px + result[-1].px_height == 4000
 
 
 class TestRotated:
@@ -1449,25 +1577,28 @@ class TestRealTesseract:
         assert sum(text in expected for text in line) >= 0.9 * len(expected)
 
     @pytest.mark.parametrize("size", [100, 150, 200], ids=["24pt", "36pt", "48pt"])  # px at 300 DPI
-    @pytest.mark.parametrize("middle", [860, 870, 880])
-    def test_a_heading_taller_than_the_shared_strip_is_kept_from_one_band(self, size, middle):
-        # D6: the heading's ink, centred on row `middle`, is taller than the rows 840..899 the bands share and crosses
-        # both of their cut edges: neither band reads it whole, and tesseract reads each band's part as other words.
-        # Once merged, the words kept are one band's read of it, never both bands' (which duplicated it).
+    @pytest.mark.parametrize("middle", [840, 860, 870, 880, 900])
+    def test_a_heading_taller_than_the_shared_strip_is_read_whole_in_one_band(self, size, middle):
+        # #444: blank-row band cutting keeps all 15 (size x middle) tall headings whole in one band instead of slicing
+        # them across both cut edges.
         font = ImageFont.load_default(size=size)
         image = Image.new("L", (2550, 1650), 255)
         draw = ImageDraw.Draw(image)
         _, top, _, bottom = draw.textbbox((0, 0), "Quarterly", font=font)
         draw.text((150, middle - (top + bottom) // 2), "Quarterly", fill=0, font=font)
         page = RenderedPage(pixels=image.tobytes(), px_width=image.width, px_height=image.height)
-        argv = [trusted_executable("tesseract"), "stdin", "stdout", "--psm", "3", "-l", "eng", "tsv"]
 
-        read = [(band, ocr._band_words(argv, band, 60.0)) for band in bands(page)]
-        merged = ocr._merged(read)
+        result = ocr_words(bands(page), dpi=300, rotation=0, page_size_pt=(612.0, 396.0), timeout_s=60.0)
 
-        ink = ImageOps.invert(image).getbbox()
-        assert ink is not None and ink[1] < 840 and ink[3] > 900  # it crosses both cut edges
-        (_, upper), (_, lower) = read
-        assert isinstance(upper, list) and upper and isinstance(lower, list) and lower  # each band read a part
-        assert merged  # the heading is not lost
-        assert all(word in upper for word in merged) or all(word in lower for word in merged)
+        assert result.status == "ok"
+        assert [word.text for word in result.words] == ["Quarterly"]
+
+    def test_fifteen_large_headings_straddling_seams_are_all_read_whole(self):
+        page, headings = fifteen_headings_page()
+
+        result = ocr_words(bands(page), dpi=300, rotation=0, page_size_pt=(384.0, 792.0), timeout_s=60.0)
+
+        assert result.status == "ok"
+        read_text = " ".join(word.text for word in result.words)
+        for label, _, _ in headings:
+            assert label in read_text, f"missing {label!r} in {read_text!r}"

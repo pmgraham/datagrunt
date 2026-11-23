@@ -28,7 +28,7 @@ from pathlib import Path
 import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
-from PIL import Image
+from PIL import Image, ImageCms
 
 from datagrunt.pdf import (
     BBox,
@@ -2079,3 +2079,86 @@ class TestBoundaryMutants:
         monkeypatch.setattr(pdfium_c, "FPDFImageObj_GetImageMetadata", writes_colorspace(11))
 
         assert [item.colorspace for item in page_images(handle, 0).images] == ["Pattern"]
+
+
+class TestPictureIdentityKey:
+    """Extraction-time picture_key captures stream, filters, size, bpp, colorspace, and ICC profile."""
+
+    def test_raw_image_validates_icc_sha256_and_round_trips_pickle(self):
+        icc = sha(b"icc-profile")
+        item = raw_image(colorspace="ICCBased", icc_sha256=icc)
+        assert item.icc_sha256 == icc
+        assert item.picture_key is not None and icc in item.picture_key
+        assert pickle.loads(pickle.dumps(item)) == item
+        with pytest.raises(ValueError, match="icc_sha256 must be 64 lowercase hex characters"):
+            raw_image(icc_sha256="NOT-HEX")
+        with pytest.raises(TypeError, match="icc_sha256 must be a str"):
+            raw_image(icc_sha256=123)
+
+    def test_unreadable_or_unsized_image_has_no_picture_key(self):
+        assert raw_image(raw_sha256=None, bits_per_pixel=None, colorspace=None).picture_key is None
+        assert raw_image(px_width=0, px_height=0).picture_key is None
+        assert raw_image(bits_per_pixel=None, colorspace=None).picture_key is None
+        assert raw_image(colorspace="ICCBased", icc_sha256=None).picture_key is None
+
+    def test_same_image_with_flipped_transform_gets_equal_picture_key(self, tmp_path):
+        content = b"q 80 0 0 40 10 20 cm /Im Do Q q -80 0 0 40 200 20 cm /Im Do Q"
+        path = xobject_page(tmp_path, FLATE, RGB_4X2 + b" /Filter /FlateDecode", content=content)
+
+        first, second = images_of(path).images
+
+        assert first.picture_key is not None
+        assert first.picture_key == second.picture_key
+
+    def test_shared_stream_with_different_colorspace_or_mask_gets_different_picture_key(self, tmp_path):
+        content = b"q 80 0 0 40 10 20 cm /Im0 Do Q q 80 0 0 40 120 20 cm /Im1 Do Q"
+        res = b"/XObject << /Im0 5 0 R /Im1 6 0 R >>"
+        rgb = image_xobject(FLATE, RGB_4X2 + b" /Filter /FlateDecode")
+        masked = image_xobject(FLATE, RGB_4X2 + b" /Mask [0 0 1 1 2 2] /Filter /FlateDecode")
+        path = content_page(tmp_path, content, extra=(rgb, masked), resources=res)
+
+        first, second = images_of(path).images
+
+        assert first.raw_sha256 == second.raw_sha256
+        assert first.picture_key is not None and second.picture_key is not None
+        assert first.picture_key != second.picture_key
+
+    def test_shared_stream_with_different_icc_profiles_gets_different_picture_key(self, tmp_path):
+        srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        srgb_alt = _swapped_rgb_icc_profile(srgb)
+        icc1 = zlib.compress(srgb)
+        icc2 = zlib.compress(srgb_alt)
+        content = b"q 80 0 0 40 10 20 cm /Im0 Do Q q 80 0 0 40 120 20 cm /Im1 Do Q"
+        res = b"/XObject << /Im0 5 0 R /Im1 6 0 R >>"
+        img1 = image_xobject(
+            FLATE,
+            b"/Width 4 /Height 2 /ColorSpace [/ICCBased 7 0 R] /BitsPerComponent 8 /Filter /FlateDecode",
+        )
+        img2 = image_xobject(
+            FLATE,
+            b"/Width 4 /Height 2 /ColorSpace [/ICCBased 8 0 R] /BitsPerComponent 8 /Filter /FlateDecode",
+        )
+        p1 = b"<< /N 3 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (len(icc1), icc1)
+        p2 = b"<< /N 3 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (len(icc2), icc2)
+        path = content_page(tmp_path, content, extra=(img1, img2, p1, p2), resources=res)
+
+        first, second = images_of(path).images
+
+        assert first.raw_sha256 == second.raw_sha256
+        assert first.colorspace == second.colorspace == "ICCBased"
+        assert first.icc_sha256 == sha(srgb) and second.icc_sha256 == sha(srgb_alt)
+        assert first.picture_key != second.picture_key
+
+
+def _swapped_rgb_icc_profile(srgb: bytes) -> bytes:
+    """Return a valid ICC profile derived from ``srgb`` with red and blue XYZ primaries swapped."""
+    buf = bytearray(srgb)
+    count = struct.unpack_from(">I", buf, 128)[0]
+    tags = {sig: (off, sz) for sig, off, sz in (struct.unpack_from(">4sII", buf, 132 + i * 12) for i in range(count))}
+    r_off, r_sz = tags[b"rXYZ"]
+    b_off, b_sz = tags[b"bXYZ"]
+    buf[r_off : r_off + r_sz], buf[b_off : b_off + b_sz] = (
+        bytes(buf[b_off : b_off + b_sz]),
+        bytes(buf[r_off : r_off + r_sz]),
+    )
+    return bytes(buf)

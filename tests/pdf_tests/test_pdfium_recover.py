@@ -18,7 +18,7 @@ import pypdfium2 as pdfium
 import pypdfium2.raw as pdfium_c
 import pytest
 
-from datagrunt.pdf import PDFCorruptError, pdfium_engine
+from datagrunt.pdf import PDFCorruptError, _pdfium_recover, pdfium_engine
 from datagrunt.pdf._pdfium_common import object_address
 from datagrunt.pdf.pdfium_engine import (
     PageFailure,
@@ -1224,3 +1224,180 @@ class TestRecoveryErrors:
             recover_dropped_text("doc.pdf", 0)
         with pytest.raises(ValueError, match="document handle is closed"):
             recover_dropped_text(handle, 0)
+
+
+class TestRecoveryEdgeCases:
+    """Issue #454 items 1 & 2: safe recovery slots and degenerate zero-scale Form XObjects."""
+
+    def test_mediabox_below_zero_does_not_collide_with_recovery_slot(self, tmp_path):
+        # Legacy slots sat at (0, -100) and (100, -200); MediaBox reaching below y = 0 can hold
+        # identical 12 pt text there, which used to merge with the moved dropped objects.
+        content = (
+            b"BT /F1 12 Tf 0 -100 Td (HIDDEN) Tj ET "
+            b"BT /F1 12 Tf 100 -200 Td (SECOND) Tj ET "
+            b"BT /F1 0 Tf 72 100 Td (HIDDEN) Tj ET "
+            b"BT /F1 0 Tf 72 150 Td (SECOND) Tj ET"
+        )
+        page = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 -300 400 300] /Contents 4 0 R"
+            b" /Resources << /Font << /F1 5 0 R >> >> >>"
+        )
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            page,
+            stream(content),
+            HELVETICA,
+        ]
+        path = hand_written_pdf(tmp_path / "neg_mediabox.pdf", objects)
+
+        got = recovered(path)
+
+        assert [(item.span.text, item.hidden_reasons, item.span.object_index) for item in got.spans] == [
+            ("HIDDEN", ("tiny_font",), 2),
+            ("SECOND", ("tiny_font",), 3),
+        ]
+        assert got.stats == NO_LOSS
+
+    def test_off_page_existing_text_at_legacy_slot_does_not_collide(self, tmp_path):
+        content = b"BT /F1 12 Tf 0 -100 Td (HIDDEN) Tj ET BT /F1 0 Tf 72 100 Td (HIDDEN) Tj ET"
+        path = pdf(tmp_path, content)
+
+        got = recovered(path)
+
+        assert [(item.span.text, item.hidden_reasons, item.span.object_index) for item in got.spans] == [
+            ("HIDDEN", ("tiny_font",), 1),
+        ]
+        assert got.stats == NO_LOSS
+
+    def test_translated_form_object_at_legacy_slot_does_not_collide(self, tmp_path):
+        body = b"BT /F1 12 Tf 0 -100 Td (HIDDEN) Tj ET BT /F1 0 Tf 72 100 Td (HIDDEN) Tj ET"
+        xobj = form(body, b"[1 0 0 1 0 0]", b"/Font << /F1 5 0 R >>")
+        content = b"q 1 0 0 1 0 200 cm /X Do Q"
+        path = pdf(tmp_path, content, resources=b"/XObject << /X 6 0 R >>", extra=(xobj,))
+
+        got = recovered(path)
+
+        assert [(item.span.text, item.hidden_reasons, item.span.object_index) for item in got.spans] == [
+            ("HIDDEN", ("tiny_font",), 2),
+        ]
+        assert got.stats == NO_LOSS
+
+    def test_zero_scale_form_resets_enclosing_matrix_and_recovers_distinct_spans(self, tmp_path):
+        body = b"BT /F1 0 Tf 10 10 Td (one) Tj ET BT /F1 0 Tf 10 30 Td (two) Tj ET BT /F1 0 Tf 10 50 Td (three) Tj ET"
+        xobj = form(body, b"[1 0 0 1 0 0]", b"/Font << /F1 5 0 R >>")
+        content = CONTROL + b"q 0 0 0 0 72 100 cm /X Do Q"
+        path = pdf(tmp_path, content, resources=b"/XObject << /X 6 0 R >>", extra=(xobj,))
+
+        got = recovered(path)
+
+        assert [(item.span.text, item.hidden_reasons, item.span.object_index) for item in got.spans] == [
+            ("one", ("tiny_font",), 2),
+            ("two", ("tiny_font",), 3),
+            ("three", ("tiny_font",), 4),
+        ]
+        assert got.stats == NO_LOSS
+
+        # Verify directly that after isolation the enclosing zero-scale form matrix is reset
+        # so the moved text objects occupy distinct, non-collapsed 12 pt page-space boxes.
+        handle = open_document(path)
+        page, page_number = pdfium_engine._load_page(handle, 0)
+        try:
+            geometry = pdfium_engine._read_geometry(page, page_number)
+            to_display = pdfium_engine._display_mapping(geometry)
+            objects = pdfium_engine._page_objects(page.raw, max_objects=pdfium_engine.MAX_PAGE_OBJECTS)
+            walk = pdfium_engine._text_walk(objects)
+            texts, form_handles, form_own = pdfium_engine._recovery_walk(objects)
+            with pdfium_engine._opened_textpage(page, page_number) as tp:
+                before = pdfium_engine.collect_text(tp.raw, to_display, walk)
+            pdfium_engine._isolate_page_dropped(
+                page,
+                geometry,
+                objects,
+                texts,
+                before.dropped,
+                to_display,
+                form_handles=form_handles,
+                form_own=form_own,
+            )
+            form_obj = objects[1][0]
+            assert matrix_of(form_obj) == (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+            with pdfium_engine._opened_textpage(page, page_number) as tp:
+                after = pdfium_engine.collect_text(tp.raw, to_display, walk)
+            moved_boxes = [span.bbox for span in after.page_text.spans if span.object_index in (2, 3, 4)]
+            assert len(moved_boxes) == 3
+            assert len(set(moved_boxes)) == 3
+            assert all(box[2] > box[0] and box[3] > box[1] for box in moved_boxes)
+        finally:
+            page.close()
+
+    def test_zero_scale_form_with_existing_same_text_at_legacy_slot_recovers(self, tmp_path):
+        # Same-look copy at (72, 100) recovers and is classified as an overprint (never unrecovered).
+        same_body = b"BT /F1 12 Tf 0 -100 Td (HIDDEN) Tj ET BT /F1 0 Tf 10 10 Td (HIDDEN) Tj ET"
+        same_path = pdf(
+            tmp_path,
+            b"q 0 0 0 0 72 100 cm /X Do Q",
+            resources=b"/XObject << /X 6 0 R >>",
+            extra=(form(same_body, b"[1 0 0 1 0 0]", b"/Font << /F1 5 0 R >>"),),
+        )
+        same_got = recovered(same_path)
+        assert same_got == RecoveredText(
+            page_number=1, spans=(), stats=dataclasses.replace(NO_LOSS, overprint_duplicates=1)
+        )
+
+        # Distinct-look (red) copy recovers and emits its span with zero loss.
+        red_body = b"BT /F1 12 Tf 0 -100 Td (HIDDEN) Tj ET 1 0 0 rg BT /F1 0 Tf 10 10 Td (HIDDEN) Tj ET"
+        red_path = pdf(
+            tmp_path,
+            b"q 0 0 0 0 72 100 cm /X Do Q",
+            resources=b"/XObject << /X 6 0 R >>",
+            extra=(form(red_body, b"[1 0 0 1 0 0]", b"/Font << /F1 5 0 R >>"),),
+        )
+        red_got = recovered(red_path)
+        assert [(item.span.text, item.hidden_reasons, item.span.object_index) for item in red_got.spans] == [
+            ("HIDDEN", ("tiny_font",), 2),
+        ]
+        assert red_got.stats == NO_LOSS
+
+    def test_nested_zero_scale_forms_and_zero_form_matrix_recover_distinct_spans(self, tmp_path):
+        body = b"BT /F1 0 Tf 10 10 Td (one) Tj ET BT /F1 0 Tf 10 30 Td (two) Tj ET BT /F1 0 Tf 10 50 Td (three) Tj ET"
+        inner = form(body, b"[0 0 0 0 0 0]", b"/Font << /F1 5 0 R >>")
+        outer = form(b"q 0 0 0 0 5 5 cm /Y Do Q", b"[1 0 0 1 0 0]", b"/Font << /F1 5 0 R >> /XObject << /Y 7 0 R >>")
+        content = CONTROL + b"q 0 0 0 0 72 100 cm /X Do Q"
+        path = pdf(tmp_path, content, resources=b"/XObject << /X 6 0 R >>", extra=(outer, inner))
+
+        got = recovered(path)
+
+        assert [(item.span.text, item.hidden_reasons) for item in got.spans] == [
+            ("one", ("tiny_font",)),
+            ("two", ("tiny_font",)),
+            ("three", ("tiny_font",)),
+        ]
+        assert got.stats == NO_LOSS
+
+    def test_safe_slot_planner_handles_negative_extreme_and_nonfinite_bounds(self):
+        slot_origin = _pdfium_recover._slot_origin
+
+        # Normal page [0, 0, 400, 300]: preserves legacy (0, -100) diagonal below y = 0.
+        assert slot_origin((0.0, 0.0, 400.0, 300.0), 0, 2) == (0.0, -100.0)
+        assert slot_origin((0.0, 0.0, 400.0, 300.0), 1, 2) == (100.0, -200.0)
+
+        # Page reaching y = -300: placed strictly below -300.
+        x0, y0 = slot_origin((0.0, -300.0, 400.0, 300.0), 0, 2)
+        assert y0 <= -400.0 and x0 == 0.0
+
+        # Extreme negative min_y: shifts safely above max_y.
+        x_above, y_above = slot_origin((0.0, -1e20, 400.0, 300.0), 0, 2)
+        assert y_above >= 400.0 and x_above == 0.0
+
+        # Extreme both y sides: shifts safely right of max_x.
+        x_right, y_right = slot_origin((0.0, -1e20, 400.0, 1e20), 0, 2)
+        assert x_right >= 500.0 and y_right == -100.0
+
+        # Extreme both y sides and max_x: shifts safely left of min_x.
+        x_left, y_left = slot_origin((0.0, -1e20, 1e20, 1e20), 0, 2)
+        assert x_left <= -10_100.0 and y_left == -100.0
+
+        # All four sides extreme or non-finite: deterministic finite fallback.
+        assert slot_origin((-1e20, -1e20, 1e20, 1e20), 0, 2) == (0.0, -100.0)
+        assert slot_origin((float("nan"), 0.0, 400.0, 300.0), 1, 2) == (100.0, -200.0)

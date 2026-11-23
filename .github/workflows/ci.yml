@@ -228,7 +228,7 @@ jobs:
 
   python-compat:
     # The main test job covers 3.12; this proves the rest of the advertised
-    # range (requires-python >= 3.11, classifiers through 3.14). The native
+    # range (requires-python >= 3.11, classifiers through 3.15). The native
     # extension is abi3-py311, so this mostly exercises the pure-Python paths
     # (the whole PDF subsystem) and the dependency set per version.
     # Skipped on post-merge push to main: ruleset requires PRs for main, where
@@ -240,9 +240,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13", "3.14"]
+        python-version: ["3.11", "3.13", "3.14", "3.15"]
     env:
-      # PEP 669 sys.monitoring is available on 3.12+ (3.13, 3.14); 3.11 uses ctrace.
+      # PEP 669 sys.monitoring is available on 3.12+ (3.13, 3.14, 3.15); 3.11 uses ctrace.
       COVERAGE_CORE: ${{ matrix.python-version != '3.11' && 'sysmon' || 'ctrace' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4

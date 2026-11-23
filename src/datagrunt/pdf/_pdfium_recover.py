@@ -89,7 +89,7 @@ from typing import NamedTuple
 import pypdfium2.raw as pdfium_c
 
 from datagrunt.pdf._hidden_rules import RECOVERY_REASONS, TINY_FONT_PT, em_reasons, em_size, off_page
-from datagrunt.pdf._path_segments import Matrix
+from datagrunt.pdf._path_segments import IDENTITY, Matrix
 from datagrunt.pdf._pdfium_common import Box, PdfiumFailure, object_address, union_box
 from datagrunt.pdf._pdfium_text import PageText, RawSpan, font_size
 from datagrunt.pdf._validate import int_at_least, typed_tuple
@@ -105,6 +105,12 @@ _PDFIUM_SHARE = 0.9
 # The size each dropped object is drawn at to be read, and the spacing of the places it is moved to.
 _READ_SIZE_PT = 12.0
 _PLACE_SPACING = 100.0
+# Upper coordinate magnitude keeping binary32 FS_MATRIX slot coordinates finite and well-spaced.
+_MAX_SLOT_COORD = 16_000_000.0
+# Horizontal clearance when placing slots to the left of an occupied box (text advances +x).
+_LEFT_SLOT_PAD = 10_000.0
+# Wrap slot x across columns after this many slots while y stays strictly unique per slot.
+_SLOT_X_WRAP = 1000
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -198,13 +204,15 @@ class TextObject(NamedTuple):
 
     ``own`` is pdfium's object matrix, into its form's space; ``outer`` maps
     that space to page space (every enclosing form's matrix; identity off a
-    form).
+    form). ``forms`` lists the enclosing form object indices from innermost
+    to outermost (empty off a form).
     """
 
     object_index: int
     handle: pdfium_c.FPDF_PAGEOBJECT
     own: Matrix
     outer: Matrix
+    forms: tuple[int, ...] = ()
 
 
 class Target(NamedTuple):
@@ -254,26 +262,93 @@ def _is_point(box: Box) -> bool:
     return left == right and bottom == top
 
 
+def _finite_box(box: Box | None) -> bool:
+    """True when ``box`` is a 4-tuple of finite numbers."""
+    return box is not None and all(math.isfinite(value) for value in box)
+
+
+def _slot_fits(x: float, y: float) -> bool:
+    """True when a recovery slot coordinate stays finite and within binary32 precision bounds."""
+    return math.isfinite(x) and math.isfinite(y) and abs(x) <= _MAX_SLOT_COORD and abs(y) <= _MAX_SLOT_COORD
+
+
+def _slot_origin(occupied: Box | None, place: int, total: int) -> tuple[float, float]:
+    """A safe user-space origin for dropped object ``place`` of ``total``, outside ``occupied``."""
+    step_x = _PLACE_SPACING * (place % _SLOT_X_WRAP)
+    span_x = _PLACE_SPACING * min(max(total, 1), _SLOT_X_WRAP)
+    span_y = _PLACE_SPACING * max(total, 1)
+    fallback = (step_x, -_PLACE_SPACING * (place + 1))
+    if not _finite_box(occupied):
+        return fallback
+    assert occupied is not None
+    min_x, min_y, max_x, max_y = occupied
+    below_y = min(0.0, min_y)
+    if _slot_fits(span_x, below_y - span_y):
+        return step_x, below_y - _PLACE_SPACING * (place + 1)
+    above_y = max(0.0, max_y)
+    if _slot_fits(span_x, above_y + span_y):
+        return step_x, above_y + _PLACE_SPACING * (place + 1)
+    right_x = max(0.0, max_x)
+    if _slot_fits(right_x + span_x + _PLACE_SPACING, -span_y):
+        return right_x + _PLACE_SPACING + step_x, -_PLACE_SPACING * (place + 1)
+    left_x = min(0.0, min_x) - _LEFT_SLOT_PAD
+    if _slot_fits(left_x - span_x - _PLACE_SPACING, -span_y):
+        return left_x - _PLACE_SPACING - step_x, -_PLACE_SPACING * (place + 1)
+    return fallback
+
+
+def _reset_forms(
+    form_indices: Iterable[int],
+    form_handles: dict[int, pdfium_c.FPDF_PAGEOBJECT],
+    form_matrices: dict[int, Matrix],
+) -> None:
+    """Reset non-identity enclosing Form XObjects to identity so moved text lands in page space."""
+    identity = pdfium_c.FS_MATRIX(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+    for form_index in sorted(form_indices):
+        if form_matrices.get(form_index) == IDENTITY:
+            continue
+        handle = form_handles.get(form_index)
+        if handle is None:
+            continue
+        if not pdfium_c.FPDFPageObj_SetMatrix(handle, identity):
+            raise PdfiumFailure(f"set the matrix of object {form_index}")
+
+
 def isolate_dropped(
-    texts: Iterable[TextObject], dropped: frozenset[int], to_display: Callable[[Box], Box]
+    texts: Iterable[TextObject],
+    dropped: frozenset[int],
+    to_display: Callable[[Box], Box],
+    *,
+    occupied: Box | None = None,
+    form_handles: dict[int, pdfium_c.FPDF_PAGEOBJECT] | None = None,
+    form_matrices: dict[int, Matrix] | None = None,
+    occupied_for_reset: Callable[[frozenset[int], frozenset[int]], Box | None] | None = None,
 ) -> tuple[Target, ...]:
     """Read each dropped object's original place and size, then move it where a textpage reads it.
 
-    Bounded by the page's text objects; each dropped one gets the next place
-    on the diagonal ``(100 k, -100 (k + 1))`` of its form's space.
+    Bounded by the page's text objects; enclosing Form XObjects of moved
+    objects are reset to identity and each moved object is placed outside
+    the union bounding box of the page and every stationary page object.
 
     Raises:
         PdfiumFailure: If a pdfium call fails.
     """
-    targets: list[Target] = []
-    for text in texts:
-        if object_address(text.handle) not in dropped:
-            continue
-        target = _original(text, to_display)
-        if target.box is not None:
-            _move(text, len(targets))
-            target = target._replace(empty=_is_point(_bounds(text.handle, f"object {text.object_index}")))
-        targets.append(target)
+    entries = [(text, _original(text, to_display)) for text in texts if object_address(text.handle) in dropped]
+    movable = [(index, text) for index, (text, target) in enumerate(entries) if target.box is not None]
+    if not movable:
+        return tuple(target for _text, target in entries)
+    moved_indices = frozenset(text.object_index for _index, text in movable)
+    reset_forms = frozenset(form_index for _index, text in movable for form_index in text.forms)
+    exclusion = occupied_for_reset(moved_indices, reset_forms) if occupied_for_reset is not None else occupied
+    if form_handles is not None and form_matrices is not None:
+        _reset_forms(reset_forms, form_handles, form_matrices)
+    targets = [target for _text, target in entries]
+    total = len(movable)
+    for place, (entry_index, text) in enumerate(movable):
+        slot_x, slot_y = _slot_origin(exclusion, place, total)
+        _move(text, slot_x, slot_y)
+        empty = _is_point(_bounds(text.handle, f"object {text.object_index}"))
+        targets[entry_index] = targets[entry_index]._replace(empty=empty)
     return tuple(targets)
 
 
@@ -302,13 +377,13 @@ def _original(text: TextObject, to_display: Callable[[Box], Box]) -> Target:
     )
 
 
-def _move(text: TextObject, place: int) -> None:
-    """Give ``text`` the read size and an unscaled matrix at diagonal place ``place`` of its form's space."""
+def _move(text: TextObject, x: float, y: float) -> None:
+    """Give ``text`` the read size and an unscaled matrix at ``(x, y)``."""
     label = f"object {text.object_index}"
     if not pdfium_c.FPDFTextObj_SetFontSize(text.handle, ctypes.c_float(_READ_SIZE_PT)):
         raise PdfiumFailure(f"set the font size of {label}")
     # A new matrix makes pdfium lay the object out again (a new size alone does not), so it comes second.
-    spot = pdfium_c.FS_MATRIX(1.0, 0.0, 0.0, 1.0, _PLACE_SPACING * place, -_PLACE_SPACING * (place + 1))
+    spot = pdfium_c.FS_MATRIX(1.0, 0.0, 0.0, 1.0, x, y)
     if not pdfium_c.FPDFPageObj_SetMatrix(text.handle, spot):
         raise PdfiumFailure(f"set the matrix of {label}")
 

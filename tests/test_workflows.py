@@ -117,7 +117,7 @@ def test_ci_runs_core_gate_on_push_but_skips_duplicate_wheel_and_compat_builds()
     assert "needs.changes.outputs.run_ci == 'true'" in test_if
     assert "push" not in test_if
 
-    # Cross-OS wheel matrix, 3-version Python matrix, and advisory audit already ran on the PR
+    # Cross-OS wheel matrix, 4-version Python matrix, and advisory audit already ran on the PR
     # (and Publish to PyPI builds release wheels after Bump Version).
     for job_id in ("python-compat", "build", "audit"):
         assert jobs[job_id].get("needs") == ["changes"]
@@ -210,7 +210,7 @@ def test_ci_preserves_required_jobs_and_runs_disjoint_xdist_plus_benchmark_passe
     jobs = ci["jobs"]
     assert jobs["test"]["name"] == "cargo + pytest (both backends)"
     assert jobs["python-compat"]["name"] == "python compat"
-    assert jobs["python-compat"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.13", "3.14"]
+    assert jobs["python-compat"]["strategy"]["matrix"]["python-version"] == ["3.11", "3.13", "3.14", "3.15"]
     assert jobs["build"]["name"] == "wheel matrix"
     assert jobs["audit"]["name"] == "dependency audit (advisory)"
 
@@ -237,6 +237,23 @@ def test_ci_uses_sysmon_coverage_core_for_py312_plus() -> None:
     assert test_env.get("COVERAGE_CORE") == "sysmon"
     compat_core = str(compat_env.get("COVERAGE_CORE", ""))
     assert "sysmon" in compat_core and "ctrace" in compat_core and "3.11" in compat_core
+
+
+def test_pyproject_classifiers_match_ci_python_matrix() -> None:
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    classifiers = pyproject["project"]["classifiers"]
+    py_prefix = "Programming Language :: Python :: "
+    advertised = [c.removeprefix(py_prefix) for c in classifiers if c.startswith(f"{py_prefix}3.")]
+
+    ci = _load_workflow("ci.yml")
+    compat_versions = ci["jobs"]["python-compat"]["strategy"]["matrix"]["python-version"]
+    test_uv = [s for s in _job_steps(ci, "test") if "astral-sh/setup-uv@" in str(s.get("uses", ""))]
+    assert len(test_uv) == 1
+    primary_version = str(test_uv[0]["with"]["python-version"])
+    ci_versions = sorted([primary_version, *compat_versions], key=lambda v: tuple(int(p) for p in v.split(".")))
+
+    assert advertised == ["3.11", "3.12", "3.13", "3.14", "3.15"]
+    assert ci_versions == advertised
 
 
 def test_ci_enables_fresh_pyo3_uv_rust_and_cargo_audit_caches() -> None:

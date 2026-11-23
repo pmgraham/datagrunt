@@ -2186,3 +2186,25 @@ class TestOrientationFallbackVote:
         assert page.quality.ocr_mean_confidence is not None and page.quality.ocr_mean_confidence >= 85.0
         assert low_notes(page) == []
         assert "ALPHA DOCUMENT PAGE 1" in " ".join(texts(page))
+
+
+class TestBlankCutBandConsistency:
+    """PageRender.band_png_bytes() stays identical to the blank-cut bands OCR reads (#444)."""
+
+    def test_page_image_bands_match_shifted_ocr_bands_on_tall_heading_pdf(self, tmp_path, monkeypatch):
+        # 36 pt heading whose baseline at y = 218 pt places ink across rows 840..900 at 300 DPI.
+        items = (
+            TextRun("HEADING ONE", 72.0, 218.0, size=36.0),
+            TextRun("HEADING TWO", 72.0, 420.0, size=36.0),
+        )
+        path = build_pdf(tmp_path / "tall_headings.pdf", [PageSpec(items=items)])
+        monkeypatch.setattr(vision, "orientation", lambda *args, **kwargs: UPRIGHT)
+        calls = spy_ocr(monkeypatch, words=line_words("HEADING ONE", 72.0, 200.0, size=36.0))
+
+        page = visioned(path, ocr="always")
+
+        ocr_bands = calls[0]["bands"]
+        assert [band.top_px for band in ocr_bands] != [0, 840, 1680, 2520]
+        assert ocr_bands[0].top_px + ocr_bands[0].px_height < 840
+        png_bands = [decoded(png) for png in page.page_image.read_bands()]
+        assert png_bands == [(band.pixels, band.px_width, band.px_height) for band in ocr_bands]

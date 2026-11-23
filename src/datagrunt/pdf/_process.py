@@ -1,7 +1,8 @@
 """Helpers for the child processes the v5 PDF package starts (#369 A5a, #372 A8a): Python workers and tesseract.
 
-Internal: not exported from ``datagrunt`` or ``datagrunt.pdf``. Each wait is
-bounded, and each read of a child's stderr too.
+Internal except for :func:`freeze_support` (exported from ``datagrunt.pdf``
+for frozen executables, #440). Each wait is bounded, and each read of a
+child's stderr too.
 
 The Python worker launcher, shared by the render worker (``render.py``), the
 page workers (``pipeline.py``) and the figure workers (``_loaders.py``).
@@ -52,6 +53,7 @@ and close the pipe itself, and the tail says so: the parent never closes a
 pipe another thread is reading.
 """
 
+import importlib
 import json
 import mmap
 import os
@@ -75,6 +77,7 @@ __all__ = [
     "MAX_REQUEST_BYTES",
     "REAP_TIMEOUT_S",
     "STDERR_THREAD",
+    "WORKER_FLAG",
     "WORKERS",
     "MessageTooLong",
     "NoInterpreter",
@@ -82,6 +85,7 @@ __all__ = [
     "close_pipes",
     "drained",
     "error_reply",
+    "freeze_support",
     "kill_group",
     "missing_extra_reply",
     "next_reply",
@@ -153,6 +157,8 @@ entry(message.get("request"), replies)
 
 
 _NO_WORKER = "datagrunt reads PDFs in worker processes and cannot start one here"
+WORKER_FLAG = "--datagrunt-pdf-worker"
+_FROZEN_SUPPORT = threading.Event()
 
 
 class NoInterpreter(Exception):
@@ -163,20 +169,117 @@ class MessageTooLong(Exception):
     """A reply's length is over its reader's bound: it is not read."""
 
 
+def freeze_support() -> None:
+    """Enable PDF worker processes in frozen applications (PyInstaller, cx_Freeze, Nuitka).
+
+    Call this once near the entry point of a frozen application, inside
+    ``if __name__ == "__main__":``, mirroring :func:`multiprocessing.freeze_support`.
+    In a non-frozen process this is a no-op. In a frozen worker process invoked
+    with :data:`WORKER_FLAG`, this runs the allowlisted worker from stdin and
+    exits with status 0 so the application's main code never re-executes.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    _FROZEN_SUPPORT.set()
+    if len(sys.argv) == 2 and sys.argv[1] == WORKER_FLAG:
+        _run_frozen_worker()
+        sys.exit(0)
+
+
+def _run_frozen_worker() -> None:
+    """Run one allowlisted worker request from stdin and write length-prefixed replies to real stdout."""
+    stdin = getattr(sys.stdin, "buffer", None)
+    if stdin is None:
+        raise SystemExit("the worker has no binary stdin stream")
+    with _redirect_stdout_to_stderr() as replies:
+        path, name, request = _read_worker_request(stdin, MAX_REQUEST_BYTES)
+        _install_sys_path(path)
+        entry = _load_worker_entry(name, replies)
+        if entry is None:
+            return
+        entry(request, replies)
+
+
+def _redirect_stdout_to_stderr() -> IO[bytes]:
+    """Duplicate fd 1 for length-prefixed replies and point fd 1 at stderr so prints never corrupt replies."""
+    replies_fd = os.dup(1)
+    try:
+        os.dup2(2, 1)
+    except BaseException:
+        os.close(replies_fd)
+        raise
+    return os.fdopen(replies_fd, "wb")
+
+
+def _read_worker_request(stream: IO[bytes], bound: int) -> tuple[list[str], str, object]:
+    """Read and validate one bounded JSON worker request from ``stream``."""
+    if bound < 1:
+        raise ValueError(f"bound must be at least 1, got {bound}")
+    data = stream.read(bound + 1)
+    if len(data) > bound:
+        raise SystemExit(f"the worker request is over {bound} bytes")
+    try:
+        message = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"the worker request is not valid JSON: {exc}") from exc
+    if not isinstance(message, dict):
+        raise SystemExit(f"the worker request must be a JSON object, got {type(message).__name__}")
+    path = message.get("sys_path")
+    if not isinstance(path, list) or not all(isinstance(entry, str) for entry in path):
+        raise SystemExit("the worker request's sys_path is not a list of str")
+    name = message.get("worker")
+    if not isinstance(name, str) or name not in WORKERS:
+        raise SystemExit(f"the worker request names no worker of {tuple(WORKERS)!r}")
+    return path, name, message.get("request")
+
+
+def _install_sys_path(path: list[str]) -> None:
+    """Install the caller's ``sys.path`` while keeping a PyInstaller child's own ``_MEIPASS`` entries first."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if isinstance(meipass, str) and meipass:
+        prefix = meipass + os.sep
+        own = [entry for entry in sys.path if entry == meipass or entry.startswith(prefix)]
+        extra = [entry for entry in path if entry not in own]
+        sys.path[:] = [*own, *extra]
+        return
+    sys.path[:] = path
+
+
+def _load_worker_entry(name: str, replies: IO[bytes]) -> Callable[[object, IO[bytes]], None] | None:
+    """Import and return the allowlisted worker entry, or send the missing-extra reply and return None."""
+    if name not in WORKERS:
+        raise SystemExit(f"the worker request names no worker of {tuple(WORKERS)!r}")
+    module, function = WORKERS[name]
+    try:
+        entry = getattr(importlib.import_module(module), function)
+    except ImportError as exc:
+        if (exc.name or "").partition(".")[0] not in EXTRA_IMPORTS:
+            raise
+        send_message(replies, missing_extra_reply(exc))
+        return None
+    if not callable(entry):
+        raise TypeError(f"{module}.{function} is not callable")
+    return entry
+
+
 def worker_command() -> list[str]:
     """The worker's command line, which holds nothing of the request.
 
-    Reads :data:`BOOTSTRAP` when called.
+    Reads :data:`BOOTSTRAP` when called. In a frozen application where
+    :func:`freeze_support` has been called, launches the frozen executable
+    with :data:`WORKER_FLAG` instead of ``python -I -c BOOTSTRAP``.
 
     Raises:
-        NoInterpreter: In a frozen application, or when ``sys.executable`` is
-            empty, naming the cause plainly: datagrunt reads PDFs in worker
-            processes only, so nothing is read.
+        NoInterpreter: In a frozen application without :func:`freeze_support`,
+            or when ``sys.executable`` is empty, naming the cause plainly:
+            datagrunt reads PDFs in worker processes only, so nothing is read.
     """
-    if getattr(sys, "frozen", False):
+    if getattr(sys, "frozen", False) and not _FROZEN_SUPPORT.is_set():
         raise NoInterpreter(f"this application is frozen (sys.frozen): {_NO_WORKER}")
     if not sys.executable:
         raise NoInterpreter(f"sys.executable is empty: {_NO_WORKER}")
+    if getattr(sys, "frozen", False):
+        return [sys.executable, WORKER_FLAG]
     return [sys.executable, "-I", "-c", BOOTSTRAP]
 
 

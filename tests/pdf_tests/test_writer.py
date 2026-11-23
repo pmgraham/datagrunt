@@ -6,32 +6,36 @@ that raises, or one only counted, is a ``monkeypatch`` of the module name
 for it: the writer's ``extract_document``, the bundle's ``render_page``.
 """
 
+import dataclasses
 import hashlib
+import io
 import json
 import logging
 import os
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import polars as pl
 import pyarrow.parquet as pq
 import pytest
-from PIL import Image
+from PIL import Image, ImageCms
 
-from datagrunt.pdf import _loaders, bundle, writer
+from datagrunt.pdf import _figure_worker, _loaders, bundle, pdfium_engine, writer
 from datagrunt.pdf.bundle import load_bundle
 from datagrunt.pdf.codec import document_from_json_bytes, document_to_json_bytes
 from datagrunt.pdf.elements import Paragraph, PDFDocument
-from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError
+from datagrunt.pdf.exceptions import DatagruntPDFError, PDFCorruptError, PDFSourceChangedError
 from datagrunt.pdf.frame import element_frame, utf8_text
 from datagrunt.pdf.pipeline import extract_document
 from datagrunt.pdf.render import RenderFailed, RenderRefused, effective_dpi, render_page
 from datagrunt.pdf.writer import PDFWriter
-from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, solid_png
+from pdf_tests.builders import PageSpec, RasterImage, TextRun, build_pdf, hand_written_pdf, solid_png
 from pdf_tests.documents import (
     FIGURE_A_SHA,
     FIGURE_B_SHA,
@@ -58,8 +62,10 @@ from pdf_tests.test_bundle import (
     manifest_of,
     paged_pdf,
     png_pixels,
+    rewritten_in_place,
     shared_stream_pdf,
     source_pdf,
+    touched,
 )
 from pdf_tests.test_layout_stream_tables import body_text
 
@@ -966,6 +972,363 @@ class TestExtractImagesFromAPdf:
         assert [path.read_bytes() for path in paths] == [figure.read_bytes() for figure in figures]
 
 
+def _reused_streams_pdf(path: Path, pages: int = 10) -> Path:
+    """``pages`` pages each drawing the same two 64x64 images (2 * pages figures, 2 distinct pictures)."""
+    specs = [
+        PageSpec(
+            items=(
+                TextRun(f"Sheet {index}", 72.0, 60.0),
+                RasterImage(72.0, 100.0, 64.0, 64.0, BLUE),
+                RasterImage(200.0, 100.0, 64.0, 64.0, RED),
+            )
+        )
+        for index in range(1, pages + 1)
+    ]
+    return build_pdf(path, specs)
+
+
+def _distinct_figures_pdf(path: Path, count: int) -> Path:
+    """One page holding ``count`` distinct 64x64 images (each a different colour)."""
+    images = tuple(
+        RasterImage(
+            36.0 + (idx % 4) * 80.0,
+            100.0 + (idx // 4) * 80.0,
+            64.0,
+            64.0,
+            solid_png(64, 64, (0.05 + 0.08 * idx, 0.2, 0.9 - 0.06 * idx)),
+        )
+        for idx in range(count)
+    )
+    return build_pdf(path, [PageSpec(items=images)])
+
+
+def _swapped_icc_bytes(srgb: bytes) -> bytes:
+    """Swap rXYZ and bXYZ primaries in ``srgb`` to create a second valid ICC profile."""
+    buf = bytearray(srgb)
+    count = struct.unpack_from(">I", buf, 128)[0]
+    tags = {sig: (off, sz) for sig, off, sz in (struct.unpack_from(">4sII", buf, 132 + i * 12) for i in range(count))}
+    r_off, r_sz = tags[b"rXYZ"]
+    b_off, b_sz = tags[b"bXYZ"]
+    buf[r_off : r_off + r_sz], buf[b_off : b_off + b_sz] = (
+        bytes(buf[b_off : b_off + b_sz]),
+        bytes(buf[r_off : r_off + r_sz]),
+    )
+    return bytes(buf)
+
+
+def _icc_shared_stream_pdf(path: Path) -> Path:
+    """Two pages sharing one 64x64 RGB stream under two distinct /ICCBased profiles."""
+    srgb = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    icc1, icc2 = zlib.compress(srgb), zlib.compress(_swapped_icc_bytes(srgb))
+    raw = bytes([20, 40, 220]) * (64 * 64)
+    page_tpl = (
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R "
+        b"/Resources << /XObject << /Im0 %d 0 R >> >> >>"
+    )
+    content = b"q 200 0 0 200 100 400 cm /Im0 Do Q"
+    img_hdr = b"/Type /XObject /Subtype /Image /Width 64 /Height 64 /BitsPerComponent 8 /ColorSpace [/ICCBased %d 0 R]"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+        page_tpl % 6,
+        page_tpl % 7,
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+        b"<< %s /Length %d >>\nstream\n%s\nendstream" % (img_hdr % 8, len(raw), raw),
+        b"<< %s /Length %d >>\nstream\n%s\nendstream" % (img_hdr % 9, len(raw), raw),
+        b"<< /N 3 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (len(icc1), icc1),
+        b"<< /N 3 /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (len(icc2), icc2),
+    ]
+    return hand_written_pdf(path, objects)
+
+
+def _mixed_reused_and_decode_pdf(path: Path) -> Path:
+    """Six draws of one reused XObject plus two different /Decode XObjects sharing another stream."""
+    reused_stream = bytes([220, 30, 30]) * (64 * 64)
+    shared_stream = bytes([10, 200, 10]) * (64 * 64)
+    reused_img = (
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB "
+        b"/BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream" % (len(reused_stream), reused_stream)
+    )
+    dec_a = (
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB "
+        b"/BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream" % (len(shared_stream), shared_stream)
+    )
+    dec_b = (
+        b"<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB "
+        b"/BitsPerComponent 8 /Decode [1 0 1 0 1 0] /Length %d >>\nstream\n%s\nendstream"
+        % (len(shared_stream), shared_stream)
+    )
+    draw_reused = b"q 100 0 0 100 50 500 cm /Re Do Q"
+    draw_a = b"q 100 0 0 100 50 500 cm /Re Do Q q 100 0 0 100 200 500 cm /ShA Do Q"
+    draw_b = b"q 100 0 0 100 50 500 cm /Re Do Q q 100 0 0 100 200 500 cm /ShB Do Q"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R] /Count 6 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 9 0 R "
+        b"/Resources << /XObject << /Re 12 0 R /ShA 13 0 R >> >> >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 10 0 R "
+        b"/Resources << /XObject << /Re 12 0 R /ShB 14 0 R >> >> >>",
+        *[
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 11 0 R "
+            b"/Resources << /XObject << /Re 12 0 R >> >> >>"
+            for _ in range(4)
+        ],
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(draw_a), draw_a),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(draw_b), draw_b),
+        b"<< /Length %d >>\nstream\n%s\nendstream" % (len(draw_reused), draw_reused),
+        reused_img,
+        dec_a,
+        dec_b,
+    ]
+    return hand_written_pdf(path, objects)
+
+
+class TestFigureDeduplicationAndBatching:
+    """#449: distinct pictures are read once, different dicts stay distinct, batches reuse one open handle."""
+
+    @pytest.mark.parametrize("dedupe", [True, False], ids=["dedupe", "no-dedupe"])
+    def test_reused_streams_are_decoded_once_in_extract_images(self, tmp_path, monkeypatch, dedupe):
+        path = _reused_streams_pdf(tmp_path / "reused.pdf", pages=10)
+        made = PDFWriter(path, ocr="never")
+        figures = made._extracted().figures
+        assert len(figures) == 20
+
+        reads = 0
+        real_read = pdfium_engine.FigureSession.read
+
+        def counting_read(self, loader, kind):
+            nonlocal reads
+            reads += 1
+            return real_read(self, loader, kind)
+
+        monkeypatch.setattr(pdfium_engine.FigureSession, "read", counting_read)
+        paths = made.extract_images(tmp_path / "images", dedupe=dedupe)
+
+        assert reads == 2
+        assert len(paths) == (2 if dedupe else 20)
+        expected = [figures[0].read_bytes(), figures[1].read_bytes()]
+        if dedupe:
+            assert [p.read_bytes() for p in paths] == expected
+        else:
+            assert [p.read_bytes() for p in paths] == expected * 10
+
+    def test_reused_streams_are_read_once_under_sandbox(self, tmp_path, monkeypatch):
+        path = _reused_streams_pdf(tmp_path / "reused.pdf", pages=6)
+        made = PDFWriter(path, ocr="never", sandbox=True)
+        assert len(made._extracted().figures) == 12
+
+        sent_counts: list[int] = []
+        real_payload = _loaders._batch_payload
+
+        def counting_payload(reads, kind):
+            sent_counts.append(len(reads))
+            return real_payload(reads, kind)
+
+        monkeypatch.setattr(_loaders, "_batch_payload", counting_payload)
+        paths = made.extract_images(tmp_path / "images")
+
+        assert len(paths) == 2
+        assert sum(sent_counts) == 2
+
+    @pytest.mark.parametrize(
+        ("first_dict", "second_dict"),
+        [
+            pytest.param(
+                AS_RGB,
+                AS_RGB + b" /Decode [1 0 1 0 1 0]",
+                id="decode-array",
+            ),
+            pytest.param(
+                b"/Width 64 /Height 64 /ColorSpace [/Indexed /DeviceRGB 1 <FF000000FF00>] /BitsPerComponent 8",
+                b"/Width 64 /Height 64 /ColorSpace [/Indexed /DeviceRGB 1 <0000FFFFFF00>] /BitsPerComponent 8",
+                id="indexed-palette",
+            ),
+            pytest.param(
+                AS_RGB + b" /Mask [10 10 200 200 10 10]",
+                AS_RGB + b" /Mask [0 0 0 0 0 0]",
+                id="color-key-mask",
+            ),
+            pytest.param(AS_RGB, AS_GREY, id="colorspace-rgb-vs-gray"),
+        ],
+    )
+    def test_shared_stream_with_different_dict_writes_two_distinct_pngs(self, tmp_path, first_dict, second_dict):
+        raw = bytes([0, 1]) * (32 * 64) if b"/Indexed" in first_dict else bytes([10, 200, 10]) * (64 * 64)
+        page_tpl = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 5 0 R "
+            b"/Resources << /XObject << /Im0 %d 0 R >> >> >>"
+        )
+        content = b"q 200 0 0 200 100 400 cm /Im0 Do Q"
+        img_prefix = b"/Type /XObject /Subtype /Image "
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            page_tpl % 6,
+            page_tpl % 7,
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+            b"<< %s /Length %d >>\nstream\n%s\nendstream" % (img_prefix + first_dict, len(raw), raw),
+            b"<< %s /Length %d >>\nstream\n%s\nendstream" % (img_prefix + second_dict, len(raw), raw),
+        ]
+        path = hand_written_pdf(tmp_path / "diff.pdf", objects)
+        made = PDFWriter(path, ocr="never")
+        figures = made._extracted().figures
+        reads = [fig._loader.__self__ for fig in figures]
+        keys = _loaders.resolved_picture_keys(reads)
+
+        paths = made.extract_images(tmp_path / "images")
+
+        assert len(figures) == 2 and figures[0].sha256 == figures[1].sha256
+        assert keys[0] != keys[1]
+        assert len(paths) == 2
+        png0, png1 = paths[0].read_bytes(), paths[1].read_bytes()
+        assert png0 != png1
+        assert png_pixels(paths[0]) != png_pixels(paths[1])
+
+    def test_shared_stream_with_different_icc_profiles_writes_two_distinct_pngs(self, tmp_path):
+        path = _icc_shared_stream_pdf(tmp_path / "icc_shared.pdf")
+        made = PDFWriter(path, ocr="never")
+        figures = made._extracted().figures
+        reads = [fig._loader.__self__ for fig in figures]
+
+        paths = made.extract_images(tmp_path / "images")
+
+        assert figures[0].sha256 == figures[1].sha256
+        assert reads[0].picture_key != reads[1].picture_key
+        assert len(paths) == 2 and paths[0].read_bytes() != paths[1].read_bytes()
+
+    def test_mixed_pdf_dedupes_reused_stream_while_keeping_different_decode_distinct(self, tmp_path, monkeypatch):
+        path = _mixed_reused_and_decode_pdf(tmp_path / "mixed.pdf")
+        made = PDFWriter(path, ocr="never")
+        assert len(made._extracted().figures) == 8
+
+        reads = 0
+        real_read = pdfium_engine.FigureSession.read
+
+        def counting_read(self, loader, kind):
+            nonlocal reads
+            reads += 1
+            return real_read(self, loader, kind)
+
+        monkeypatch.setattr(pdfium_engine.FigureSession, "read", counting_read)
+        paths = made.extract_images(tmp_path / "images")
+
+        assert reads == 3
+        assert len(paths) == 3
+        assert len({p.read_bytes() for p in paths}) == 3
+
+    def test_figure_worker_reuses_one_open_document_per_batch_and_isolates_errors(self, tmp_path, monkeypatch):
+        path = _distinct_figures_pdf(tmp_path / "batch.pdf", 5)
+        figures = extract_document(path, ocr="never", sandbox=True).figures
+        reads = [fig._loader.__self__ for fig in figures]
+        bad_img = dataclasses.replace(reads[2].image, raw_sha256="0" * 64)
+        mixed = [reads[0], reads[1], dataclasses.replace(reads[2], image=bad_img), reads[3], reads[4]]
+
+        opens = 0
+        real_open = _figure_worker.open_document
+
+        def counting_open(*args, **kwargs):
+            nonlocal opens
+            opens += 1
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(_figure_worker, "apply_memory_cap", lambda *args: None)
+        monkeypatch.setattr(_figure_worker, "open_document", counting_open)
+        request = json.loads(_loaders._batch_payload(mixed, "png"))["request"]
+        replies = io.BytesIO()
+
+        _figure_worker._worker_main(request, replies)
+
+        assert opens == 1
+        assert replies.tell() > 0
+        # Verify full round-trip error isolation through read_figures as well
+        monkeypatch.undo()
+        outcomes = list(_loaders.read_figures(mixed, "png"))
+        assert isinstance(outcomes[0], bytes) and isinstance(outcomes[1], bytes)
+        assert isinstance(outcomes[2], DatagruntPDFError)
+        assert isinstance(outcomes[3], bytes) and isinstance(outcomes[4], bytes)
+
+    @pytest.mark.parametrize("sandbox", [False, True], ids=["in-process", "sandbox"])
+    def test_extract_images_spreads_batches_across_workers_in_deterministic_order(self, tmp_path, monkeypatch, sandbox):
+        path = _distinct_figures_pdf(tmp_path / "eight.pdf", 8)
+        serial = PDFWriter(path, ocr="never", workers=1, sandbox=sandbox)
+        parallel = PDFWriter(path, ocr="never", workers=4, sandbox=sandbox)
+        serial_paths = serial.extract_images(tmp_path / "serial")
+
+        batch_sizes: list[int] = []
+        if sandbox:
+            real_payload = _loaders._batch_payload
+
+            def spy_payload(reads, kind):
+                batch_sizes.append(len(reads))
+                return real_payload(reads, kind)
+
+            monkeypatch.setattr(_loaders, "_batch_payload", spy_payload)
+        else:
+            real_in_proc = _loaders._in_process_figure_outcomes
+
+            def spy_in_proc(batch, kind):
+                batch_sizes.append(len(batch))
+                return real_in_proc(batch, kind)
+
+            monkeypatch.setattr(_loaders, "_in_process_figure_outcomes", spy_in_proc)
+
+        parallel_paths = parallel.extract_images(tmp_path / "parallel")
+
+        assert len(batch_sizes) == 4 and sum(batch_sizes) == 8
+        assert [p.name for p in parallel_paths] == [p.name for p in serial_paths]
+        assert [p.read_bytes() for p in parallel_paths] == [p.read_bytes() for p in serial_paths]
+
+    def test_inline_image_with_different_decode_fails_closed_and_writes_two_pngs(self, tmp_path):
+        raw = bytes([10, 200, 10]) * (40 * 40)
+        xobj = (
+            b"<< /Type /XObject /Subtype /Image /Width 40 /Height 40 /ColorSpace /DeviceRGB "
+            b"/BitsPerComponent 8 /Length %d >>\nstream\n%s\nendstream" % (len(raw), raw)
+        )
+        inline = b"q 80 0 0 80 200 400 cm BI /W 40 /H 40 /CS /RGB /BPC 8 /D [1 0 1 0 1 0] ID " + raw + b" EI Q"
+        content = b"q 80 0 0 80 50 400 cm /Im0 Do Q " + inline
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R "
+            b"/Resources << /XObject << /Im0 5 0 R >> >> >>",
+            b"<< /Length %d >>\nstream\n%s\nendstream" % (len(content), content),
+            xobj,
+        ]
+        path = hand_written_pdf(tmp_path / "inline_vs_xobj.pdf", objects)
+        made = PDFWriter(path, ocr="never")
+        figures = made._extracted().figures
+
+        paths = made.extract_images(tmp_path / "images")
+
+        assert len(figures) == 2 and figures[0].sha256 == figures[1].sha256
+        assert len(paths) == 2 and paths[0].read_bytes() != paths[1].read_bytes()
+
+    def test_failed_representative_does_not_poison_follower_and_cache_cap_is_respected(self, tmp_path, monkeypatch):
+        path = _reused_streams_pdf(tmp_path / "reused_fail.pdf", pages=3)
+        made = PDFWriter(path, ocr="never")
+        figures = made._extracted().figures
+        assert len(figures) == 6
+
+        calls = 0
+        real_read = pdfium_engine.FigureSession.read
+
+        def fail_first_only(self, loader, kind):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DatagruntPDFError("transient first read failure")
+            return real_read(self, loader, kind)
+
+        monkeypatch.setattr(pdfium_engine.FigureSession, "read", fail_first_only)
+        paths = made.extract_images(tmp_path / "images_fail")
+        assert len(paths) == 2 and calls == 3  # first failed, second (other pic) ok, follower recovered pic 1
+
+        # Cache byte cap smaller than one PNG still succeeds cleanly for every figure
+        monkeypatch.undo()
+        monkeypatch.setattr(_loaders, "_MAX_PNG_CACHE_BYTES", 8)
+        paths_uncached = made.extract_images(tmp_path / "images_cap", dedupe=False)
+        assert len(paths_uncached) == 6 and paths_uncached[0].read_bytes() == paths_uncached[2].read_bytes()
+
+
 def spied_renders(monkeypatch, real=fake_render, module=bundle) -> list:
     """Record each ``module``'s render_page call (source, page index, dpi, password, cap, timeout); let ``real`` run.
 
@@ -1141,6 +1504,50 @@ class TestRenderPagesAsImages:
         with pytest.raises(NotADirectoryError, match="output_dir exists and is not a directory"):
             PDFWriter(source_pdf(tmp_path), ocr="never").render_pages_as_images(tmp_path / "pages")
         assert calls == []
+
+    def test_a_source_replaced_with_different_bytes_after_extraction_raises_source_changed(self, tmp_path, monkeypatch):
+        renders = spied_renders(monkeypatch)
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        made._extracted()
+        text_pdf(tmp_path, name=source.name)
+        with pytest.raises(PDFSourceChangedError, match="its bytes are not the document's"):
+            made.render_pages_as_images(tmp_path / "pages")
+        assert renders == [] and not (tmp_path / "pages").exists()
+
+    def test_a_source_removed_after_extraction_raises_source_changed(self, tmp_path, monkeypatch):
+        renders = spied_renders(monkeypatch)
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        made._extracted()
+        source.unlink()
+        with pytest.raises(PDFSourceChangedError, match="was removed"):
+            made.render_pages_as_images(tmp_path / "pages")
+        assert renders == [] and not (tmp_path / "pages").exists()
+
+    @pytest.mark.parametrize("change", [touched, rewritten_in_place], ids=["touched", "rewritten-same-bytes"])
+    def test_a_source_touched_or_rewritten_with_same_bytes_still_renders(self, tmp_path, monkeypatch, change):
+        spied_renders(monkeypatch)
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        made._extracted()
+        change(source)
+        paths = made.render_pages_as_images(tmp_path / "pages")
+        assert paths == page_files(tmp_path / "pages", (1, 2, 3, 4))
+
+    def test_a_source_changed_during_render_raises_source_changed(self, tmp_path, monkeypatch):
+        source = source_pdf(tmp_path)
+        made = PDFWriter(source, ocr="never", dpi=72)
+        made._extracted()
+
+        def mutating(src, page_index, **kwargs):
+            if page_index == 0:
+                text_pdf(tmp_path, name=source.name)
+            return fake_render(src, page_index, **kwargs)
+
+        monkeypatch.setattr(bundle, "render_page", mutating)
+        with pytest.raises(PDFSourceChangedError, match="changed while render_pages_as_images ran"):
+            made.render_pages_as_images(tmp_path / "pages")
 
 
 class TestWriteBundle:

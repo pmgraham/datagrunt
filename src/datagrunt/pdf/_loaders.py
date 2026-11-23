@@ -63,12 +63,19 @@ figures. An error a figure's read raises (the file changed, a decode
 refused) is that figure's outcome, raised as it was.
 """
 
+import base64
 import dataclasses
+import hashlib
+import math
 import os
+import re
 import stat
 import subprocess
 import time
+import zlib
+from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -101,12 +108,49 @@ from datagrunt.pdf.render import RenderedPage, render_page, render_size
 
 _default_render_page = render_page
 
-__all__ = ["FIGURE_BATCH", "FigureRead", "PageDraw", "PageRender", "figure_pngs", "read_figures"]
+__all__ = [
+    "FIGURE_BATCH",
+    "FigureRead",
+    "PageDraw",
+    "PageRender",
+    "figure_pngs",
+    "read_figures",
+    "resolved_picture_keys",
+    "verify_source_bytes",
+]
 
 _TURNS = (0, 90, 180, 270)
 
 # The figures one worker reads, at most: a batch's request is ~0.5 KB a figure, within the launcher's 1 MiB bound.
 FIGURE_BATCH = 64
+# Bounded PNG cache for repeated picture keys during figure_pngs streaming (64 MiB).
+_MAX_PNG_CACHE_BYTES = 64 << 20
+# Bounds for fail-closed PDF image-dictionary uniqueness scan (#449).
+_MAX_DICT_SCAN_BYTES = 64 << 20
+_MAX_PDF_OBJECTS = 200_000
+_MAX_DICT_NESTING = 32
+_MAX_CONTENT_STREAM_INFLATE = 1 << 20
+_MAX_TOTAL_CONTENT_INFLATE = 16 << 20
+_UNIQUE_KEY = object()
+_DISQUALIFYING_TOKENS = (b"/Encrypt", b"/DefaultGray", b"/DefaultRGB", b"/DefaultCMYK")
+_DICT_TOKEN_RE = re.compile(rb"<<|>>|[%(]")
+_OBJ_HEADER_RE = re.compile(rb"(?:^|[\r\n\s])(\d+)\s+(\d+)\s+obj(?=[\s\[\]()<>/{}%])")
+_INT_OBJ_RE = re.compile(rb"(?:^|[\r\n\s])(\d+)\s+(\d+)\s+obj\s+(\d+)\s+endobj(?=[\s\r\n]|$)")
+_STREAM_START_RE = re.compile(rb"stream(?:\r\n|\n)")
+_LENGTH_DIRECT_RE = re.compile(rb"/Length\s+(\d+)(?!\d)")
+_LENGTH_INDIRECT_RE = re.compile(rb"/Length\s+(\d+)\s+(\d+)\s+R(?![A-Za-z0-9_])")
+_LENGTH_ANY_RE = re.compile(rb"/Length\s+(?:\d+\s+\d+\s+R|\d+)")
+_SUBTYPE_IMAGE_RE = re.compile(rb"/Subtype\s*/Image(?![A-Za-z0-9_#.-])")
+_SUBTYPE_REF_RE = re.compile(rb"/Subtype\s+\d+\s+\d+\s+R(?![A-Za-z0-9_])")
+_FILTER_KEY_RE = re.compile(rb"/Filter(?=[\s/\[\(<>])")
+_SINGLE_FLATE_RE = re.compile(rb"/Filter\s*(?:/FlateDecode|\[\s*/FlateDecode\s*\])(?![A-Za-z0-9_#.-])")
+_ASCII85_FLATE_RE = re.compile(rb"/Filter\s*\[\s*/ASCII85Decode\s+/FlateDecode\s*\](?![A-Za-z0-9_#.-])")
+_DECODE_PARMS_RE = re.compile(rb"/DecodeParms(?=[\s/\[\(<])")
+_NON_CONTENT_STREAM_RE = re.compile(
+    rb"/(?:Type\s*/(?:ObjStm|XRef|Metadata)|Subtype\s*/(?:Type1C|CIDFontType0C|OpenType)|Length1(?![A-Za-z0-9_]))"
+)
+_INLINE_IMAGE_RE = re.compile(rb"(?:^|[\s\[\]()<>/{}%])BI[\s\r\n]+/")
+_WS_RE = re.compile(rb"\s+")
 # A figure worker's first reply is given this to start, and each figure this. Measured here: a worker starts in ~0.2
 # s and reads a figure in 12-67 ms (a JPEG 2000 image at the pixel bound in seconds), so each bound is over 100 times
 # what it covers.
@@ -345,6 +389,25 @@ def _bound_render(loader: PageRender | PageDraw) -> RenderedPage:
     return page
 
 
+def verify_source_bytes(
+    source: Path,
+    expected_sha256: str,
+    *,
+    identity: SourceIdentity | None,
+    when: str,
+) -> SourceIdentity:
+    """Verify ``source`` holds bytes hashing to ``expected_sha256``, fast-pathing matching ``identity``."""
+    now = _identity_at(source, when)
+    if identity is not None and not identity.changes(now):
+        return now
+    digest = _sha256_at(source, now, when)
+    if digest != expected_sha256:
+        changes = () if identity is None else identity.changes(now)
+        mismatch = f"its bytes are not the document's (sha256 {digest}, not {expected_sha256})"
+        raise _changed(source, when, changes or ("content",), mismatch)
+    return now
+
+
 def _drawable(loader: PageRender | PageDraw, when: str) -> SourceIdentity | None:
     """The identity of the file at the loader's source if it holds the document's bytes; None if it is bound to none.
 
@@ -505,6 +568,11 @@ class FigureRead:
             raise ValueError("image has no raw_sha256")
         return digest
 
+    @property
+    def picture_key(self) -> tuple[object, ...] | None:
+        """Extraction-time picture identity key from ``image``, or None when not safely deduplicable."""
+        return self.image.picture_key
+
     def png_bytes(self) -> bytes:
         """The image decoded by pdfium at its own pixel size, as PNG bytes (``ImageLoader.png_bytes``'s, in a worker).
 
@@ -528,20 +596,318 @@ class FigureRead:
 
 def _read_one(read: FigureRead, kind: Kind) -> bytes:
     """One figure's bytes, read in a worker of its own; its error raised."""
-    (outcome,) = read_figures((read,), kind)
+    outcome = _single_outcome(read, kind)
     if isinstance(outcome, Exception):
         raise outcome
     return outcome
 
 
-def figure_pngs(figures: Sequence[Figure]) -> Iterator[Callable[[], bytes]]:
+def _single_outcome(read: FigureRead, kind: Kind) -> bytes | Exception:
+    """One figure's outcome (bytes or exception), read without raising."""
+    (outcome,) = read_figures((read,), kind)
+    return outcome
+
+
+def _read_scan_bytes(source: Path) -> bytes | None:
+    """Read ``source`` for dictionary uniqueness scanning when within ``_MAX_DICT_SCAN_BYTES``; else None."""
+    try:
+        with _opened_source(source) as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size < 1 or size > _MAX_DICT_SCAN_BYTES:
+                return None
+            data = stream.read(size + 1)
+    except (OSError, ValueError):
+        return None
+    return data if len(data) == size else None
+
+
+def _skip_pdf_string(data: bytes, start: int) -> int:
+    """Return index immediately after a PDF literal string ``(...)`` starting at ``start``, or -1."""
+    end = len(data)
+    if start < 0 or start >= end or data[start] != 0x28:
+        return -1
+    depth = 0
+    pos = start
+    while pos < end:  # bounded: pos strictly increases every iteration
+        byte = data[pos]
+        if byte == 0x5C:  # backslash escape
+            pos += 2
+            continue
+        if byte == 0x28:  # '('
+            depth += 1
+        if byte == 0x29:  # ')'
+            depth -= 1
+        pos += 1
+        if depth == 0:
+            return pos
+    return -1
+
+
+def _skip_ws_and_comments(data: bytes, pos: int) -> int:
+    """Advance ``pos`` past PDF whitespace and ``%`` comments."""
+    end = len(data)
+    while pos < end:  # bounded: pos strictly increases
+        byte = data[pos]
+        if byte in (0x00, 0x09, 0x0A, 0x0C, 0x0D, 0x20):
+            pos += 1
+            continue
+        if byte == 0x25:  # '%' comment to end of line
+            nl = data.find(b"\n", pos)
+            cr = data.find(b"\r", pos)
+            pos = end if nl < 0 and cr < 0 else min(x for x in (nl, cr) if x >= 0) + 1
+            continue
+        return pos
+    return end
+
+
+def _find_dict_end(data: bytes, start: int) -> int:
+    """Return index immediately after the balanced ``>>`` matching ``<<`` at ``start``, or -1."""
+    depth = 0
+    pos = start
+    end = len(data)
+    for _ in range(end - start + 1):  # bounded: pos strictly advances every iteration
+        match = _DICT_TOKEN_RE.search(data, pos)
+        if match is None:
+            return -1
+        token = match.group(0)
+        if token == b"%":
+            pos = _skip_ws_and_comments(data, match.start())
+            continue
+        if token == b"(":
+            pos = _skip_pdf_string(data, match.start())
+            if pos < 0:
+                return -1
+            continue
+        if token == b"<<":
+            depth += 1
+            if depth > _MAX_DICT_NESTING:
+                return -1
+            pos = match.end()
+            continue
+        depth -= 1
+        pos = match.end()
+        if depth == 0:
+            return pos
+    return -1
+
+
+def _top_level_dict(dict_bytes: bytes) -> bytes:
+    """Keep only top-level dictionary bytes outside nested ``<<...>>``, strings ``(...)``, and comments."""
+    out: list[bytes] = []
+    depth = 0
+    pos = 0
+    end = len(dict_bytes)
+    for _ in range(end + 1):  # bounded: pos strictly advances
+        match = _DICT_TOKEN_RE.search(dict_bytes, pos)
+        if match is None:
+            if depth == 1:
+                out.append(dict_bytes[pos:])
+            return b"".join(out)
+        if depth == 1:
+            out.append(dict_bytes[pos : match.start()])
+        token = match.group(0)
+        if token == b"%":
+            pos = _skip_ws_and_comments(dict_bytes, match.start())
+            continue
+        if token == b"(":
+            pos = _skip_pdf_string(dict_bytes, match.start())
+            if pos < 0:
+                return b""
+            out.append(b" ")
+            continue
+        depth += 1 if token == b"<<" else -1
+        pos = match.end()
+        if depth == 1:
+            out.append(b" ")
+    return b"".join(out)
+
+
+def _canonical_image_dict(dict_bytes: bytes) -> bytes:
+    """Normalize an image dictionary for equality: strip ``/Length`` and collapse whitespace outside strings."""
+    parts: list[bytes] = []
+    pos = 0
+    end = len(dict_bytes)
+    for _ in range(end + 1):  # bounded: pos strictly advances
+        paren = dict_bytes.find(b"(", pos)
+        segment = dict_bytes[pos:] if paren < 0 else dict_bytes[pos:paren]
+        cleaned = _WS_RE.sub(b" ", _LENGTH_ANY_RE.sub(b"", segment))
+        parts.append(cleaned)
+        if paren < 0:
+            break
+        after = _skip_pdf_string(dict_bytes, paren)
+        if after < 0:
+            return dict_bytes
+        parts.append(dict_bytes[paren:after])
+        pos = after
+    return b"".join(parts).strip()
+
+
+def _resolve_stream_length(top: bytes, int_objs: dict[tuple[int, int], int]) -> int | None:
+    """Resolve top-level ``/Length`` (direct integer or indirect ``N G R``); None if missing or unknown."""
+    indirect = _LENGTH_INDIRECT_RE.search(top)
+    if indirect is not None:
+        return int_objs.get((int(indirect.group(1)), int(indirect.group(2))))
+    direct = _LENGTH_DIRECT_RE.search(top)
+    return None if direct is None else int(direct.group(1))
+
+
+def _stream_end_after(data: bytes, stream_start: int, length: int) -> int:
+    """Verify ``endstream`` follows ``length`` bytes from ``stream_start``; return index after ``endstream`` or -1."""
+    stream_end = stream_start + length
+    if length < 0 or stream_end > len(data):
+        return -1
+    after = stream_end
+    for _ in range(4):  # allow optional trailing whitespace/CRLF before endstream
+        if after < len(data) and data[after] in (0x0A, 0x0D, 0x20):
+            after += 1
+        else:
+            break
+    if data[after : after + 9] != b"endstream":
+        return -1
+    return after + 9
+
+
+def _decode_ascii85(payload: bytes) -> bytes | None:
+    """Decode an Adobe ASCII85 PDF stream payload, or return None on syntax error."""
+    stripped = payload.rstrip()
+    if stripped.endswith(b"~>"):
+        stripped = stripped[:-2]
+    try:
+        return base64.a85decode(stripped, adobe=False, ignorechars=b" \t\r\n\x0c")
+    except ValueError:
+        return None
+
+
+def _inflate_bounded(compressed: bytes, cap: int) -> bytes | None:
+    """Inflate ``compressed`` whole within ``cap`` bytes, or return None."""
+    if cap <= 0:
+        return None
+    inflater = zlib.decompressobj()
+    try:
+        inflated = inflater.decompress(compressed, cap + 1)
+    except zlib.error:
+        return None
+    if not inflater.eof or len(inflated) > cap:
+        return None
+    return inflated
+
+
+def _content_stream_safe(top: bytes, payload: bytes, inflate_budget: list[int]) -> bool:
+    """True when a non-image stream is proven to contain no inline image operator (``BI``)."""
+    if _NON_CONTENT_STREAM_RE.search(top):
+        return True
+    if _DECODE_PARMS_RE.search(top):
+        return False
+    if not _FILTER_KEY_RE.search(top):
+        return _INLINE_IMAGE_RE.search(payload) is None
+    cap = min(_MAX_CONTENT_STREAM_INFLATE, inflate_budget[0])
+    compressed: bytes | None = None
+    if _SINGLE_FLATE_RE.search(top):
+        compressed = payload
+    elif _ASCII85_FLATE_RE.search(top) and len(payload) <= cap:
+        compressed = _decode_ascii85(payload)
+    if compressed is None:
+        return False
+    inflated = _inflate_bounded(compressed, cap)
+    if inflated is None:
+        return False
+    inflate_budget[0] -= len(inflated)
+    return _INLINE_IMAGE_RE.search(inflated) is None
+
+
+def _dedupable_streams(source: Path, candidate_shas: frozenset[str]) -> frozenset[str]:
+    """Return subset of ``candidate_shas`` proven to appear with one unique image dictionary in ``source``.
+
+    Fail-closed: encrypted PDFs, ``/DefaultGray``/``/DefaultRGB``/``/DefaultCMYK``,
+    incremental updates, hex-escaped names, unparseable streams, or content streams
+    holding (or possibly holding) inline images return ``frozenset()``.
+    """
+    data = _read_scan_bytes(source)
+    if data is None or any(token in data for token in _DISQUALIFYING_TOKENS):
+        return frozenset()
+    int_objs = {(int(m.group(1)), int(m.group(2))): int(m.group(3)) for m in _INT_OBJ_RE.finditer(data)}
+    dicts_by_sha: dict[str, set[bytes]] = {}
+    seen_objs: set[tuple[int, int]] = set()
+    inflate_budget = [_MAX_TOTAL_CONTENT_INFLATE]
+    pos = 0
+    for _ in range(_MAX_PDF_OBJECTS):
+        match = _OBJ_HEADER_RE.search(data, pos)
+        if match is None:
+            return frozenset(sha for sha, dicts in dicts_by_sha.items() if len(dicts) == 1)
+        obj_id = (int(match.group(1)), int(match.group(2)))
+        if obj_id in seen_objs:
+            return frozenset()
+        seen_objs.add(obj_id)
+        pos = _inspect_object_stream(data, match.end(), int_objs, candidate_shas, dicts_by_sha, inflate_budget)
+        if pos < 0:
+            return frozenset()
+    return frozenset()
+
+
+def _inspect_object_stream(
+    data: bytes,
+    body_start: int,
+    int_objs: dict[tuple[int, int], int],
+    candidate_shas: frozenset[str],
+    dicts_by_sha: dict[str, set[bytes]],
+    inflate_budget: list[int],
+) -> int:
+    """Inspect one indirect object body; return next scan offset, or -1 to fail closed."""
+    dict_start = _skip_ws_and_comments(data, body_start)
+    if data[dict_start : dict_start + 2] != b"<<":
+        return body_start
+    dict_end = _find_dict_end(data, dict_start)
+    if dict_end < 0:
+        return -1
+    after_dict = _skip_ws_and_comments(data, dict_end)
+    stream_match = _STREAM_START_RE.match(data, after_dict)
+    if stream_match is None:
+        return dict_end
+    dict_bytes = data[dict_start:dict_end]
+    if b"#" in dict_bytes:
+        return -1
+    top = _top_level_dict(dict_bytes)
+    length = _resolve_stream_length(top, int_objs)
+    if length is None:
+        return -1
+    after_endstream = _stream_end_after(data, stream_match.end(), length)
+    if after_endstream < 0 or _SUBTYPE_REF_RE.search(top):
+        return -1
+    payload = data[stream_match.end() : stream_match.end() + length]
+    if _SUBTYPE_IMAGE_RE.search(top):
+        sha = hashlib.sha256(payload).hexdigest()
+        if sha in candidate_shas:
+            dicts_by_sha.setdefault(sha, set()).add(_canonical_image_dict(dict_bytes))
+        return after_endstream
+    return after_endstream if _content_stream_safe(top, payload, inflate_budget) else -1
+
+
+def resolved_picture_keys(reads: Sequence[FigureRead]) -> tuple[object, ...]:
+    """Return one deduplication key per read in ``reads``; equal keys are proven to decode to identical PNGs."""
+    raw_keys = [None if read.picture_key is None else (_worker_key(read), read.picture_key) for read in reads]
+    counts = Counter(key for key in raw_keys if key is not None)
+    candidates_by_source: dict[Path, set[str]] = {}
+    for read, raw_key in zip(reads, raw_keys, strict=True):
+        if raw_key is not None and counts[raw_key] >= 2:
+            candidates_by_source.setdefault(read.source, set()).add(read.raw_sha256)
+    if not candidates_by_source:
+        return tuple((_UNIQUE_KEY, idx) for idx in range(len(reads)))
+    dedupable = {src: _dedupable_streams(src, frozenset(shas)) for src, shas in candidates_by_source.items()}
+    return tuple(
+        raw_key if raw_key is not None and read.raw_sha256 in dedupable.get(read.source, ()) else (_UNIQUE_KEY, idx)
+        for idx, (read, raw_key) in enumerate(zip(reads, raw_keys, strict=True))
+    )
+
+
+def figure_pngs(figures: Sequence[Figure], *, workers: int = 1) -> Iterator[Callable[[], bytes]]:
     """Each figure's PNG read, in order, as a callable that returns its bytes or raises its error.
 
-    The figures whose PNG loader is a :class:`FigureRead`'s are read in
-    batches (:func:`read_figures`), each when its turn comes; any other
-    figure (a bundle's, read from its file) is read by its own
-    ``read_bytes``.
+    The figures whose PNG loader is a :class:`FigureRead`'s are deduplicated by
+    resolved picture key (reading each distinct picture once) and read in
+    batches spread across ``workers`` (:func:`read_figures`); any other figure
+    (a bundle's, read from its file) is read by its own ``read_bytes``.
     """
+    int_at_least("workers", workers, 1)
     index = 0
     while index < len(figures):  # bounded: each pass consumes at least one figure
         run = _run_of_reads(figures, index)
@@ -549,9 +915,64 @@ def figure_pngs(figures: Sequence[Figure]) -> Iterator[Callable[[], bytes]]:
             yield figures[index].read_bytes
             index += 1
             continue
-        for outcome in read_figures(run, "png"):  # bounded: one outcome a read
-            yield partial(_outcome_of, outcome)
+        yield from _deduped_figure_pngs(run, workers=workers)
         index += len(run)
+
+
+def _deduped_figure_pngs(run: list[FigureRead], *, workers: int) -> Iterator[Callable[[], bytes]]:
+    """Stream PNG outcomes for ``run``, reading each distinct picture key once with bounded refcounted caching."""
+    keys = resolved_picture_keys(run)
+    remaining = Counter(keys)
+    seen: set[object] = set()
+    rep_reads: list[FigureRead] = []
+    is_first: list[bool] = []
+    for read, key in zip(run, keys, strict=True):
+        first = key not in seen
+        is_first.append(first)
+        if first:
+            seen.add(key)
+            rep_reads.append(read)
+    rep_outcomes = read_figures(rep_reads, "png", workers=workers)
+    cache: dict[object, bytes] = {}
+    cache_bytes = 0
+    try:
+        for read, key, first in zip(run, keys, is_first, strict=True):
+            remaining[key] -= 1
+            outcome, cache_bytes = _resolve_run_item(read, key, first, rep_outcomes, cache, remaining[key], cache_bytes)
+            yield partial(_outcome_of, outcome)
+    finally:
+        close = getattr(rep_outcomes, "close", None)
+        if callable(close):
+            close()
+
+
+def _resolve_run_item(
+    read: FigureRead,
+    key: object,
+    first: bool,
+    rep_outcomes: Iterator[bytes | Exception],
+    cache: dict[object, bytes],
+    left: int,
+    cache_bytes: int,
+) -> tuple[bytes | Exception, int]:
+    """Obtain one figure's outcome from representative iterator, bounded cache, or per-figure fallback."""
+    if first:
+        outcome = next(rep_outcomes)
+    elif key in cache:
+        outcome = cache[key]
+        if left == 0:
+            cache_bytes -= len(cache.pop(key))
+    else:
+        outcome = _single_outcome(read, "png")
+    if (
+        isinstance(outcome, bytes)
+        and left > 0
+        and key not in cache
+        and cache_bytes + len(outcome) <= _MAX_PNG_CACHE_BYTES
+    ):
+        cache[key] = outcome
+        cache_bytes += len(outcome)
+    return outcome, cache_bytes
 
 
 def _run_of_reads(figures: Sequence[Figure], start: int) -> list[FigureRead]:
@@ -572,36 +993,86 @@ def _outcome_of(outcome: bytes | Exception) -> bytes:
     return outcome
 
 
-def read_figures(reads: Sequence[FigureRead], kind: Kind) -> Iterator[bytes | Exception]:
+def read_figures(reads: Sequence[FigureRead], kind: Kind, *, workers: int = 1) -> Iterator[bytes | Exception]:
     """Each read's bytes (``kind``: ``"png"`` or ``"raw"``), or the exception it raised, in order (module notes).
 
     Consecutive reads of one PDF (its path, password and memory cap) share a
-    worker, at most :data:`FIGURE_BATCH` of them.
+    worker, at most :data:`FIGURE_BATCH` of them under ``sandbox``; with
+    ``workers > 1``, batches spread across up to ``workers`` threads while
+    yielding outcomes in deterministic order.
 
     Raises:
-        ValueError: If ``kind`` is neither ``"png"`` nor ``"raw"``.
-        TypeError: If a read is not a FigureRead.
+        ValueError: If ``kind`` is neither ``"png"`` nor ``"raw"``, or ``workers < 1``.
+        TypeError: If a read is not a FigureRead, or ``workers`` is not an int.
     """
     if kind not in _KINDS:
         raise ValueError(f"kind must be one of {_KINDS}, got {kind!r}")
+    worker_count = int_at_least("workers", workers, 1)
     for read in reads:
         if not isinstance(read, FigureRead):
             raise TypeError(f"each read must be a FigureRead, got {type(read).__name__}")
-    for batch in _batches(reads):  # bounded: the reads, FIGURE_BATCH at a time
-        yield from _batch_outcomes(batch, kind)
+    batches = list(_batches(reads, workers=worker_count))
+    if worker_count == 1 or len(batches) <= 1:
+        for batch in batches:  # bounded: the reads' batches
+            yield from _batch_outcomes(batch, kind)
+        return
+    yield from _parallel_batch_outcomes(batches, kind, workers=min(worker_count, len(batches)))
 
 
-def _batches(reads: Sequence[FigureRead]) -> Iterator[list[FigureRead]]:
-    """``reads`` in runs sharing a worker (at most FIGURE_BATCH under ``sandbox``; full PDF run in-process)."""
-    batch: list[FigureRead] = []
+def _collect_batch(batch: list[FigureRead], kind: Kind) -> list[bytes | Exception]:
+    """Materialize one batch's outcomes inside a worker thread."""
+    return list(_batch_outcomes(batch, kind))
+
+
+def _parallel_batch_outcomes(
+    batches: list[list[FigureRead]], kind: Kind, *, workers: int
+) -> Iterator[bytes | Exception]:
+    """Run ``batches`` across at most ``workers`` threads in a bounded sliding window, yielding in batch order."""
+    next_submit = 0
+    next_yield = 0
+    ready: dict[int, list[bytes | Exception]] = {}
+    in_flight: dict[Future[list[bytes | Exception]], int] = {}
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="datagrunt-figures")
+    try:
+        for _ in range(2 * len(batches) + 1):  # bounded: each pass yields a batch or completes >=1 future
+            if next_yield >= len(batches):
+                return
+            while next_submit < len(batches) and len(in_flight) + len(ready) < workers:
+                in_flight[pool.submit(_collect_batch, batches[next_submit], kind)] = next_submit
+                next_submit += 1
+            if next_yield in ready:
+                yield from ready.pop(next_yield)
+                next_yield += 1
+                continue
+            done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                ready[in_flight.pop(future)] = future.result()
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def _batches(reads: Sequence[FigureRead], *, workers: int = 1) -> Iterator[list[FigureRead]]:
+    """``reads`` in runs sharing a worker (capped by FIGURE_BATCH under ``sandbox``; split across ``workers``)."""
+    run: list[FigureRead] = []
     for read in reads:
-        limit_hit = read.sandbox and len(batch) == FIGURE_BATCH
-        if batch and (limit_hit or _worker_key(batch[0]) != _worker_key(read)):
-            yield batch
-            batch = []
-        batch.append(read)
-    if batch:
-        yield batch
+        if run and _worker_key(run[0]) != _worker_key(read):
+            yield from _split_run(run, workers=workers)
+            run = []
+        run.append(read)
+    if run:
+        yield from _split_run(run, workers=workers)
+
+
+def _split_run(run: list[FigureRead], *, workers: int) -> Iterator[list[FigureRead]]:
+    """Split one homogeneous worker-key ``run`` into bounded batches for ``workers``."""
+    sandbox = run[0].sandbox
+    if workers == 1:
+        size = FIGURE_BATCH if sandbox else len(run)
+    else:
+        per_worker = math.ceil(len(run) / min(workers, len(run)))
+        size = min(FIGURE_BATCH, per_worker) if sandbox else per_worker
+    for start in range(0, len(run), max(1, size)):
+        yield run[start : start + size]
 
 
 def _worker_key(read: FigureRead) -> tuple[Path, str | None, int, bool]:

@@ -94,9 +94,11 @@ __all__ = [
     "CorpusManifest",
     "extract_corpus",
     "load_corpus",
+    "freeze_support",
 ]
 
 if TYPE_CHECKING:
+    from datagrunt.pdf._process import freeze_support
     from datagrunt.pdf.bundle import load_bundle, write_bundle
     from datagrunt.pdf.corpus import (
         CorpusEntry,
@@ -116,6 +118,7 @@ _DIRECT_NAMES = _MappingProxyType(
         "CorpusFailure": "datagrunt.pdf.corpus",
         "CorpusManifest": "datagrunt.pdf.corpus",
         "load_corpus": "datagrunt.pdf.corpus",
+        "freeze_support": "datagrunt.pdf._process",
     }
 )
 

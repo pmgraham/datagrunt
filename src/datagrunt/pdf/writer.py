@@ -60,13 +60,12 @@ Each method writes the document in one form. A path returned is absolute
   escaped against spreadsheet formula injection. Guarding a spreadsheet
   that opens the CSV is the application's concern.
 - :meth:`PDFWriter.extract_images`: each figure's PNG, through its A1
-  loader, into ``output_dir``: an extracted figure's PNGs are read in
-  batches, up to 64 a capped figure worker
+  loader, into ``output_dir``: an extracted figure's PNGs are deduplicated by
+  resolved picture identity (reading each distinct picture once while keeping
+  pictures with different colour spaces, ``/Decode`` arrays, palettes, or masks
+  distinct) and read in batches spread across ``workers``
   (:func:`~datagrunt.pdf._loaders.figure_pngs`), as ``Figure.read_bytes``
-  reads one; any other figure by its own ``read_bytes``. Every figure is
-  read: its ``sha256`` hashes the raw stream, not the image dictionary that
-  decodes it, so only its PNG shows whether it is a picture already written
-  (one read a figure: correctness over speed, as the bundle's notes say).
+  reads one; any other figure by its own ``read_bytes``.
   With ``dedupe`` (the default) each distinct picture is written
   once, as the bundle names it: ``<sha256>.png`` (the raw stream's sha256,
   a figure's identity), and another picture of the same stream (the stream
@@ -102,8 +101,10 @@ Each method writes the document in one form. A path returned is absolute
   #470), whose content lives only in their page images, are also named in
   one ``UserWarning`` a call, with the document and ``output_dir``: the
   source PDF is their only full copy (#471, as the bundle warns). Any other error fails the call. The paths returned are
-  the files written, in page order. The PDF rendered is the file at the
-  source path when the call runs.
+  the files written, in page order. Before and after rendering, the file at the
+  source path is verified against the extracted document's identity and sha256
+  (#454); a file replaced with other bytes, removed, or changed mid-render
+  raises :class:`~datagrunt.pdf.exceptions.PDFSourceChangedError`.
 - :meth:`PDFWriter.write_bundle`: A7a's
   :func:`~datagrunt.pdf.bundle.write_bundle` of the document, with the
   writer's source, password and options (``ocr``,
@@ -152,9 +153,9 @@ from typing import Any, BinaryIO
 import polars as pl
 from PIL import Image
 
-from datagrunt.pdf._loaders import figure_pngs
+from datagrunt.pdf._loaders import PageDraw, PageRender, _check_unchanged, figure_pngs, verify_source_bytes
 from datagrunt.pdf._options import MIN_IMAGE_DIMENSION, OcrMode, RenderPagesMode, checked_render_pages
-from datagrunt.pdf._source import checked_pdf_file
+from datagrunt.pdf._source import SourceIdentity, checked_pdf_file
 from datagrunt.pdf._validate import checked_password as _checked_password
 from datagrunt.pdf._validate import checked_path as _checked_path
 from datagrunt.pdf._validate import int_at_least, strict_bool
@@ -235,6 +236,7 @@ class PDFWriter:
             orientation_fallback=orientation_fallback,
         )
         self._source, self._document = _checked_source(source, password)
+        self._source_identity: SourceIdentity | None = None
         self._lock = threading.RLock()
 
     def write_json(self, out_filepath: str | os.PathLike[str]) -> Path:
@@ -358,7 +360,7 @@ class PDFWriter:
         figures = self._extracted().figures
         directory.mkdir(parents=True, exist_ok=True)
         source = None if self._source is None else self._source.path
-        return _write_figures(_bound(figures, source), directory, dedupe=dedupe)
+        return _write_figures(_bound(figures, source), directory, dedupe=dedupe, workers=self._options.workers)
 
     def render_pages_as_images(self, output_dir: str | os.PathLike[str], *, dpi: int | None = None) -> list[Path]:
         """Render every page into ``output_dir``, made when missing, as ``page_NNNN.png`` (see the module notes).
@@ -382,8 +384,20 @@ class PDFWriter:
         directory = _directory_target(output_dir)
         target_dpi = self._options.dpi if dpi is None else int_at_least("dpi", dpi, _MIN_TARGET_DPI)
         document = self._extracted()
+        with self._lock:
+            cached_identity = self._source_identity
+        before = verify_source_bytes(
+            source.path,
+            document.metadata.sha256,
+            identity=cached_identity,
+            when="before render_pages_as_images ran",
+        )
+        with self._lock:
+            self._source_identity = before
         directory.mkdir(parents=True, exist_ok=True)
-        return _write_renders(document, directory, source, target_dpi, self._options)
+        paths = _write_renders(document, directory, source, target_dpi, self._options)
+        _check_unchanged(source.path, before, "while render_pages_as_images ran")
+        return paths
 
     def write_bundle(
         self,
@@ -448,6 +462,7 @@ class PDFWriter:
         with self._lock:
             if self._document is None:
                 self._document = _extract(self._required_source("extraction"), self._options)
+                self._source_identity = _document_source_identity(self._document)
             return self._document
 
     def _required_source(self, method: str) -> PDFSource:
@@ -458,6 +473,19 @@ class PDFWriter:
                 "which holds no PDF to read; build it from the .pdf path"
             )
         return self._source
+
+
+def _document_source_identity(document: PDFDocument) -> SourceIdentity | None:
+    """The ``SourceIdentity`` carried by any page image loader of ``document`` matching its sha256."""
+    expected = document.metadata.sha256
+    for sheet in document.pages:
+        image = sheet.page_image
+        if image is None or image._loader is None:
+            continue
+        owner = getattr(image._loader, "__self__", None)
+        if isinstance(owner, (PageDraw, PageRender)) and owner.identity is not None and owner.sha256 == expected:
+            return owner.identity
+    return None
 
 
 def _checked_source(source: object, password: object) -> tuple[PDFSource | None, PDFDocument | None]:
@@ -582,15 +610,15 @@ def _bound(figures: tuple[Figure, ...], source: Path | None) -> tuple[Figure, ..
     return tuple(bound)
 
 
-def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool) -> list[Path]:
+def _write_figures(figures: tuple[Figure, ...], directory: Path, *, dedupe: bool, workers: int = 1) -> list[Path]:
     """Write each figure's PNG into ``directory`` (each distinct picture once, with ``dedupe``); the paths, in order.
 
-    Every figure is read. A figure whose bytes cannot be read, or are not a PNG, is skipped with a warning (see
-    the module notes).
+    Distinct pictures are read once in batches spread across ``workers``. A figure whose bytes cannot be read, or are
+    not a PNG, is skipped with a warning (see the module notes).
     """
     written: list[Path] = []
     pictures = _Pictures()
-    for figure, read in zip(figures, figure_pngs(figures), strict=True):  # read in batches, each when its turn comes
+    for figure, read in zip(figures, figure_pngs(figures, workers=workers), strict=True):
         data, why = _png(read)
         if data is None:
             _LOGGER.warning("figure %s (sha256 %s) was not written: %s", figure.element_id, figure.sha256, why)

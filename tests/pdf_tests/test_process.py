@@ -453,3 +453,298 @@ class TestWorkerImports:
         loaded = json.loads(done.stdout)
         assert ALLOWLIST[worker][0] in loaded  # the probe ran where the request is handled
         assert [name for name in loaded if inside(name, NOT_IN_A_WORKER)] == []
+
+
+FROZEN_WORKER_SCRIPT = """
+import sys
+sys.frozen = True
+from datagrunt.pdf import freeze_support
+freeze_support()
+print("MAIN_RAN")
+sys.exit(99)
+"""
+
+FROZEN_WORKER_ECHO_SCRIPT = """
+import sys
+from types import MappingProxyType
+sys.frozen = True
+from datagrunt.pdf import _process, freeze_support
+
+
+def _echo_worker(request, replies):
+    print("frozen noise on stdout")
+    _process.send_message(replies, repr(request).encode("utf-8"))
+
+
+_process.WORKERS = MappingProxyType({**_process.WORKERS, "pages": ("__main__", "_echo_worker")})
+freeze_support()
+print("MAIN_RAN")
+sys.exit(99)
+"""
+
+FROZEN_MISSING_EXTRA_SCRIPT = """
+import sys
+sys.frozen = True
+sys.modules["pypdfium2"] = None
+from datagrunt.pdf import freeze_support
+freeze_support()
+print("MAIN_RAN")
+sys.exit(99)
+"""
+
+
+def run_frozen_worker(tmp_path, script: str, stdin: bytes) -> subprocess.CompletedProcess:
+    """Run ``script`` as a frozen worker subprocess invoked with ``WORKER_FLAG``."""
+    entry = tmp_path / "frozen_entry.py"
+    entry.write_text(script, encoding="utf-8")
+    command = [sys.executable, str(entry), _process.WORKER_FLAG]
+    return subprocess.run(command, input=stdin, capture_output=True, check=False, timeout=60)
+
+
+class TestFreezeSupport:
+    """Explicit opt-in freeze_support() enables allowlisted worker processes in frozen apps (#440)."""
+
+    def test_worker_flag_and_freeze_support_are_exported(self):
+        assert _process.WORKER_FLAG == "--datagrunt-pdf-worker"
+        assert "WORKER_FLAG" in _process.__all__
+        assert "freeze_support" in _process.__all__
+
+    def test_freeze_support_is_a_no_op_in_a_non_frozen_process(self, monkeypatch):
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+
+        _process.freeze_support()
+
+        assert _process.worker_command() == [sys.executable, "-I", "-c", _process.BOOTSTRAP]
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        with pytest.raises(_process.NoInterpreter, match="this application is frozen"):
+            _process.worker_command()
+
+    def test_freeze_support_ignores_worker_flag_when_not_frozen(self, monkeypatch):
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+        monkeypatch.setattr(sys, "argv", ["app.py", _process.WORKER_FLAG])
+
+        _process.freeze_support()
+
+        assert _process.worker_command() == [sys.executable, "-I", "-c", _process.BOOTSTRAP]
+
+    def test_freeze_support_enables_frozen_worker_command(self, monkeypatch):
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "argv", ["my-app"])
+
+        with pytest.raises(_process.NoInterpreter, match="this application is frozen"):
+            _process.worker_command()
+
+        _process.freeze_support()
+
+        assert _process.worker_command() == [sys.executable, _process.WORKER_FLAG]
+
+    def test_freeze_support_in_frozen_process_still_rejects_empty_executable(self, monkeypatch):
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "executable", "")
+        monkeypatch.setattr(sys, "argv", ["my-app"])
+
+        _process.freeze_support()
+
+        with pytest.raises(_process.NoInterpreter, match="sys.executable is empty"):
+            _process.worker_command()
+
+    def test_freeze_support_ignores_extra_argv_tokens_with_worker_flag(self, monkeypatch):
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "argv", ["my-app", _process.WORKER_FLAG, "--extra"])
+
+        _process.freeze_support()
+
+        assert _process.worker_command() == [sys.executable, _process.WORKER_FLAG]
+
+    def test_install_sys_path_preserves_meipass_entries_first(self, monkeypatch):
+        monkeypatch.setattr(sys, "_MEIPASS", "/tmp/_MEI_child", raising=False)
+        monkeypatch.setattr(sys, "path", ["/tmp/_MEI_child", "/tmp/_MEI_child/lib", "/other"])
+
+        _process._install_sys_path(["/tmp/_MEI_parent", "/custom", "/tmp/_MEI_child"])
+
+        assert sys.path == ["/tmp/_MEI_child", "/tmp/_MEI_child/lib", "/tmp/_MEI_parent", "/custom"]
+
+    def test_install_sys_path_replaces_path_without_meipass(self, monkeypatch):
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        monkeypatch.setattr(sys, "path", ["/old"])
+
+        _process._install_sys_path(["/new/a", "/new/b"])
+
+        assert sys.path == ["/new/a", "/new/b"]
+
+    def test_read_worker_request_validates_bound_json_and_fields(self):
+        with pytest.raises(ValueError, match="bound must be at least 1"):
+            _process._read_worker_request(io.BytesIO(b"{}"), 0)
+        with pytest.raises(SystemExit, match="over 4 bytes"):
+            _process._read_worker_request(io.BytesIO(b"12345"), 4)
+        with pytest.raises(SystemExit, match="not valid JSON"):
+            _process._read_worker_request(io.BytesIO(b"{bad"), 1024)
+        with pytest.raises(SystemExit, match="must be a JSON object"):
+            _process._read_worker_request(io.BytesIO(b"[]"), 1024)
+        with pytest.raises(SystemExit, match="sys_path is not a list of str"):
+            _process._read_worker_request(io.BytesIO(b'{"sys_path": "x", "worker": "pages"}'), 1024)
+        with pytest.raises(SystemExit, match="names no worker"):
+            _process._read_worker_request(io.BytesIO(b'{"sys_path": [], "worker": "bad"}'), 1024)
+        valid = json.dumps({"sys_path": ["/a"], "worker": "render", "request": {"k": 1}}).encode()
+        assert _process._read_worker_request(io.BytesIO(valid), 1024) == (["/a"], "render", {"k": 1})
+
+    def test_load_worker_entry_validates_allowlist_extra_and_callability(self, monkeypatch):
+        with pytest.raises(SystemExit, match="names no worker"):
+            _process._load_worker_entry("os.system", io.BytesIO())
+        monkeypatch.setattr(
+            _process.importlib,
+            "import_module",
+            lambda _m: (_ for _ in ()).throw(ModuleNotFoundError("no pypdfium2", name="pypdfium2")),
+        )
+        replies = io.BytesIO()
+        assert _process._load_worker_entry("pages", replies) is None
+        msg = _process.read_message(io.BytesIO(replies.getvalue()), 1 << 20)
+        assert msg is not None and msg[:1] == _process.ERROR
+        monkeypatch.setattr(
+            _process.importlib,
+            "import_module",
+            lambda _m: (_ for _ in ()).throw(ModuleNotFoundError("no other", name="other_mod")),
+        )
+        with pytest.raises(ModuleNotFoundError, match="no other"):
+            _process._load_worker_entry("pages", io.BytesIO())
+
+    def test_load_worker_entry_rejects_non_callable_attribute(self, monkeypatch):
+        class FakeModule:
+            _worker_main = 42
+
+        monkeypatch.setattr(_process.importlib, "import_module", lambda _m: FakeModule)
+        with pytest.raises(TypeError, match="not callable"):
+            _process._load_worker_entry("pages", io.BytesIO())
+
+        def fake_worker(request, replies):
+            return None
+
+        FakeModule._worker_main = fake_worker
+        assert _process._load_worker_entry("pages", io.BytesIO()) is fake_worker
+
+    def test_redirect_stdout_to_stderr_closes_dup_fd_on_dup2_failure(self, monkeypatch):
+        closed: list[int] = []
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "dup", lambda fd: 99)
+            scoped.setattr(os, "dup2", lambda src, dst: (_ for _ in ()).throw(OSError("dup2 failed")))
+            scoped.setattr(os, "close", lambda fd: closed.append(fd))
+            with pytest.raises(OSError, match="dup2 failed"):
+                _process._redirect_stdout_to_stderr()
+
+        assert closed == [99]
+
+    def test_redirect_stdout_to_stderr_returns_stream_on_success(self, monkeypatch):
+        calls: list[tuple[str, object]] = []
+        sentinel = io.BytesIO()
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "dup", lambda fd: calls.append(("dup", fd)) or 99)
+            scoped.setattr(os, "dup2", lambda src, dst: calls.append(("dup2", (src, dst))))
+            scoped.setattr(os, "fdopen", lambda fd, mode: calls.append(("fdopen", (fd, mode))) or sentinel)
+            stream = _process._redirect_stdout_to_stderr()
+
+        assert stream is sentinel
+        assert calls == [("dup", 1), ("dup2", (2, 1)), ("fdopen", (99, "wb"))]
+
+    def test_run_frozen_worker_handles_missing_stdin_and_in_process_dispatch(self, monkeypatch):
+        monkeypatch.setattr(sys, "stdin", None)
+        with pytest.raises(SystemExit, match="no binary stdin stream"):
+            _process._run_frozen_worker()
+
+        class FakeStdin:
+            def __init__(self, data: bytes) -> None:
+                self.buffer = io.BytesIO(data)
+
+        seen: list[object] = []
+        payload = json.dumps({"sys_path": list(sys.path), "worker": "pages", "request": {"ok": True}}).encode()
+        monkeypatch.setattr(sys, "stdin", FakeStdin(payload))
+        monkeypatch.setattr(_process, "_redirect_stdout_to_stderr", lambda: io.BytesIO())
+        monkeypatch.setattr(_process, "_install_sys_path", lambda _path: None)
+        monkeypatch.setattr(_process, "_load_worker_entry", lambda _name, _rep: lambda req, rep: seen.append(req))
+
+        _process._run_frozen_worker()
+        assert seen == [{"ok": True}]
+
+        monkeypatch.setattr(sys, "stdin", FakeStdin(payload))
+        monkeypatch.setattr(_process, "_load_worker_entry", lambda _name, _rep: None)
+        _process._run_frozen_worker()
+
+    def test_freeze_support_invokes_frozen_worker_and_exits_zero(self, monkeypatch):
+        ran: list[bool] = []
+        monkeypatch.setattr(_process, "_FROZEN_SUPPORT", threading.Event())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(sys, "argv", ["app", _process.WORKER_FLAG])
+        monkeypatch.setattr(_process, "_run_frozen_worker", lambda: ran.append(True))
+
+        with pytest.raises(SystemExit) as caught:
+            _process.freeze_support()
+
+        assert caught.value.code == 0
+        assert ran == [True]
+        assert _process._FROZEN_SUPPORT.is_set()
+
+    def test_frozen_worker_dispatches_allowlisted_worker_redirects_stdout_and_exits_zero(self, tmp_path):
+        payload = _process.request_payload("pages", {"page": 7}, _process.MAX_REQUEST_BYTES)
+
+        done = run_frozen_worker(tmp_path, FROZEN_WORKER_ECHO_SCRIPT, payload)
+
+        assert done.returncode == 0, done.stderr
+        assert _process.read_message(io.BytesIO(done.stdout), 1024) == b"{'page': 7}"
+        assert b"frozen noise on stdout" in done.stderr
+        assert b"MAIN_RAN" not in done.stdout and b"MAIN_RAN" not in done.stderr
+
+    def test_frozen_worker_refuses_request_over_bound_before_main(self, tmp_path):
+        done = run_frozen_worker(tmp_path, FROZEN_WORKER_SCRIPT, b" " * (_process.MAX_REQUEST_BYTES + 1))
+
+        assert done.returncode == 1
+        assert b"the worker request is over 1048576 bytes" in done.stderr
+        assert b"MAIN_RAN" not in done.stdout and b"MAIN_RAN" not in done.stderr
+
+    @pytest.mark.parametrize(
+        ("stdin", "expected"),
+        [
+            pytest.param(b"{not-json", b"not valid JSON", id="bad-json"),
+            pytest.param(b"[]", b"must be a JSON object", id="non-dict"),
+            pytest.param(
+                json.dumps({"sys_path": "/not/a/list", "worker": "pages", "request": {}}).encode(),
+                b"the worker request's sys_path is not a list of str",
+                id="bad-sys-path-str",
+            ),
+            pytest.param(
+                json.dumps({"sys_path": ["/ok", 3], "worker": "pages", "request": {}}).encode(),
+                b"the worker request's sys_path is not a list of str",
+                id="bad-sys-path-int",
+            ),
+            pytest.param(
+                json.dumps({"sys_path": [], "worker": "os.system", "request": {}}).encode(),
+                b"the worker request names no worker of ('figures', 'pages', 'render')",
+                id="disallowed-worker",
+            ),
+            pytest.param(
+                json.dumps({"sys_path": [], "request": {}}).encode(),
+                b"the worker request names no worker of ('figures', 'pages', 'render')",
+                id="missing-worker",
+            ),
+        ],
+    )
+    def test_frozen_worker_refuses_invalid_requests_without_running_main(self, tmp_path, stdin, expected):
+        done = run_frozen_worker(tmp_path, FROZEN_WORKER_SCRIPT, stdin)
+
+        assert done.returncode == 1
+        assert expected in done.stderr
+        assert b"MAIN_RAN" not in done.stdout and b"MAIN_RAN" not in done.stderr
+
+    def test_frozen_worker_reports_missing_pdf_extra_as_error_reply(self, tmp_path):
+        payload = _process.request_payload("pages", {}, _process.MAX_REQUEST_BYTES)
+
+        done = run_frozen_worker(tmp_path, FROZEN_MISSING_EXTRA_SCRIPT, payload)
+
+        assert done.returncode == 0, done.stderr
+        reply = _process.read_message(io.BytesIO(done.stdout), 1 << 20)
+        assert reply is not None and reply[:1] == _process.ERROR
+        error = _process.read_error(reply[1:], "frozen worker")
+        assert isinstance(error, ImportError)
+        assert "pypdfium2" in str(error)
+        assert b"MAIN_RAN" not in done.stdout and b"MAIN_RAN" not in done.stderr
