@@ -49,7 +49,7 @@ To install Datagrunt using `uv`:
 uv pip install datagrunt
 ```
 
-Datagrunt 5.0 requires Python 3.11 or newer.
+Datagrunt 5.x supports Python 3.11–3.15 (requires Python 3.11 or newer).
 
 > **PDF parsing** is an optional extra — install it with `uv pip install "datagrunt[pdf]"`. For **schema-driven PDF extraction** (`rationalize`), install `uv pip install "datagrunt[pdf,rationalize]"`. See [PDF parsing](#pdf-parsing) and [Schema-driven extraction (`rationalize`)](#schema-driven-extraction-rationalize) below.
 
@@ -424,8 +424,11 @@ visible = reader.to_dataframe().filter(pl.col("hidden_reasons").list.len() == 0)
 
 Each page is routed `digital`, `hybrid`, or `vision` (`page.route`). A vision
 page (a scan, or a page with too little text or mostly unreadable characters)
-is rendered at `vision_dpi` and read by the **Tesseract** program; there is no
-Python wrapper. The page's own digital text is kept, flagged `superseded`.
+is rendered at `vision_dpi` in blank-row-aligned bands (so tall headings stay
+intact across seams) and read by the **Tesseract** program; there is no Python
+wrapper. On a `hybrid` page (digital text over a scan) with unmapped/invalid
+character regions (`ocr != "never"`), those regions are OCR'd and merged by
+position while each replaced span is kept and flagged `superseded`.
 
 Install Tesseract with its English (`eng`) and orientation (`osd`) data, e.g.
 `brew install tesseract` on macOS or `apt-get install tesseract-ocr` on
@@ -527,7 +530,9 @@ multi-document parallelism scale out cleanly:
   guard required). A page exceeding its memory or time bound becomes an error
   page while remaining pages continue in a fresh worker. Inside distributed
   runtimes (**Apache Spark**, **Apache Beam**, **Apache Flink**, or **Celery**),
-  per-document worker pools automatically clamp to 1 process.
+  per-document worker pools automatically clamp to 1 process. In frozen
+  executables (such as PyInstaller), call `datagrunt.pdf.freeze_support()` at
+  entry so the binary can re-enter as a memory-capped worker.
 
 ### Schema-driven extraction (`rationalize`)
 

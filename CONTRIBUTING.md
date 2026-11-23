@@ -13,7 +13,7 @@ uv venv
 uv pip install -e ".[dev,pdf,rationalize]"   # builds the Rust extension via maturin
 ```
 
-Requirements: Python >= 3.11, a Rust toolchain (stable), and — for the PDF OCR tests — [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract` / `apt-get install tesseract-ocr`).
+Requirements: Python >= 3.11 (Python 3.11–3.15 supported and tested in CI), a Rust toolchain (stable), and — for the PDF OCR tests — [Tesseract](https://github.com/tesseract-ocr/tesseract) (`brew install tesseract` / `apt-get install tesseract-ocr`).
 
 After changing Rust code, rebuild the extension so tests see it:
 
