@@ -367,7 +367,7 @@ jobs:
         # enumerates installed dists via pip (uv venvs omit pip by default).
         run: |
           uv venv --clear
-          uv pip install --reinstall-package datagrunt -e . pip-audit pip
+          uv pip install --reinstall-package datagrunt -e ".[pdf,rationalize]" pip-audit pip
           .venv/bin/pip-audit
 
   ci-gate:

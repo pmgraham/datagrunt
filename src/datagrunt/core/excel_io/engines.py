@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import ClassVar, Optional
 
 # third party libraries
-import duckdb
 import polars as pl
 import xlsxwriter
 
 # local libraries
+from datagrunt.core.databases.databases import private_in_memory_connection
 from datagrunt.core.excel_io.excelcomponents import (
     ExcelComponents,
     excel_table_name,
@@ -161,7 +161,7 @@ class ExcelReaderEngine:
         """
         df = self._read_sheet(sheet, normalize_columns, read_options)
         if self._connection is None:
-            self._connection = duckdb.connect(":memory:")
+            self._connection = private_in_memory_connection()
         self._connection.register(self.db_table, df.to_arrow())
         return self._connection.sql(sql_query)
 

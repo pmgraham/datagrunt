@@ -21,7 +21,6 @@ was on an error page and gives the rest to a new worker.
 
 import json
 import os
-import pickle
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -32,6 +31,7 @@ from datagrunt.pdf import _render_worker, pipeline
 from datagrunt.pdf._hybrid_ocr import hybrid_page
 from datagrunt.pdf._memory_cap import CAP_EXIT, Lifetime, apply_memory_cap
 from datagrunt.pdf._options import PrerenderEntry, _PrerenderCache
+from datagrunt.pdf._page_ipc import encode_page_reply
 from datagrunt.pdf._process import MAX_REQUEST_BYTES, error_reply, read_message, send_message
 from datagrunt.pdf.assembly import assemble_page
 from datagrunt.pdf.elements import Page
@@ -161,7 +161,7 @@ def _extract(request: ChunkRequest, replies: IO[bytes], lifetime: Lifetime) -> N
         lifetime.extend(pipeline._lifetime_s(len(pages), request.options))
         progress = partial(_send_started, replies)
         for page in _iter_pages(handle, source, pages, request.options, progress):  # bounded: the chunk's pages
-            send_message(replies, _PAGE + pickle.dumps(page))
+            send_message(replies, _PAGE + encode_page_reply(page))
     _check_unchanged(source, os.stat(source.path), f"by the time the worker for pages {_span(pages)} finished them")
 
 

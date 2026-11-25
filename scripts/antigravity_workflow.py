@@ -12,7 +12,7 @@ import re
 import subprocess
 import sys
 import textwrap
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Final
@@ -52,9 +52,27 @@ _RAW_FORBIDDEN_SCHEME_RE: Final[re.Pattern[str]] = re.compile(
 )
 
 
-def run_command(cmd, cwd=None):
-    """Run a shell command and return its output and exit code."""
-    res = subprocess.run(cmd, shell=True, text=True, capture_output=True, cwd=cwd)
+_GIT_REF_RE: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9._/@~^][A-Za-z0-9._/@~^-]*$")
+_GIT_TIMEOUT_SECONDS: Final[float] = 30.0
+
+
+def validate_git_ref(ref: str) -> str:
+    """Validate a git commit/ref argument, rejecting leading dashes, whitespace, and control characters."""
+    if not isinstance(ref, str) or not ref or len(ref) > 256:
+        raise ValueError(f"Invalid git ref: {ref!r}")
+    if ref.startswith("-") or ".." in ref or _GIT_REF_RE.fullmatch(ref) is None:
+        raise ValueError(f"Invalid git ref: {ref!r}")
+    return ref
+
+
+def run_command(cmd: Sequence[str], cwd: Path | str | None = None) -> tuple[int, str, str]:
+    """Run a subprocess argv sequence with ``shell=False`` and return ``(returncode, stdout, stderr)``."""
+    if isinstance(cmd, (str, bytes)) or not isinstance(cmd, Sequence) or not cmd:
+        raise TypeError("cmd must be a non-empty sequence of string arguments, not a shell string")
+    argv = list(cmd)
+    if any(not isinstance(part, str) or not part for part in argv):
+        raise ValueError("every command argument must be a non-empty string")
+    res = subprocess.run(argv, shell=False, text=True, capture_output=True, cwd=cwd, timeout=_GIT_TIMEOUT_SECONDS)
     return res.returncode, res.stdout.strip(), res.stderr.strip()
 
 
@@ -829,18 +847,20 @@ def main():
     print(f"[*] Project Version: {version}")
 
     # Gather git log, stats, and diff
-    print(f"[*] Gathering git changes between {args.pre_merge_commit} and HEAD...")
-    code_log, commit_log, _ = run_command(f"git log {args.pre_merge_commit}..HEAD --oneline --no-merges", cwd=repo_dir)
-    code_stat, file_stat, _ = run_command(f"git diff --stat {args.pre_merge_commit} HEAD", cwd=repo_dir)
-    code_diff, git_diff, _ = run_command(f"git diff {args.pre_merge_commit} HEAD", cwd=repo_dir)
+    pre_merge_commit = validate_git_ref(args.pre_merge_commit)
+    print(f"[*] Gathering git changes between {pre_merge_commit} and HEAD...")
+    code_log, commit_log, _ = run_command(
+        ["git", "log", f"{pre_merge_commit}..HEAD", "--oneline", "--no-merges"], cwd=repo_dir
+    )
+    code_stat, file_stat, _ = run_command(["git", "diff", "--stat", pre_merge_commit, "HEAD"], cwd=repo_dir)
+    code_diff, git_diff, _ = run_command(["git", "diff", pre_merge_commit, "HEAD"], cwd=repo_dir)
 
     if code_log != 0 or code_diff != 0:
-        print(f"[!] Warning: Git commands failed. Check if '{args.pre_merge_commit}' is a valid commit.")
+        print(f"[!] Warning: Git commands failed. Check if '{pre_merge_commit}' is a valid commit.")
         print("[*] Falling back to analyzing the latest commit (HEAD~1..HEAD)...")
-        args.pre_merge_commit = "HEAD~1"
-        _, commit_log, _ = run_command("git log -n 5 --oneline --no-merges", cwd=repo_dir)
-        _, file_stat, _ = run_command("git diff --stat HEAD~1 HEAD", cwd=repo_dir)
-        _, git_diff, _ = run_command("git diff HEAD~1 HEAD", cwd=repo_dir)
+        _, commit_log, _ = run_command(["git", "log", "-n", "5", "--oneline", "--no-merges"], cwd=repo_dir)
+        _, file_stat, _ = run_command(["git", "diff", "--stat", "HEAD~1", "HEAD"], cwd=repo_dir)
+        _, git_diff, _ = run_command(["git", "diff", "HEAD~1", "HEAD"], cwd=repo_dir)
 
     print(f"[*] Commits found:\n{commit_log}\n")
     print(f"[*] Files changed:\n{file_stat}\n")

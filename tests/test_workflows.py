@@ -1015,3 +1015,93 @@ def test_ci_path_filter_skips_only_non_packaged_docs_and_fails_closed(tmp_path: 
     assert _classify(event="push", before="0" * 40, head=mixed) == "run_ci=true"
     _git("checkout", docs_sha)
     assert _classify(event="pull_request") == "run_ci=true"
+
+
+def test_pyproject_pdf_extra_pins_patched_pillow() -> None:
+    pyproject = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    pdf_deps = pyproject["project"]["optional-dependencies"]["pdf"]
+    pillow_specs = [dep for dep in pdf_deps if dep.lower().startswith("pillow")]
+    assert pillow_specs == ["Pillow>=13.0.0"]
+
+
+def test_ci_pip_audit_covers_pdf_and_rationalize_extras() -> None:
+    ci = _load_workflow("ci.yml")
+    steps = _job_steps(ci, "audit")
+    audit_steps = [s for s in steps if s.get("name") == "pip-audit"]
+    assert len(audit_steps) == 1
+    cmd = str(audit_steps[0].get("run", ""))
+    assert '-e ".[pdf,rationalize]"' in cmd
+
+
+def test_bump_version_and_build_workflows_pin_release_tools_and_avoid_inline_expr() -> None:
+    bump = _load_workflow("bump-version.yml")
+    bump_steps = _job_steps(bump, "bump-version")
+
+    install_steps = [s for s in bump_steps if s.get("name") == "Install bumpver"]
+    assert len(install_steps) == 1
+    assert "bumpver==2026.1132" in str(install_steps[0].get("run", ""))
+
+    tagcheck_steps = [s for s in bump_steps if s.get("id") == "tagcheck"]
+    assert len(tagcheck_steps) == 1
+    assert "${{" not in str(tagcheck_steps[0].get("run", ""))
+
+    update_steps = [s for s in bump_steps if s.get("name") == "Bump version"]
+    assert len(update_steps) == 1
+    assert "${{" not in str(update_steps[0].get("run", ""))
+    assert "VERSION_PART" in (update_steps[0].get("env") or {})
+
+    build = _load_workflow("build.yml")
+    sdist_steps = _job_steps(build, "sdist")
+    build_sdist = [s for s in sdist_steps if s.get("name") == "Build + validate sdist"]
+    assert len(build_sdist) == 1
+    sdist_cmd = str(build_sdist[0].get("run", ""))
+    assert "maturin==1.14.1" in sdist_cmd
+    assert "twine==7.0.0" in sdist_cmd
+
+
+def test_auto_publish_site_does_not_persist_site_token_during_agent_step() -> None:
+    wf = _load_workflow("auto-publish-site.yml")
+    steps = _job_steps(wf, "update-docs")
+
+    site_checkouts = [s for s in steps if s.get("name") == "Checkout datagrunt-site"]
+    assert len(site_checkouts) == 1
+    assert site_checkouts[0].get("with", {}).get("persist-credentials") is False
+
+    agent_steps = [s for s in steps if s.get("name") == "Run Antigravity Workflow"]
+    assert len(agent_steps) == 1
+    assert "site-token" not in str(agent_steps[0])
+
+    for step_name in ("Commit and Push Docs Update", "Verify and heal live site deployment"):
+        matches = [s for s in steps if s.get("name") == step_name]
+        assert len(matches) == 1
+        env = matches[0].get("env") or {}
+        assert env.get("SITE_TOKEN") == "${{ steps.site-token.outputs.token }}"
+        assert "GIT_CONFIG_KEY_0" in str(matches[0].get("run", ""))
+
+
+def test_antigravity_workflow_uses_shell_false_and_validates_git_ref() -> None:
+    import ast
+
+    script_path = ROOT / "scripts" / "antigravity_workflow.py"
+    tree = ast.parse(script_path.read_text(encoding="utf-8"))
+    shell_true_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and any(
+            kw.arg == "shell" and isinstance(kw.value, ast.Constant) and kw.value.value is True for kw in node.keywords
+        )
+    ]
+    assert shell_true_calls == [], "scripts/antigravity_workflow.py must never call subprocess with shell=True"
+
+    mod = _load_antigravity_workflow_module()
+    rc, out, _ = mod.run_command(["git", "--version"])
+    assert rc == 0 and "git version" in out.lower()
+    with pytest.raises(TypeError, match="sequence"):
+        mod.run_command("git --version")
+
+    assert mod.validate_git_ref("HEAD~1") == "HEAD~1"
+    assert mod.validate_git_ref("v5.6.0") == "v5.6.0"
+    for bad in ("", "   ", "--upload-pack=evil", "-n", "HEAD; id", "HEAD\nfoo", "HEAD\x00"):
+        with pytest.raises(ValueError, match="git ref"):
+            mod.validate_git_ref(bad)

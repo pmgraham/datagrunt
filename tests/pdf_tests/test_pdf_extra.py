@@ -406,7 +406,7 @@ def _pyproject() -> dict:
 
 
 def test_pdf_extra_is_exactly_pypdfium2_and_pillow():
-    assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=12.2.0"]
+    assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=13.0.0"]
 
 
 def test_core_dependencies_are_unchanged():

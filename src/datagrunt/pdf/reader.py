@@ -224,6 +224,9 @@ class PDFReader:
         workers, ocr, dpi, vision_dpi, max_render_pixels,
         min_image_dimension, strict: The extraction options, as
             :class:`~datagrunt.pdf.pipeline.PipelineOptions` holds them.
+        sandbox: Force PDFium extraction, page rendering, and figure decoding
+            into memory-capped worker subprocesses (process and memory
+            isolation for crash/OOM containment; does not drop OS privileges).
 
     Raises:
         TypeError: If ``source`` is not a path or a Mapping, or an option or

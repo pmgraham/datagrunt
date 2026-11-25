@@ -30,6 +30,7 @@ from datagrunt.pdf import (
     DatagruntPDFError,
     PDFCorruptError,
     PDFEncryptedError,
+    _page_ipc,
     _page_worker,
     _process,
     _source,
@@ -309,21 +310,21 @@ def facts_then_pages(message, replies) -> tuple[Page, ...]:
 def send_pages_reversed(message, replies):
     """A worker that replies with its own pages, last first, then done."""
     for page in reversed(facts_then_pages(message, replies)):
-        _process.send_message(replies, b"P" + pickle.dumps(page))
+        _process.send_message(replies, b"P" + _page_ipc.encode_page_reply(page))
     _process.send_message(replies, b"D")
 
 
 def send_a_tuple_as_a_page(message, replies):
     """A worker whose page reply is not a page."""
     facts_then_pages(message, replies)
-    _process.send_message(replies, b"P" + pickle.dumps(("page 1",)))
+    _process.send_message(replies, b"P" + json.dumps(["page 1"]).encode("ascii"))
 
 
 def send_more_pages(message, replies):
     """A worker that sends its pages and then one more instead of done."""
     pages = facts_then_pages(message, replies)
     for page in (*pages, pages[-1]):
-        _process.send_message(replies, b"P" + pickle.dumps(page))
+        _process.send_message(replies, b"P" + _page_ipc.encode_page_reply(page))
 
 
 def send_an_unknown_kind(message, replies):
@@ -341,14 +342,14 @@ def send_done_early(message, replies):
 def send_pages_then_stop(message, replies):
     """A worker that sends its pages, then ends before its last check of the file (no done)."""
     for page in facts_then_pages(message, replies):
-        _process.send_message(replies, b"P" + pickle.dumps(page))
+        _process.send_message(replies, b"P" + _page_ipc.encode_page_reply(page))
     os._exit(5)
 
 
 def send_a_str_as_an_error(message, replies):
     """A worker whose error reply holds no exception."""
     facts_then_pages(message, replies)
-    _process.send_message(replies, b"E" + pickle.dumps("not an exception"))
+    _process.send_message(replies, b"E" + json.dumps("not an exception").encode("ascii"))
 
 
 def swap_after_first_chunk(message, replies):
@@ -1790,7 +1791,11 @@ class TestWorkers:
     @pytest.mark.parametrize(
         "worker,message",
         [
-            pytest.param("send_a_tuple_as_a_page", "pages 1-1 sent a tuple, not a page", id="not-a-page"),
+            pytest.param(
+                "send_a_tuple_as_a_page",
+                "pages 1-1 sent a malformed page reply: page reply must be a JSON object, got list",
+                id="not-a-page",
+            ),
             pytest.param("send_more_pages", "pages 1-1 sent more than its 1 page(s)", id="more-pages"),
             pytest.param("send_an_unknown_kind", "pages 1-1 sent a reply of unknown kind b'Z'", id="unknown-kind"),
             pytest.param("send_a_str_as_an_error", "pages 1-1 sent a str as its error", id="error-not-exception"),
@@ -2411,14 +2416,17 @@ class TestPageWorker:
             found.append(reply)
         raise AssertionError("more than 40 replies")
 
-    def test_it_sends_each_page_pickled_in_order_then_done(self, tmp_path):
+    def test_it_sends_each_page_as_json_in_order_then_done(self, tmp_path):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()])
 
         replies = self.replies(self.request(path, (1, 3)))
 
         sent = [reply for reply in replies if reply[:1] != b"S"]
         assert [reply[:1] for reply in sent] == [b"P", b"P", b"D"]
-        assert [pickle.loads(reply[1:]) for reply in sent[:2]] == [chain_page(path, 1), chain_page(path, 2)]
+        assert [_page_ipc.decode_page_reply(reply[1:], expected_source=path, password=None) for reply in sent[:2]] == [
+            chain_page(path, 1),
+            chain_page(path, 2),
+        ]
 
     def test_it_says_each_page_it_begins_steps_1_to_3_then_step_4(self, tmp_path):
         path = build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page(), mixed_page()])
@@ -2434,7 +2442,11 @@ class TestPageWorker:
         replies = self.replies(self.request(path, None, workers=2))
 
         assert replies[0] == b"F" + json.dumps({"page_count": 3, "title": "Parts", "author": "Ada"}).encode()
-        pages = [pickle.loads(reply[1:]) for reply in replies if reply[:1] == b"P"]
+        pages = [
+            _page_ipc.decode_page_reply(reply[1:], expected_source=path, password=None)
+            for reply in replies
+            if reply[:1] == b"P"
+        ]
         assert [page.page_number for page in pages] == [1, 2]  # the first of 2 chunks of 3 pages
         assert replies[-1] == b"D"
 
@@ -2461,14 +2473,14 @@ class TestPageWorker:
         each = [["sent S", f"route {number}", "sent P"] for number in (1, 2, 3)]
         assert events == [*steps, *each[0], *each[1], *each[2], "sent D"]
 
-    def test_an_error_that_stops_the_chunk_is_sent_pickled_instead(self, tmp_path):
+    def test_an_error_that_stops_the_chunk_is_sent_as_json_instead(self, tmp_path):
         path = break_page(build_pdf(tmp_path / "doc.pdf", [mixed_page(), mixed_page()]), 2)
         message = self.request(path, options=dataclasses.asdict(PipelineOptions(strict=True)))
 
         (reply,) = [reply for reply in self.replies(message) if reply[:1] != b"S"]
 
         assert reply[:1] == b"E"
-        error = pickle.loads(reply[1:])
+        error = _process.read_error(reply[1:], "page worker")
         assert (type(error), str(error), error.page_number) == (
             PDFCorruptError,
             "page 2 is unreadable: Failed to load page.",
@@ -2506,7 +2518,7 @@ class TestPageWorker:
 
         (reply,) = self.replies(self.request(path, (0, 1), **change))
 
-        sent = pickle.loads(reply[1:])
+        sent = _process.read_error(reply[1:], "page worker")
         assert reply[:1] == b"E" and f"{type(sent).__name__}: {sent}".startswith(error)
 
 
