@@ -57,7 +57,6 @@ import importlib
 import json
 import mmap
 import os
-import pickle
 import signal
 import struct
 import subprocess
@@ -65,10 +64,16 @@ import sys
 import threading
 from collections.abc import Callable
 from types import MappingProxyType
-from typing import IO
+from typing import IO, Any
 
 from datagrunt.pdf._extra import EXTRA_IMPORTS, missing_in_worker
-from datagrunt.pdf.exceptions import DatagruntPDFError
+from datagrunt.pdf.exceptions import (
+    BundleCorruptError,
+    DatagruntPDFError,
+    PDFCorruptError,
+    PDFEncryptedError,
+    PDFSourceChangedError,
+)
 
 __all__ = [
     "BOOTSTRAP",
@@ -113,8 +118,8 @@ WORKERS = MappingProxyType(
 )
 MAX_REQUEST_BYTES = 1 << 20  # the JSON request on a worker's stdin
 LENGTH = struct.Struct("<Q")  # each reply's length, before it
-# Every worker's reply kind for an exception its caller raises (error_reply's pickle after it). A worker that cannot
-# import the [pdf] extra sends one as its first reply, whichever worker it is (see BOOTSTRAP).
+# Every worker's reply kind for an exception its caller raises (error_reply's strict JSON after it). A worker that
+# cannot import the [pdf] extra sends one as its first reply, whichever worker it is (see BOOTSTRAP).
 ERROR = b"E"
 
 # The worker's program: ``python -I -c BOOTSTRAP``. It keeps the real stdout
@@ -427,24 +432,90 @@ def _expire(
     kill(child)
 
 
-# The exceptions a worker sends as they are: the caller can import them without pdfium. Any other is sent as a
-# DatagruntPDFError naming its type and message.
-_PORTABLE_MODULES = ("builtins", "datagrunt.pdf.exceptions")
+# Explicit allowlist of exception classes that may cross worker IPC as JSON (zero pickle).
+_PDF_ERROR_TYPES: MappingProxyType[str, type[DatagruntPDFError]] = MappingProxyType(
+    {
+        "DatagruntPDFError": DatagruntPDFError,
+        "PDFEncryptedError": PDFEncryptedError,
+        "PDFCorruptError": PDFCorruptError,
+        "PDFSourceChangedError": PDFSourceChangedError,
+        "BundleCorruptError": BundleCorruptError,
+    }
+)
+_BUILTIN_ERROR_TYPES: MappingProxyType[str, type[Exception]] = MappingProxyType(
+    {
+        "FileNotFoundError": FileNotFoundError,
+        "PermissionError": PermissionError,
+        "NotADirectoryError": NotADirectoryError,
+        "IsADirectoryError": IsADirectoryError,
+        "OSError": OSError,
+        "ModuleNotFoundError": ModuleNotFoundError,
+        "ImportError": ImportError,
+        "ValueError": ValueError,
+        "TypeError": TypeError,
+        "IndexError": IndexError,
+        "KeyError": KeyError,
+        "RuntimeError": RuntimeError,
+        "TimeoutError": TimeoutError,
+    }
+)
+_ERROR_MODULES: MappingProxyType[str, MappingProxyType[str, type[Exception]]] = MappingProxyType(
+    {
+        "datagrunt.pdf.exceptions": _PDF_ERROR_TYPES,
+        "builtins": _BUILTIN_ERROR_TYPES,
+    }
+)
+_ERROR_BASE_KEYS = frozenset({"module", "type", "message"})
+_ERROR_OPTIONAL_KEYS = frozenset({"page_number", "errno", "strerror", "filename", "name"})
+_ERROR_ALL_KEYS = _ERROR_BASE_KEYS | _ERROR_OPTIONAL_KEYS
+
+
+def _unique_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def _no_json_constant(name: str) -> object:
+    raise ValueError(f"disallowed JSON constant {name!r}")
 
 
 def error_reply(exc: Exception) -> bytes:
-    """``exc``, pickled for its caller: as it is if the caller can import its type, else as a DatagruntPDFError.
+    """``exc`` serialized as strict ASCII JSON for its caller (zero pickle).
 
-    A worker sends the exception that stops it; the caller raises it. An
-    exception whose type lives in a pdfium module (or that cannot be
-    pickled) crosses as a ``DatagruntPDFError`` saying ``"<type>: <message>"``.
+    An allowlisted exception in ``datagrunt.pdf.exceptions`` or ``builtins``
+    crosses with its type and structured attributes; any other exception crosses
+    as a ``DatagruntPDFError`` saying ``"<type>: <message>"``.
     """
-    if type(exc).__module__ in _PORTABLE_MODULES:
-        try:
-            return pickle.dumps(exc)
-        except Exception:  # an argument that cannot be pickled: sent in words below, never dropped
-            pass
-    return pickle.dumps(DatagruntPDFError(f"{type(exc).__name__}: {exc}"))
+    cls = type(exc)
+    module = cls.__module__
+    name = cls.__name__
+    allowed = _ERROR_MODULES.get(module)
+    if allowed is None or allowed.get(name) is not cls:
+        payload: dict[str, Any] = {
+            "module": "datagrunt.pdf.exceptions",
+            "type": "DatagruntPDFError",
+            "message": f"{name}: {exc}",
+        }
+        return json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
+
+    payload = {"module": module, "type": name, "message": str(exc)}
+    if isinstance(exc, PDFCorruptError):
+        payload["page_number"] = exc.page_number
+    elif isinstance(exc, OSError):
+        if isinstance(exc.errno, int) and not isinstance(exc.errno, bool):
+            payload["errno"] = exc.errno
+        if isinstance(exc.strerror, str):
+            payload["strerror"] = exc.strerror
+        if isinstance(exc.filename, (str, os.PathLike)):
+            payload["filename"] = os.fspath(exc.filename)
+    elif isinstance(exc, ImportError):
+        if isinstance(exc.name, str):
+            payload["name"] = exc.name
+    return json.dumps(payload, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
 
 
 def missing_extra_reply(exc: ImportError) -> bytes:
@@ -459,19 +530,70 @@ def missing_extra_reply(exc: ImportError) -> bytes:
     return ERROR + error_reply(error)
 
 
+def _rebuild_allowlisted_error(data: dict[str, Any], who: str) -> Exception:
+    """Reconstruct one allowlisted exception from validated JSON ``data``."""
+    keys = set(data)
+    if not _ERROR_BASE_KEYS.issubset(keys) or not keys.issubset(_ERROR_ALL_KEYS):
+        return DatagruntPDFError(f"{who} sent a malformed error payload")
+    module, err_type, message = data["module"], data["type"], data["message"]
+    if not (isinstance(module, str) and isinstance(err_type, str) and isinstance(message, str)):
+        return DatagruntPDFError(f"{who} sent an error with non-text metadata")
+    allowed = _ERROR_MODULES.get(module)
+    cls = None if allowed is None else allowed.get(err_type)
+    if cls is None:
+        return DatagruntPDFError(f"{who} sent an unallowlisted error type {module}.{err_type}")
+
+    extra_keys = keys - _ERROR_BASE_KEYS
+    if cls is PDFCorruptError:
+        if not extra_keys.issubset({"page_number"}):
+            return DatagruntPDFError(f"{who} sent unexpected fields for PDFCorruptError")
+        page_number = data.get("page_number")
+        if page_number is not None and (type(page_number) is not int or page_number < 1):
+            return DatagruntPDFError(f"{who} sent an invalid page_number {page_number!r}")
+        return PDFCorruptError(message, page_number=page_number)
+    if issubclass(cls, OSError):
+        if not extra_keys.issubset({"errno", "strerror", "filename"}):
+            return DatagruntPDFError(f"{who} sent unexpected fields for {err_type}")
+        err_no = data.get("errno")
+        strerror = data.get("strerror")
+        filename = data.get("filename")
+        if err_no is not None and type(err_no) is not int:
+            return DatagruntPDFError(f"{who} sent an invalid errno {err_no!r}")
+        if strerror is not None and not isinstance(strerror, str):
+            return DatagruntPDFError(f"{who} sent an invalid strerror")
+        if filename is not None and not isinstance(filename, str):
+            return DatagruntPDFError(f"{who} sent an invalid filename")
+        if err_no is not None and strerror is not None:
+            return cls(err_no, strerror) if filename is None else cls(err_no, strerror, filename)
+        return cls(message)
+    if issubclass(cls, ImportError):
+        if not extra_keys.issubset({"name"}):
+            return DatagruntPDFError(f"{who} sent unexpected fields for {err_type}")
+        mod_name = data.get("name")
+        if mod_name is not None and not isinstance(mod_name, str):
+            return DatagruntPDFError(f"{who} sent an invalid module name")
+        return cls(message, name=mod_name)
+    if extra_keys:
+        return DatagruntPDFError(f"{who} sent unexpected fields for {err_type}")
+    return cls(message)
+
+
 def read_error(body: bytes, who: str) -> Exception:
     """The exception a worker (``who``) sent (:func:`error_reply`); anything else is a DatagruntPDFError saying so.
 
-    Unpickling is acceptable here: the worker is the caller's own process
-    image, run with its privileges and its exact ``sys.path``.
+    Decodes strict JSON against an explicit exception allowlist — never uses ``pickle``.
     """
     try:
-        error = pickle.loads(body)
-    except Exception as exc:  # a reply that is not an exception's pickle: said, never raised as something else
+        raw = json.loads(
+            body.decode("utf-8"),
+            object_pairs_hook=_unique_json_keys,
+            parse_constant=_no_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         return DatagruntPDFError(f"{who} sent an error that cannot be read: {type(exc).__name__}: {exc}")
-    if not isinstance(error, Exception):
-        return DatagruntPDFError(f"{who} sent a {type(error).__name__} as its error")
-    return error
+    if not isinstance(raw, dict):
+        return DatagruntPDFError(f"{who} sent a {type(raw).__name__} as its error")
+    return _rebuild_allowlisted_error(raw, who)
 
 
 def close_pipes(child: "subprocess.Popen[bytes]") -> None:

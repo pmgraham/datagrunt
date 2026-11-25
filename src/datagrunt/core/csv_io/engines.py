@@ -570,7 +570,10 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
 
     def write_excel(self, export_filename=None, normalize_columns=None):
         """
-        Query to export a DuckDB table to an Excel file.
+        Export a DuckDB table to an Excel (.xlsx) file via Polars/XlsxWriter.
+
+        Avoids downloading DuckDB's remote ``spatial`` extension over the
+        network while preserving DuckDB CSV parsing semantics.
 
         Args:
             export_filename (optional, str): The name of the output file.
@@ -579,9 +582,7 @@ class CSVWriterDuckDBEngine(CSVBaseWriterEngine):
         """
         normalize_columns = _resolve_normalize_columns(self.normalize_columns, normalize_columns)
         filename = self.queries.set_export_filename(CSVEngineProperties.excel_export_filename, export_filename)
-        self.queries.create_table(normalize_columns)
-        self.queries.load_spatial_extension(self.queries.connection)
-        self.queries.connection.sql(self.queries.export_excel_query(filename))
+        self.queries.create_table(normalize_columns).pl().write_excel(filename)
 
     def write_json(self, export_filename=None, normalize_columns=None):
         """

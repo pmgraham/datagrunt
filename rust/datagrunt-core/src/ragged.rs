@@ -15,19 +15,13 @@ pub fn check_ragged(path: &Path, delimiter: u8) -> bool {
     check_ragged_inner(path, delimiter).unwrap_or(false)
 }
 
-// Inner: Err only on IO failure; the wrapper maps it to false.
+// Inner: Err on IO failure or record-size bound exceeded; wrapper maps to false.
 fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
     let mut reader = csv_reader_streaming(path, delimiter)?;
-    let mut records = reader.records();
+    let mut record = csv::StringRecord::new();
 
     let mut expected_cols = None;
-    for record in records.by_ref() {
-        // Unlike row counting (which skips, since Python's CSVRows has no
-        // try/except), a parse error here aborts to "not ragged" because the
-        // Python original wraps the whole scan in `except Exception: False`.
-        // With a streaming File source an `Err` could be a genuine IO error;
-        // returning false matches Python's `except Exception: return False`.
-        let Ok(record) = record else { return Ok(false) };
+    while reader.read_record(&mut record)? {
         if !skip_record(&record) {
             expected_cols = Some(record.len());
             break;
@@ -38,8 +32,7 @@ fn check_ragged_inner(path: &Path, delimiter: u8) -> std::io::Result<bool> {
     };
 
     let mut row_count = 0usize;
-    for record in records {
-        let Ok(record) = record else { return Ok(false) };
+    while reader.read_record(&mut record)? {
         if skip_record(&record) {
             continue;
         }

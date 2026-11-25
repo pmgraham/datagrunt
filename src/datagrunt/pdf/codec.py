@@ -80,7 +80,21 @@ from datagrunt.pdf.elements import (
     Section,
     Table,
 )
-from datagrunt.pdf.frame import ELEMENT_KINDS, KINDS
+
+KINDS = ("heading", "paragraph", "key_value", "table", "list", "figure")
+
+# Each element type's kind (DocumentElement's six concrete types), in KINDS order.
+# Defined here (not in frame.py) so codec and worker IPC never pull in polars/pyarrow.
+ELEMENT_KINDS: Mapping[type, str] = MappingProxyType(
+    {
+        Heading: "heading",
+        Paragraph: "paragraph",
+        KeyValue: "key_value",
+        Table: "table",
+        BulletList: "list",
+        Figure: "figure",
+    }
+)
 
 __all__ = [
     "FORMAT",

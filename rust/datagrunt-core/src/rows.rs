@@ -14,6 +14,17 @@ const CANDIDATE_SAMPLE_ROWS: usize = 5;
 /// Python CSV_SNIFF_SAMPLE_ROWS = 5.
 const SNIFF_SAMPLE_ROWS: usize = 5;
 
+/// Per-record byte cap for streaming CSV scans (`row_count_with_header`, `check_ragged`).
+///
+/// 16 MiB (2x `MAX_LINE_READ_BYTES`): accommodates wide multi-column rows
+/// (including the 9 MB multi-field parity fixtures) while preventing unbounded
+/// heap growth on crafted unclosed-quote or newline-free inputs (DG-05).
+pub const MAX_RECORD_READ_BYTES: usize = 16 * 1024 * 1024;
+
+/// Internal buffer size configured on `csv::ReaderBuilder`, added as read slack
+/// in `RecordBudgetReader` so normal multi-record refills never trip the bound.
+const CSV_READER_BUF_CAPACITY: usize = 8 * 1024;
+
 /// Result of a single-pass header probe: the five values both delimiter
 /// and dialect inference need.
 pub struct HeaderProbe {
@@ -209,48 +220,145 @@ pub fn count_leading_physical_lines_before_header(path: &Path) -> std::io::Resul
     Ok(count)
 }
 
-/// Build a streaming `csv::Reader` over the file, matching Python's
+/// Wraps a `Read` stream with a per-record byte budget.
+///
+/// Callers reset the budget before reading each CSV record so multi-gigabyte
+/// files with normal row widths stream without limit, while a single runaway
+/// record (e.g. an unclosed quote) aborts as soon as bytes pulled for that
+/// record exceed `max_record_bytes + CSV_READER_BUF_CAPACITY`.
+pub(crate) struct RecordBudgetReader<R> {
+    inner: R,
+    read_limit: usize,
+    bytes_this_record: usize,
+    exceeded: bool,
+}
+
+impl<R> RecordBudgetReader<R> {
+    fn new(inner: R, max_record_bytes: usize) -> Self {
+        Self {
+            inner,
+            read_limit: max_record_bytes.saturating_add(CSV_READER_BUF_CAPACITY),
+            bytes_this_record: 0,
+            exceeded: false,
+        }
+    }
+
+    fn reset_budget(&mut self) {
+        self.bytes_this_record = 0;
+        self.exceeded = false;
+    }
+
+    fn budget_exceeded(&self) -> bool {
+        self.exceeded
+    }
+}
+
+impl<R: Read> Read for RecordBudgetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.bytes_this_record >= self.read_limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CSV record exceeds maximum buffered byte limit",
+            ));
+        }
+        let remaining = self.read_limit - self.bytes_this_record;
+        let capped_len = buf.len().min(remaining);
+        let n = self.inner.read(&mut buf[..capped_len])?;
+        self.bytes_this_record = self.bytes_this_record.saturating_add(n);
+        Ok(n)
+    }
+}
+
+/// Streaming CSV reader enforcing a strict per-record byte cap.
+pub(crate) struct BoundedCsvReader {
+    reader: csv::Reader<RecordBudgetReader<DecodedReader>>,
+    max_record_bytes: usize,
+}
+
+impl BoundedCsvReader {
+    /// Read the next CSV record into `record`, failing closed with
+    /// `io::ErrorKind::InvalidData` if the record exceeds `max_record_bytes`.
+    pub(crate) fn read_record(&mut self, record: &mut csv::StringRecord) -> io::Result<bool> {
+        self.reader.get_mut().reset_budget();
+        match self.reader.read_record(record) {
+            Ok(false) => Ok(false),
+            Ok(true) => {
+                if record.as_slice().len() > self.max_record_bytes {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "CSV record exceeds maximum size of {} bytes",
+                            self.max_record_bytes
+                        ),
+                    ));
+                }
+                Ok(true)
+            }
+            Err(err) => {
+                if self.reader.get_mut().budget_exceeded() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "CSV record exceeds maximum size of {} bytes",
+                            self.max_record_bytes
+                        ),
+                    ));
+                }
+                match err.into_kind() {
+                    csv::ErrorKind::Io(io_err) => Err(io_err),
+                    other => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{other:?}"),
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// Build a bounded streaming CSV reader over the file, matching Python's
 /// `csv.reader` behaviour: no header auto-detection, flexible field counts
-/// (Python never errors on ragged widths), and the given single-byte
-/// delimiter.
-///
-/// The reader streams decoded bytes via [`DecodedReader`] in 64 KiB chunks, so
-/// callers that stop early (e.g. ragged checks bailing after 10k rows) never
-/// pay to decode the rest of the file. Newline handling mirrors Python: legacy
-/// mac files get `\r` → `\n` translation (Python's `open(..., newline=None)`),
-/// every other file passes `\r` through raw (`newline=""`).
-///
-/// NOTE on error semantics: unlike the previous in-memory source, the file
-/// underneath can now surface a genuine IO error mid-parse as an `Err` record.
-/// `row_count_with_header` skips `Err` (matching Python's `csv.reader`, which
-/// never errors on row shape — a real IO error there is unreachable for regular
-/// files); `check_ragged` returns `false` on `Err`, exactly matching its Python
-/// original's `except Exception: return False`.
-pub(crate) fn csv_reader_streaming(
+/// (Python never errors on ragged widths), single-byte delimiter, and a hard
+/// per-record byte cap (`max_record_bytes`) so crafted inputs cannot cause OOM.
+pub(crate) fn csv_reader_streaming_bounded(
     path: &Path,
     delimiter: u8,
-) -> io::Result<csv::Reader<DecodedReader>> {
+    max_record_bytes: usize,
+) -> io::Result<BoundedCsvReader> {
+    if max_record_bytes == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max_record_bytes must be >= 1",
+        ));
+    }
     // Open the file once: probe the first 4096 bytes for the legacy-mac
     // newline signature (\r present, \n absent), then rewind to offset 0
     // so DecodedReader decodes from the beginning (including BOM detection).
-    // This avoids the redundant open that `is_legacy_mac_newlines(path)`
-    // would cause; the probe semantics are byte-identical to that function.
     let mut file = File::open(path)?;
     let mut probe = Vec::with_capacity(4096);
     // Mirror `is_legacy_mac_newlines`: a probe read error degrades to non-legacy
-    // (swallowed, NOT propagated), so behavior is byte-identical to the previous
-    // two-open path and to the Python oracle, both of which ignore probe IO
-    // errors. A genuine read failure surfaces later during the actual scan.
+    // (swallowed, NOT propagated). A genuine read failure surfaces during scan.
     let legacy = file.by_ref().take(4096).read_to_end(&mut probe).is_ok()
         && probe.contains(&b'\r')
         && !probe.contains(&b'\n');
     file.seek(SeekFrom::Start(0))?;
-    let reader = DecodedReader::from_file(file, legacy);
-    Ok(csv::ReaderBuilder::new()
+    let reader = RecordBudgetReader::new(DecodedReader::from_file(file, legacy), max_record_bytes);
+    let csv_reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true) // Python csv.reader never errors on ragged widths
         .delimiter(delimiter)
-        .from_reader(reader))
+        .buffer_capacity(CSV_READER_BUF_CAPACITY)
+        .from_reader(reader);
+    Ok(BoundedCsvReader {
+        reader: csv_reader,
+        max_record_bytes,
+    })
+}
+
+/// Build a streaming CSV reader bounded by [`MAX_RECORD_READ_BYTES`].
+pub(crate) fn csv_reader_streaming(path: &Path, delimiter: u8) -> io::Result<BoundedCsvReader> {
+    csv_reader_streaming_bounded(path, delimiter, MAX_RECORD_READ_BYTES)
 }
 
 /// True when the record mirrors Python's skip condition:
@@ -269,17 +377,21 @@ pub(crate) fn skip_record(record: &csv::StringRecord) -> bool {
 ///
 /// Counts parsed CSV records (quoted fields with embedded newlines count as
 /// one record) excluding blank records and comment records (first field starts
-/// with `#`), matching the Python implementation exactly.
+/// with `#`), matching the Python implementation while bounding per-record
+/// memory to [`MAX_RECORD_READ_BYTES`].
 pub fn row_count_with_header(path: &Path, delimiter: u8) -> std::io::Result<u64> {
-    let mut reader = csv_reader_streaming(path, delimiter)?;
+    row_count_with_header_bounded(path, delimiter, MAX_RECORD_READ_BYTES)
+}
+
+pub(crate) fn row_count_with_header_bounded(
+    path: &Path,
+    delimiter: u8,
+    max_record_bytes: usize,
+) -> std::io::Result<u64> {
+    let mut reader = csv_reader_streaming_bounded(path, delimiter, max_record_bytes)?;
+    let mut record = csv::StringRecord::new();
     let mut count = 0u64;
-    for record in reader.records() {
-        // Skipping `Err` mirrors Python's csv.reader, which never errors on row
-        // shape (flexible=true rules out UnequalLengths). With a real File
-        // underneath an `Err` could now also be a genuine IO error mid-read;
-        // that path is unreachable for regular files and acceptable for this
-        // prototype (Python's equivalent would raise — already documented).
-        let Ok(record) = record else { continue };
+    while reader.read_record(&mut record)? {
         if !skip_record(&record) {
             count += 1;
         }
@@ -432,5 +544,95 @@ mod tests {
     fn single_open_lf_row_count() {
         let f = tmp(b"header,col\nrow1,a\nrow2,b\nrow3,c\n");
         assert_eq!(row_count_with_header(f.path(), b',').unwrap(), 4);
+    }
+
+    // --- DG-05: bounded per-record buffering in csv_reader_streaming ---
+
+    #[test]
+    fn row_count_rejects_unclosed_quote_record_exceeding_max_record_bytes() {
+        // An unclosed quoted field larger than MAX_RECORD_READ_BYTES (8 MiB) must
+        // fail closed with InvalidData rather than buffering unboundedly.
+        let mut content = Vec::with_capacity(MAX_RECORD_READ_BYTES + 128 * 1024);
+        content.extend_from_slice(b"col1,col2\n\"");
+        content.resize(MAX_RECORD_READ_BYTES + 128 * 1024, b'x');
+        let f = tmp(&content);
+
+        let err = row_count_with_header(f.path(), b',').unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn row_count_allows_total_file_larger_than_single_record_cap() {
+        // A multi-row file whose total size far exceeds the per-record cap
+        // (1 KiB cap, ~40 KiB file) must still count every row accurately.
+        let mut content = Vec::new();
+        content.extend_from_slice(b"a,b\n");
+        for _ in 0..1000 {
+            content.extend_from_slice(b"01234567890123456789,abcdefghijklmnop\n");
+        }
+        let f = tmp(&content);
+
+        let count = row_count_with_header_bounded(f.path(), b',', 1024).unwrap();
+        assert_eq!(count, 1001);
+    }
+
+    #[test]
+    fn row_count_bounded_rejects_record_just_over_small_cap() {
+        // Post-record size check enforces the exact cap even when the whole
+        // file fits inside the csv::Reader internal buffer.
+        let mut content = Vec::new();
+        content.extend_from_slice(b"a,b\n\"");
+        content.extend(std::iter::repeat_n(b'z', 200));
+        content.extend_from_slice(b"\",1\n");
+        let f = tmp(&content);
+
+        let err = row_count_with_header_bounded(f.path(), b',', 128).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn check_ragged_handles_oversized_unclosed_quote_without_unbounded_buffering() {
+        let mut content = Vec::with_capacity(MAX_RECORD_READ_BYTES + 128 * 1024);
+        content.extend_from_slice(b"col1,col2\n\"");
+        content.resize(MAX_RECORD_READ_BYTES + 128 * 1024, b'x');
+        let f = tmp(&content);
+
+        assert!(!crate::ragged::check_ragged(f.path(), b','));
+    }
+
+    #[test]
+    fn record_budget_reader_aborts_early_without_reading_full_stream() {
+        let mut content = Vec::with_capacity(1024 * 1024);
+        content.push(b'"');
+        content.resize(1024 * 1024, b'a');
+        let cursor = io::Cursor::new(content);
+        let budget = RecordBudgetReader::new(cursor, 1024);
+        let mut csv_reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .buffer_capacity(CSV_READER_BUF_CAPACITY)
+            .from_reader(budget);
+        let mut record = csv::StringRecord::new();
+
+        let err = csv_reader.read_record(&mut record).unwrap_err();
+        assert!(
+            csv_reader.get_mut().budget_exceeded(),
+            "unexpected err: {err}"
+        );
+        let bytes_read = csv_reader.get_mut().inner.position() as usize;
+        assert!(
+            bytes_read <= 1024 + CSV_READER_BUF_CAPACITY,
+            "reader consumed {bytes_read} bytes instead of stopping at budget"
+        );
+    }
+
+    #[test]
+    fn csv_reader_streaming_bounded_rejects_zero_cap() {
+        let f = tmp(b"a,b\n1,2\n");
+        let err = match csv_reader_streaming_bounded(f.path(), b',', 0) {
+            Ok(_) => panic!("expected InvalidInput for max_record_bytes=0"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

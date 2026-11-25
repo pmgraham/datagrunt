@@ -58,7 +58,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install bumpver
-        run: pip install bumpver
+        run: pip install bumpver==2026.1132
 
       - name: Configure Git
         run: |
@@ -70,8 +70,10 @@ jobs:
 
       - name: Check whether HEAD already carries a release tag
         id: tagcheck
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && [ -n "$(git tag --points-at HEAD)" ]; then
+          if [ "$EVENT_NAME" != "workflow_dispatch" ] && [ -n "$(git tag --points-at HEAD)" ]; then
             echo "HEAD is already tagged ($(git tag --points-at HEAD | tr '\n' ' ')); skipping duplicate bump."
             echo "already_tagged=true" >> "$GITHUB_OUTPUT"
           else
@@ -95,4 +97,14 @@ jobs:
 
       - name: Bump version
         if: steps.tagcheck.outputs.already_tagged != 'true'
-        run: bumpver update --${{ github.event.inputs.part || steps.version_type.outputs.type }}
+        env:
+          VERSION_PART: ${{ github.event.inputs.part || steps.version_type.outputs.type }}
+        run: |
+          case "$VERSION_PART" in
+            patch|minor|major) ;;
+            *)
+              echo "::error::Invalid VERSION_PART: $VERSION_PART"
+              exit 1
+              ;;
+          esac
+          bumpver update "--$VERSION_PART"

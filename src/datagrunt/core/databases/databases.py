@@ -21,6 +21,35 @@ from datagrunt.core.csv_io import (
 
 logger = logging.getLogger(__name__)
 
+# Implicit DuckDB disk/network side effects turned off on private in-memory
+# connections (mirrors datagrunt.pdf._database.private_connection).
+_DUCKDB_WRITES_OFF = ("SET temp_directory=''", "SET autoinstall_known_extensions=false")
+_DUCKDB_WRITE_SETTINGS = "SELECT current_setting('temp_directory'), current_setting('autoinstall_known_extensions')"
+_DUCKDB_WRITES_OFF_REPORTED = [("", False)]
+
+
+def private_in_memory_connection():
+    """Return a private in-memory DuckDB connection with disk spill and extension auto-install disabled.
+
+    Raises:
+        RuntimeError: If DuckDB does not report ``temp_directory`` empty and
+            ``autoinstall_known_extensions`` false after applying settings.
+    """
+    conn = duckdb.connect(":memory:")
+    try:
+        for statement in _DUCKDB_WRITES_OFF:
+            conn.execute(statement)
+        reported = conn.sql(_DUCKDB_WRITE_SETTINGS).fetchall()
+        if reported != _DUCKDB_WRITES_OFF_REPORTED:
+            raise RuntimeError(
+                f"DuckDB reports (temp_directory, autoinstall_known_extensions) {reported!r} "
+                f"after {'; '.join(_DUCKDB_WRITES_OFF)}"
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
 
 class DuckDBQueries:
     """Class to store DuckDB database queries and query strings."""
@@ -79,7 +108,7 @@ class DuckDBQueries:
         as they did with the previous eager attribute.
         """
         if self._connection is None:
-            self._connection = duckdb.connect(":memory:")
+            self._connection = private_in_memory_connection()
         return self._connection
 
     @cached_property
@@ -240,7 +269,7 @@ class DuckDBQueries:
             str: The unique table name.
         """
         stem = self._format_filename_string()
-        path_hash = hashlib.sha1(str(self.filepath.resolve()).encode()).hexdigest()[:8]  # noqa: E501
+        path_hash = hashlib.sha1(str(self.filepath.resolve()).encode(), usedforsecurity=False).hexdigest()[:8]
         return f"tbl_{stem}_{path_hash}"
 
     def set_export_filename(self, default_filename, export_filename=None):
@@ -381,7 +410,12 @@ class DuckDBQueries:
 
         Returns:
             str: The SQL query to stream the sample rows.
+
+        Raises:
+            ValueError: If ``limit`` is not a positive integer.
         """
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError(f"limit must be a positive integer, got {limit!r}")
         if self.lenient:
             from datagrunt.core.csv_io import CSVColumns
 

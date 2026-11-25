@@ -72,6 +72,8 @@ jobs:
           token: ${{ steps.site-token.outputs.token }}
           path: datagrunt-site
           fetch-depth: 0
+          # Never persist the write token in .git/config while the AI agent runs.
+          persist-credentials: false
 
       - name: Extract version
         id: meta
@@ -143,7 +145,12 @@ jobs:
         working-directory: datagrunt-site
         env:
           VERSION: ${{ steps.meta.outputs.version }}
+          SITE_TOKEN: ${{ steps.site-token.outputs.token }}
         run: |
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SITE_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add content/
@@ -160,7 +167,13 @@ jobs:
       # regeneration on a manual recovery dispatch — and push at most one empty
       # commit to re-emit the webhook before failing loud.
       - name: Verify and heal live site deployment
+        env:
+          SITE_TOKEN: ${{ steps.site-token.outputs.token }}
         run: |
+          AUTH_HEADER="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$SITE_TOKEN" | base64 | tr -d '\n')"
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="http.https://github.com/.extraheader"
+          export GIT_CONFIG_VALUE_0="$AUTH_HEADER"
           python3 datagrunt/scripts/verify_site_deploy.py \
             --site-dir datagrunt-site \
             --pyproject datagrunt/pyproject.toml

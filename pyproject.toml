@@ -37,7 +37,7 @@ requires-python = ">=3.11"
 # Python wrapper (#373).
 pdf = [
     "pypdfium2>=5.9.0",
-    "Pillow>=12.2.0",
+    "Pillow>=13.0.0",
 ]
 # rationalize() over v5 PDF documents (#360): pydantic validates the caller's
 # schemas and the records models return; httpx calls the model providers over

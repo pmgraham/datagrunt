@@ -117,11 +117,11 @@ to start a worker raises its OSError. The pool is bounded and always ends:
   thread of its own (#426): no worker waits, its pipe full, for another's
   to be read. It checks each reply is a page, its chunk's next, and the
   count at done.
-- Unpickling a worker's pages is acceptable where it would not be for
-  bytes from elsewhere: the worker is the caller's own process image, run
-  with the caller's privileges and exact ``sys.path``. Isolating pdfium in
-  a worker bounds its memory, not its privileges. The render and figure
-  workers, whose replies are pixels and bytes, pickle no data.
+- All worker IPC uses strict, bounded JSON (``_page_ipc`` for pages and
+  ``_process.error_reply`` / ``read_error`` for allowlisted exceptions); no
+  worker reply is ever unpickled. Note that ``sandbox=True`` forces subprocess
+  execution with memory caps (crash and OOM containment), not OS-level
+  privilege sandboxing (seccomp/Landlock/Seatbelt).
 - Each page reply must come within its bound (:func:`_reply_bound_s`, #418),
   counted from the worker's page reply before it (from its start for its
   first page): the deadline restarts with every page, never with a
@@ -214,7 +214,6 @@ that ended its worker has that default size: it was never read here.
 import dataclasses
 import json
 import os
-import pickle
 import struct
 import subprocess
 import sys
@@ -227,6 +226,7 @@ from typing import IO, NamedTuple, get_args
 
 from datagrunt.pdf._memory_cap import ending
 from datagrunt.pdf._options import DPI, MAX_RENDER_PIXELS, MIN_IMAGE_DIMENSION, OcrMode, VisionOptions, _PrerenderCache
+from datagrunt.pdf._page_ipc import decode_page_reply
 from datagrunt.pdf._process import (
     MAX_REQUEST_BYTES,
     REAP_TIMEOUT_S,
@@ -1059,7 +1059,16 @@ def _read_into(worker: _Worker, replies: _Replies, chunk: _Chunk) -> None:
             return
         if kind == _ERROR:
             replies.ending = "error_reply"
-        replies.pages.append(_next_page(message, pages, len(replies.pages), lost))
+        replies.pages.append(
+            _next_page(
+                message,
+                pages,
+                len(replies.pages),
+                lost,
+                expected_source=chunk.source.path,
+                password=chunk.source.password,
+            )
+        )
         since = time.monotonic()
     raise DatagruntPDFError(f"{lost} sent more replies than its pages")
 
@@ -1116,9 +1125,17 @@ def _started_index(message: bytes, pages: tuple[int, ...], lost: str) -> int:
     return index
 
 
-def _next_page(message: bytes, pages: tuple[int, ...], received: int, lost: str) -> Page:
+def _next_page(
+    message: bytes,
+    pages: tuple[int, ...],
+    received: int,
+    lost: str,
+    *,
+    expected_source: Path | None = None,
+    password: str | None = None,
+) -> Page:
     """The page in the worker's reply, if it is its pages' next one; its error raised; anything else fails loud."""
-    page = _reply_page(message, lost)
+    page = _reply_page(message, lost, expected_source=expected_source, password=password)
     if received == len(pages):
         raise DatagruntPDFError(f"{lost} sent more than its {len(pages)} page(s)")
     due = pages[received] + 1
@@ -1127,17 +1144,23 @@ def _next_page(message: bytes, pages: tuple[int, ...], received: int, lost: str)
     return page
 
 
-def _reply_page(message: bytes, lost: str) -> Page:
-    """The page in one of the worker's replies; its error raised; anything else fails loud."""
+def _reply_page(
+    message: bytes,
+    lost: str,
+    *,
+    expected_source: Path | None = None,
+    password: str | None = None,
+) -> Page:
+    """The page in one of the worker's replies (strict JSON, zero pickle); its error raised."""
     kind, body = message[:1], message[1:]
     if kind == _ERROR:
         raise read_error(body, lost)
     if kind != _PAGE:
         raise DatagruntPDFError(f"{lost} sent a reply of unknown kind {kind!r}")
-    page = pickle.loads(body)  # the caller's own process image: see the module notes
-    if not isinstance(page, Page):
-        raise DatagruntPDFError(f"{lost} sent a {type(page).__name__}, not a page")
-    return page
+    try:
+        return decode_page_reply(body, expected_source=expected_source, password=password)
+    except (TypeError, ValueError) as exc:
+        raise DatagruntPDFError(f"{lost} sent a malformed page reply: {exc}") from exc
 
 
 def _check_count(pages: list[Page], expected: tuple[int, ...], lost: str) -> None:

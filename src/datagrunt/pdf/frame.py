@@ -39,12 +39,10 @@ the document (and its JSON) keeps the exact text.
 version, and callers need one stable type.
 """
 
-from collections.abc import Mapping
-from types import MappingProxyType
-
 import polars as pl
 import pyarrow as pa
 
+from datagrunt.pdf.codec import ELEMENT_KINDS, KINDS
 from datagrunt.pdf.elements import (
     PAGE_ROUTES,
     BulletList,
@@ -68,21 +66,6 @@ __all__ = [
     "element_text",
     "utf8_text",
 ]
-
-KINDS = ("heading", "paragraph", "key_value", "table", "list", "figure")
-
-# Each element type's kind (DocumentElement's six concrete types), in KINDS order. The JSON codec names
-# an element's type by it too.
-ELEMENT_KINDS: Mapping[type, str] = MappingProxyType(
-    {
-        Heading: "heading",
-        Paragraph: "paragraph",
-        KeyValue: "key_value",
-        Table: "table",
-        BulletList: "list",
-        Figure: "figure",
-    }
-)
 
 _BBOX_FIELDS = ("x0", "y0", "x1", "y1")
 

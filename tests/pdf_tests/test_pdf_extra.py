@@ -406,7 +406,7 @@ def _pyproject() -> dict:
 
 
 def test_pdf_extra_is_exactly_pypdfium2_and_pillow():
-    assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=12.2.0"]
+    assert _pyproject()["project"]["optional-dependencies"]["pdf"] == ["pypdfium2>=5.9.0", "Pillow>=13.0.0"]
 
 
 def test_core_dependencies_are_unchanged():
@@ -435,7 +435,7 @@ def test_installed_distribution_requires_no_removed_library():
     )
 
     assert [requirement.name for requirement in requirements if canonicalize_name(requirement.name) in REMOVED] == []
-    assert pdf_extra == ["pillow>=12.2.0", "pypdfium2>=5.9.0"]
+    assert pdf_extra == ["pillow>=13.0.0", "pypdfium2>=5.9.0"]
 
 
 @pytest.mark.parametrize("missing", [("pypdfium2",), ("PIL",)], ids=["pypdfium2", "Pillow"])

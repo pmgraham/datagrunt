@@ -155,7 +155,7 @@ _GOOGLE_CLOUD_FACTORIES: Mapping[str, str] = MappingProxyType(
 )  # the kinds whose own API never names a model with '@', and where a model@version (a Google Cloud ID) goes
 # What bounded_detail turns into spaces: whitespace (line breaks included), C0, DEL and C1 controls, bidi controls
 # (the R8 set), tag characters and lone surrogates.
-_DETAIL_BLANKS = re.compile(r"[\s\x00-\x1f\x7f-\x9f‪-‮⁦-⁩\U000e0000-\U000e007f\ud800-\udfff]+")
+_DETAIL_BLANKS = re.compile(r"[\s\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\U000e0000-\U000e007f\ud800-\udfff]+")
 _IDENTITY_FORBIDDEN = frozenset({"Cc", "Cs", "Zl", "Zp"})
 _SECRET_TEXT = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
 _FAMILY = re.compile(r"[a-z0-9-]{1,32}")
