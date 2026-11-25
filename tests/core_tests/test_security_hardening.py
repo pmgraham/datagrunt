@@ -150,3 +150,19 @@ class TestFipsAndBidiSourceHygiene:
 
         sample = "alpha\u202abeta\u202egamma\u2066delta\u2069omega"
         assert bounded_detail(sample) == "alpha beta gamma delta omega"
+
+
+class TestRustStreamingRecordCap:
+    """DG-05: Rust csv_reader_streaming bounds per-record buffering on unclosed-quote CSVs."""
+
+    def test_native_row_count_and_check_ragged_bound_oversized_unclosed_quote(self, tmp_path: Path) -> None:
+        from datagrunt import _native
+
+        oversized = tmp_path / "unclosed_quote.csv"
+        with oversized.open("wb") as fh:
+            fh.write(b'col1,col2\n"')
+            fh.write(b"x" * (16 * 1024 * 1024 + 128 * 1024))
+
+        with pytest.raises(OSError, match="maximum size"):
+            _native.row_count_with_header(str(oversized), ",")
+        assert _native.check_ragged(str(oversized), ",") is False

@@ -435,7 +435,7 @@ def test_installed_distribution_requires_no_removed_library():
     )
 
     assert [requirement.name for requirement in requirements if canonicalize_name(requirement.name) in REMOVED] == []
-    assert pdf_extra == ["pillow>=12.2.0", "pypdfium2>=5.9.0"]
+    assert pdf_extra == ["pillow>=13.0.0", "pypdfium2>=5.9.0"]
 
 
 @pytest.mark.parametrize("missing", [("pypdfium2",), ("PIL",)], ids=["pypdfium2", "Pillow"])
